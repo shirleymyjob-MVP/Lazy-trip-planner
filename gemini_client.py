@@ -30,6 +30,11 @@ ENRICH_HTTP_ATTEMPTS = 1
 ENRICH_RETRY_SLEEP_S = 1.5
 ENRICH_RETRY_MAX_ELAPSED_S = 12.0
 ENRICH_INCOMPLETE_WARNING = "核對後仍然缺地址／營業時間／評分"
+# 免費額度冇 Google Maps。呢個 429 唔係 generateContent 人太多。
+MAPS_UNAVAILABLE_WARNING = "Google Maps 核對未開通（免費額度通常冇 Maps），已改用文字核對。唔好當成服務擠塞。"
+ENRICH_RATE_RETRY_SLEEP_S = 2.0
+# 同一個 process 裡 Maps 已 429／拒絕過就唔再叫，避免每撳一次都燒一次注定失敗嘅額度。
+_maps_grounding_disabled = False
 # 只係 Maps 搜尋偏向。一個地區先傳；多過一個或者唔肯定就唔傳。
 _ENRICH_MAPS_BIAS = (
     ("福岡", 33.59, 130.40),
@@ -261,6 +266,26 @@ ENRICH_PROMPT = """你係旅行助手。用 Google Maps 核對下面每個地方
 {{"places":[{{"name":"","name_zh":"","category":"restaurant","area":"","address":"","opening_hours":"","rating":"","notes":"","confidence":"中","source_images":[],"caption_index":0}}]}}
 """
 
+ENRICH_TEXT_PROMPT = """你係旅行助手。請為下面每個地方補地址、營業時間、評分。
+今次冇 Google Maps。只填你有把握嘅資料，唔好估門牌或分數。
+預設日本；如果名稱明顯係其他地方，照實填，唔好硬套日本。
+
+輸入（店名同地區）：
+{seeds_json}
+
+每個地方：
+- name 必須沿用輸入嘅名稱，唔好改到對唔返
+- name_zh：繁體中文
+- category：restaurant / cafe / dessert / attraction / shop / other
+- area：沿用輸入地區
+- address：知道先填，唔知道就空字串
+- opening_hours：知道先填，唔知道就空字串
+- rating：知道先填，例子「4.3/5」，唔知道就空字串
+- notes：廣東話口吻一句
+- confidence：高 / 中 / 低
+- source_images：空陣列
+"""
+
 
 # ---------------------------------------------------------------- client
 def make_client(
@@ -334,7 +359,7 @@ def _generate_text(
     except Exception as exc:  # noqa: BLE001 - 所有 API 錯誤都轉做友善訊息
         logger.exception("Gemini API call failed (model=%s)", model)
         # HTTP 逾時／429／5xx 已由 SDK retry_options 處理；呢度唔再加倍重試。
-        raise GeminiError(_friendly_api_error(exc), retryable=False) from exc
+        raise GeminiError(_friendly_api_error(exc, used_maps=_uses_maps_tool(tools)), retryable=False) from exc
     text = getattr(response, "text", None) or ""
     if not str(text).strip():
         logger.warning("Gemini returned empty text: %r", response)
@@ -388,14 +413,72 @@ def _generate_parsed(
     raise GeminiError(failure_message)
 
 
-def _friendly_api_error(exc: Exception) -> str:
+def _exception_chain(exc: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = exc
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chain.append(current)
+        current = current.__cause__
+    return chain
+
+
+def _exception_blob(exc: BaseException) -> str:
+    chunks: list[str] = []
+    for item in _exception_chain(exc):
+        chunks.append(str(item))
+        chunks.append(str(getattr(item, "message", "") or ""))
+        chunks.append(str(getattr(item, "status", "") or ""))
+    return " ".join(chunks).lower()
+
+
+def _exception_code(exc: BaseException) -> int | None:
+    for item in _exception_chain(exc):
+        code = getattr(item, "code", None) or getattr(item, "status_code", None)
+        if isinstance(code, int):
+            return code
+    return None
+
+
+def _is_hard_quota(exc: BaseException) -> bool:
+    """帳單／每日額度滿。呢類 429 再試都係燒請求。"""
+    blob = _exception_blob(exc)
+    markers = (
+        "billing",
+        "exceeded your current quota",
+        "check your plan",
+        "plan and billing",
+        "daily quota",
+        "quota exceeded",
+        "spend",
+        "prepay",
+        "payment required",
+    )
+    return any(marker in blob for marker in markers)
+
+
+def _uses_maps_tool(tools: list | None) -> bool:
+    for tool in tools or []:
+        if getattr(tool, "google_maps", None) is not None:
+            return True
+        if isinstance(tool, dict) and tool.get("google_maps") is not None:
+            return True
+    return False
+
+
+def _friendly_api_error(exc: Exception, *, used_maps: bool = False) -> str:
     if _is_timeout(exc):
         return "AI 回應太慢（已自動重試）。請少傳幾張圖，或者過一陣再試。"
-    code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
-    detail = str(exc)
-    if "API_KEY_INVALID" in detail or "API key not valid" in detail:
+    code = _exception_code(exc)
+    detail = _exception_blob(exc)
+    if "api_key_invalid" in detail or "api key not valid" in detail:
         code = 401
     if code == 429:
+        if used_maps:
+            return "Google Maps 核對未開通（免費額度通常冇 Maps）。請過一陣再試文字核對。"
+        if _is_hard_quota(exc):
+            return "AI 用量額度滿咗，請過一陣或者檢查帳單。唔好當成服務擠塞。"
         return "而家用緊嘅人太多（或者用量額度滿咗），請過一陣再試。"
     if code in (401, 403):
         return "AI 服務設定有問題（API Key 無效或冇權限），請通知管理員。"
@@ -641,20 +724,17 @@ def _enrich_tool_config(seeds: list[dict]) -> types.ToolConfig | None:
 
 
 def _maps_tool_rejected(err: BaseException) -> bool:
-    """lite 模型拒絕 Google Maps tool 時先換 DEFAULT_MODEL。一般 400 唔算。"""
-    chunks: list[str] = []
-    current: BaseException | None = err
-    seen: set[int] = set()
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
-        chunks.append(str(current))
-        chunks.append(str(getattr(current, "message", "") or ""))
-        current = current.__cause__
-    blob = " ".join(chunks).lower()
+    """模型話唔支援 Maps tool。一般 400 唔算。"""
+    blob = _exception_blob(err)
     if "google_maps" in blob or "google maps" in blob:
         return True
     unsupported = any(token in blob for token in ("not supported", "unsupported", "does not support", "isn't supported"))
     return unsupported and ("tool" in blob or "maps" in blob)
+
+
+def _maps_grounding_blocked(err: BaseException) -> bool:
+    """免費額度叫 Maps 通常即刻 429。呢個唔係文字 generate 嘅人太多。"""
+    return _exception_code(err) == 429 or _maps_tool_rejected(err)
 
 
 def _place_keys(place: dict) -> set[str]:
@@ -685,11 +765,13 @@ def enrich_places(
     """用 Google Maps 補地址、營業時間、評分。模型漏咗嘅店名會保留。
 
     未傳 model（空字串或 None）就用 DEFAULT_ENRICH_MODEL。測試可以傳別嘅 id。
-    lite 拒絕 Maps tool 就改用 DEFAULT_MODEL 再叫一次。
-    5xx／「唔穩定」而且第一次喺 ENRICH_RETRY_MAX_ELAPSED_S 內失敗，先瞓 1.5 秒再試一次。
+    Maps 429 或拒絕 tool 就停用 Maps，改叫同模型嘅文字核對一次，唔好再燒 Maps 額度，
+    亦唔好話成「人太多」。文字核對如果係暫時 429（冇帳單／quota 字眼）先瞓 2 秒再試一次。
+    5xx 而且第一次喺 ENRICH_RETRY_MAX_ELAPSED_S 內失敗，先瞓 1.5 秒再試一次。
     呢次 HTTP 唔跟 SDK 重試，所以唔會變成 120 秒乘幾次。
     Maps tool 唔同 response_schema 一齊用，JSON 由文字解析（容許 ```json）。
     """
+    global _maps_grounding_disabled
     if not seeds:
         return AnalysisResult([], [])
     chosen = (model or "").strip() or DEFAULT_ENRICH_MODEL
@@ -697,49 +779,61 @@ def enrich_places(
         {k: place.get(k) for k in ("name", "name_zh", "area", "address") if place.get(k)}
         for place in seeds
     ]
-    prompt = ENRICH_PROMPT.format(seeds_json=json.dumps(slim, ensure_ascii=False, indent=1))
+    seeds_json = json.dumps(slim, ensure_ascii=False, indent=1)
+    maps_prompt = ENRICH_PROMPT.format(seeds_json=seeds_json)
+    text_prompt = ENRICH_TEXT_PROMPT.format(seeds_json=seeds_json)
     maps_tool = types.Tool(google_maps=types.GoogleMaps())
     tool_config = _enrich_tool_config(seeds)
-    active = chosen
 
-    def once(model_id: str):
+    def once(*, use_maps: bool):
         return _generate_parsed(
             client,
-            model_id,
-            prompt,
-            None,
+            chosen,
+            maps_prompt if use_maps else text_prompt,
+            None if use_maps else PLACES_SCHEMA,
             0.2,
             trip_core.parse_places_response,
             failure_message="AI 回覆格式有問題，請再按一次認地方。",
             parse_attempts=parse_attempts,
             retry_sleep=retry_sleep,
             http_options=_enrich_http_options(),
-            tools=[maps_tool],
-            tool_config=tool_config,
+            tools=[maps_tool] if use_maps else None,
+            tool_config=tool_config if use_maps else None,
         )
 
-    def attempt():
-        nonlocal active
+    def call_once_with_fast_retry(*, use_maps: bool):
+        started = time.monotonic()
         try:
-            return once(active)
+            return once(use_maps=use_maps)
         except GeminiError as err:
-            if active == DEFAULT_ENRICH_MODEL and active != DEFAULT_MODEL and _maps_tool_rejected(err):
-                logger.info("Maps tool rejected by %s; retrying enrich on %s", active, DEFAULT_MODEL)
-                active = DEFAULT_MODEL
-                return once(active)
+            elapsed = time.monotonic() - started
+            if _is_unstable(err) and elapsed <= ENRICH_RETRY_MAX_ELAPSED_S:
+                logger.info("Enrich unstable after %.1fs; retrying once (maps=%s)", elapsed, use_maps)
+                _sleep(ENRICH_RETRY_SLEEP_S)
+                return once(use_maps=use_maps)
+            if (
+                not use_maps
+                and _exception_code(err) == 429
+                and not _is_hard_quota(err)
+            ):
+                logger.info("Text enrich rate-limited; retrying once after %.1fs", ENRICH_RATE_RETRY_SLEEP_S)
+                _sleep(ENRICH_RATE_RETRY_SLEEP_S)
+                return once(use_maps=False)
             raise
 
-    started = time.monotonic()
-    try:
-        found = attempt()
-    except GeminiError as err:
-        elapsed = time.monotonic() - started
-        if _is_unstable(err) and elapsed <= ENRICH_RETRY_MAX_ELAPSED_S:
-            logger.info("Enrich unstable after %.1fs; retrying once", elapsed)
-            _sleep(ENRICH_RETRY_SLEEP_S)
-            found = attempt()
-        else:
-            raise
+    maps_fell_back = _maps_grounding_disabled
+    if maps_fell_back:
+        found = call_once_with_fast_retry(use_maps=False)
+    else:
+        try:
+            found = call_once_with_fast_retry(use_maps=True)
+        except GeminiError as err:
+            if not _maps_grounding_blocked(err):
+                raise
+            logger.info("Maps grounding blocked (%s); falling back to text enrich", err)
+            _maps_grounding_disabled = True
+            maps_fell_back = True
+            found = call_once_with_fast_retry(use_maps=False)
     warnings: list[str] = []
     if not found:
         warnings.append("AI 未有補到資料，已先用你貼上嘅名稱。")
@@ -747,6 +841,8 @@ def enrich_places(
     merged = trip_core.dedupe_places(list(seeds) + found)
     if _seeds_still_incomplete(seeds, merged):
         warnings.append(ENRICH_INCOMPLETE_WARNING)
+        if maps_fell_back:
+            warnings.append(MAPS_UNAVAILABLE_WARNING)
     return AnalysisResult(merged, warnings)
 
 

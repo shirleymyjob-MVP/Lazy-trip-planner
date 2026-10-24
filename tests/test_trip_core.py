@@ -4,12 +4,20 @@ import os
 import sys
 from unittest import mock
 
+import pytest
 from PIL import Image
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import gemini_client  # noqa: E402
 import trip_core  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _reset_maps_grounding_flag():
+    gemini_client._maps_grounding_disabled = False
+    yield
+    gemini_client._maps_grounding_disabled = False
 
 PLACES_JSON = {
     "places": [
@@ -545,34 +553,98 @@ def test_enrich_warns_when_maps_facts_stay_empty():
     assert gemini_client.ENRICH_INCOMPLETE_WARNING in result.warnings
 
 
-def test_enrich_falls_back_when_lite_rejects_maps_tool():
+def _quota_error(message: str):
     from google.genai import errors
 
+    return errors.ClientError(
+        429, {"error": {"code": 429, "message": message, "status": "RESOURCE_EXHAUSTED"}}
+    )
+
+
+def test_maps_429_falls_back_to_text_enrich_without_false_rate_limit():
     client = mock.MagicMock()
     client.models.generate_content.side_effect = [
-        errors.ClientError(
-            400,
-            {"error": {"code": 400, "message": "google_maps is not supported for this model", "status": "INVALID_ARGUMENT"}},
-        ),
+        _quota_error("You exceeded your current quota, please check your plan and billing details."),
         _enrich_ok_payload(),
     ]
-    result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺")], retry_sleep=0)
-    assert result.places[0]["address"] == "東京都台東區淺草2-3-1"
-    models = [call.kwargs["model"] for call in client.models.generate_content.call_args_list]
-    assert models == [gemini_client.DEFAULT_ENRICH_MODEL, gemini_client.DEFAULT_MODEL]
+    result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺", area="東京")], retry_sleep=0)
+    assert trip_core.place_is_complete(result.places[0])
+    assert result.warnings == []
+    calls = client.models.generate_content.call_args_list
+    assert len(calls) == 2
+    assert calls[0].kwargs["model"] == gemini_client.DEFAULT_ENRICH_MODEL
+    assert calls[1].kwargs["model"] == gemini_client.DEFAULT_ENRICH_MODEL
+    assert calls[0].kwargs["config"].tools[0].google_maps is not None
+    assert calls[0].kwargs["config"].response_schema is None
+    assert calls[1].kwargs["config"].tools is None
+    assert calls[1].kwargs["config"].response_schema is gemini_client.PLACES_SCHEMA
+    assert "人太多" not in calls[1].kwargs["contents"]
 
-    explicit = mock.MagicMock()
-    explicit.models.generate_content.side_effect = errors.ClientError(
-        400,
-        {"error": {"code": 400, "message": "google_maps is not supported for this model", "status": "INVALID_ARGUMENT"}},
+    later = mock.MagicMock()
+    later.models.generate_content.return_value = _enrich_ok_payload()
+    gemini_client.enrich_places(later, "m", [trip_core.seed_place("kchiara", area="福岡")], retry_sleep=0)
+    assert later.models.generate_content.call_count == 1
+    assert later.models.generate_content.call_args.kwargs["model"] == "m"
+    assert later.models.generate_content.call_args.kwargs["config"].tools is None
+
+
+def test_maps_429_then_empty_text_warns_instead_of_rate_limit():
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        _quota_error("You exceeded your current quota, please check your plan and billing details."),
+        _Resp(json.dumps({
+            "places": [{
+                "name": "kchiara", "name_zh": "キアラ", "category": "restaurant",
+                "area": "福岡", "address": "", "opening_hours": "", "rating": "",
+                "confidence": "低", "source_images": [],
+            }]
+        }, ensure_ascii=False)),
+    ]
+    result = gemini_client.enrich_places(
+        client, None, [trip_core.seed_place("kchiara", name_zh="キアラ", area="福岡")], retry_sleep=0,
     )
-    try:
-        gemini_client.enrich_places(explicit, "m", [trip_core.seed_place("淺草寺")], retry_sleep=0)
-        assert False
-    except gemini_client.GeminiError:
-        pass
-    assert explicit.models.generate_content.call_count == 1
-    assert explicit.models.generate_content.call_args.kwargs["model"] == "m"
+    assert not trip_core.place_is_complete(result.places[0])
+    assert gemini_client.ENRICH_INCOMPLETE_WARNING in result.warnings
+    assert gemini_client.MAPS_UNAVAILABLE_WARNING in result.warnings
+    assert "而家用緊嘅人太多" not in " ".join(result.warnings)
+
+
+def test_text_enrich_hard_quota_is_not_retried_as_crowd():
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        _quota_error("You exceeded your current quota, please check your plan and billing details."),
+        _quota_error("You exceeded your current quota, please check your plan and billing details."),
+    ]
+    with mock.patch.object(gemini_client, "_sleep", side_effect=AssertionError("should not sleep")):
+        try:
+            gemini_client.enrich_places(client, None, [trip_core.seed_place("kchiara")], retry_sleep=0)
+            assert False
+        except gemini_client.GeminiError as err:
+            assert "額度滿" in str(err)
+            assert "而家用緊嘅人太多" not in str(err)
+            assert "過一陣" in str(err)
+    assert client.models.generate_content.call_count == 2
+
+
+def test_text_enrich_transient_429_retries_once():
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        _quota_error("Resource exhausted. Please retry later."),
+        _quota_error("Resource exhausted. Please retry later."),
+        _enrich_ok_payload(),
+    ]
+    sleeps = []
+    with mock.patch.object(gemini_client, "_sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+        result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺")], retry_sleep=0)
+    assert trip_core.place_is_complete(result.places[0])
+    assert client.models.generate_content.call_count == 3
+    assert sleeps == [gemini_client.ENRICH_RATE_RETRY_SLEEP_S]
+    assert calls_use_maps(client, 0) and not calls_use_maps(client, 1) and not calls_use_maps(client, 2)
+
+
+def calls_use_maps(client, index: int) -> bool:
+    tools = client.models.generate_content.call_args_list[index].kwargs["config"].tools
+    return bool(tools)
 
 
 def _fukuoka_places():
