@@ -19,7 +19,7 @@ st.info("""
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     genai.configure(api_key=GEMINI_API_KEY)
-    model = genai.GenerativeModel('gemini-2.0-flash')
+    model = genai.GenerativeModel('gemini-3.8-flash')
 except Exception:
     st.error("未能讀取 API Key。請確認已喺 Streamlit Secrets 設定。")
     model = None
