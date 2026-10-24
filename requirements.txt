@@ -1,5 +1,3 @@
 streamlit
-yt-dlp
-easyocr
-deep-translator
+google-generativeai
 Pillow
