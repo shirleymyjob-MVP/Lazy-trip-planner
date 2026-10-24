@@ -5,16 +5,30 @@
 from __future__ import annotations
 
 import io
+import ipaddress
 import json
 import re
 import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
 from typing import Any, Iterable
 from urllib.parse import quote, urlencode
 
 from PIL import Image, ImageOps
 
-MAX_IMAGE_SIDE = 1600
-JPEG_QUALITY = 85
+# 截圖只要睇到店名／地址。1280 長邊已經夠 OCR，又少啲 token，Gemini 會快啲。
+MAX_IMAGE_SIDE = 1280
+JPEG_QUALITY = 80
+
+# QA 快樂路徑：上傳（自動認地方）或撳「認地方」→ 撳「生成行程」。
+HAPPY_PATH_TAPS = 2
+HAPPY_PATH_CAPTION = (
+    f"手動步數（快樂路徑）：{HAPPY_PATH_TAPS}。"
+    "① 上傳截圖（自動認地方）或貼店名／Google Maps 連結後撳「認地方」"
+    "② 撳「生成行程」（預設日本、3 日、地點全選）。"
+    "地址、營業時間、評分喺地點卡同行程入面，唔使離開呢版去 Google Maps 對基本資料。"
+)
 
 CATEGORIES = ("restaurant", "cafe", "dessert", "attraction", "shop", "other")
 CATEGORY_LABELS = {
@@ -94,6 +108,55 @@ def _clean_str(value: Any) -> str:
     return str(value).strip()
 
 
+_RATING_EMPTY = {
+    "", "未知", "不詳", "不確定", "唔肯定", "未有", "無", "n/a", "na", "none", "null", "-", "—",
+}
+
+
+def format_rating(value: Any) -> str:
+    """整理評分成卡上可讀字串。冇把握或空值回傳空字串。"""
+    v = _clean_str(value)
+    v = re.sub(r"^(評分|rating)\s*[:：]\s*", "", v, flags=re.IGNORECASE).strip()
+    if v.lower() in _RATING_EMPTY:
+        return ""
+    if len(v) > 80:
+        v = v[:80].rstrip()
+    if re.fullmatch(r"\d(?:\.\d{1,2})?", v):
+        return f"{v}/5"
+    return v
+
+
+def place_fact_lines(place: dict) -> list[str]:
+    """地點卡固定四行：地區、地址、營業時間、評分。缺資料都要顯示，唔好逼用家開 Maps。"""
+    area = place.get("area") or "未有"
+    address = place.get("address") or "未有"
+    hours = place.get("opening_hours") or "未有"
+    rating = format_rating(place.get("rating") or "") or "未有"
+    return [
+        f"📍 地區：{area}",
+        f"🏠 地址：{address}",
+        f"🕒 營業時間：{hours}",
+        f"⭐ 評分：{rating}",
+    ]
+
+
+def seed_place(name: str, **extra: Any) -> dict | None:
+    """用家貼上嘅店名／地圖搜尋字，先做成一張未補資料嘅地點卡。"""
+    raw = {
+        "name": name,
+        "name_zh": extra.get("name_zh", ""),
+        "category": extra.get("category", "other"),
+        "area": extra.get("area", ""),
+        "address": extra.get("address", ""),
+        "opening_hours": extra.get("opening_hours", ""),
+        "rating": extra.get("rating", ""),
+        "notes": extra.get("notes", ""),
+        "confidence": extra.get("confidence", "中"),
+        "source_images": extra.get("source_images", []),
+    }
+    return normalize_place(raw)
+
+
 def normalize_category(value: Any) -> str:
     v = _clean_str(value).lower()
     if v in CATEGORIES:
@@ -143,6 +206,7 @@ def normalize_place(raw: dict) -> dict | None:
         "area": _clean_str(raw.get("area")),
         "address": _clean_str(raw.get("address")),
         "opening_hours": _clean_str(raw.get("opening_hours")),
+        "rating": format_rating(raw.get("rating")),
         "notes": _clean_str(raw.get("notes")),
         "confidence": normalize_confidence(raw.get("confidence")),
         "source_images": _to_int_list(src),
@@ -170,7 +234,7 @@ def _norm_key(s: str) -> str:
 
 def _merge(a: dict, b: dict) -> dict:
     merged = dict(a)
-    for key in ("name_zh", "area", "address", "opening_hours"):
+    for key in ("name_zh", "area", "address", "opening_hours", "rating"):
         if not merged.get(key) and b.get(key):
             merged[key] = b[key]
     if b.get("notes") and b["notes"] not in merged.get("notes", ""):
@@ -235,6 +299,256 @@ def map_batch_source_images(places: Iterable[dict], display_numbers: list[int]) 
 def escape_markdown_label(text: str) -> str:
     """跳脫 Markdown link label 入面會截斷連結嘅字元。"""
     return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
+# ---------------------------------------------------------------- pasted text / maps links
+_URL_RE = re.compile(r"https?://[^\s<>\[\]()]+", re.IGNORECASE)
+_SOCIAL_HOSTS = (
+    "instagram.com",
+    "instagr.am",
+    "youtube.com",
+    "youtu.be",
+    "xiaohongshu.com",
+    "xhslink.com",
+    "xhs.cn",
+    "tiktok.com",
+)
+# 只會向呢啲 host 發出短連結請求，避免用家貼咗其他網址就去抓。
+_FETCH_HOSTS = {
+    "maps.app.goo.gl",
+    "goo.gl",
+    "google.com",
+    "www.google.com",
+    "maps.google.com",
+    "maps.google.co.jp",
+    "www.google.co.jp",
+    "www.google.com.hk",
+}
+
+
+class _Redirect(Exception):
+    def __init__(self, url: str):
+        super().__init__(url)
+        self.url = url
+
+
+class _StopRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        raise _Redirect(newurl)
+
+
+def _parse_http_url(url: str):
+    try:
+        parsed = urllib.parse.urlparse((url or "").strip())
+    except ValueError:
+        return None
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    return parsed
+
+
+def _hostname(parsed) -> str:
+    return (parsed.hostname or "").lower().rstrip(".")
+
+
+def _host_is(host: str, marker: str) -> bool:
+    return host == marker or host.endswith("." + marker)
+
+
+def _is_social_host(host: str) -> bool:
+    return any(_host_is(host, marker) for marker in _SOCIAL_HOSTS)
+
+
+def _is_short_maps(host: str, path: str) -> bool:
+    if host == "maps.app.goo.gl":
+        return True
+    return host == "goo.gl" and path.startswith("/maps")
+
+
+def _is_maps_host(host: str, path: str) -> bool:
+    if host == "maps.app.goo.gl" or host in {"maps.google.com", "maps.google.co.jp"}:
+        return True
+    if host == "goo.gl" and path.startswith("/maps"):
+        return True
+    if host == "google.com" or host.endswith(".google.com") or host.endswith(".google.co.jp"):
+        return "/maps" in path
+    return False
+
+
+def _host_allowed_for_fetch(host: str) -> bool:
+    if not host or host == "localhost" or host.endswith(".local") or host.endswith(".internal"):
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False
+    except ValueError:
+        pass
+    return host in _FETCH_HOSTS
+
+
+def _strip_url_tail(url: str) -> str:
+    return url.rstrip(").,，。、；;]>\"'")
+
+
+def _clean_place_line(line: str) -> str:
+    line = line.strip()
+    line = re.sub(r"^[\-\*\u2022]+\s*", "", line)
+    line = re.sub(r"^\d+[\.\)、]\s*", "", line)
+    return line.strip()
+
+
+def maps_query_from_url(url: str) -> str:
+    """由完整 Google Maps URL 抽出搜尋字。短連結或解唔到就回傳空字串。"""
+    parsed = _parse_http_url(url)
+    if parsed is None:
+        return ""
+    qs = urllib.parse.parse_qs(parsed.query)
+    for key in ("query", "q", "destination"):
+        values = qs.get(key) or []
+        if values and values[0].strip():
+            return urllib.parse.unquote_plus(values[0]).strip()
+    path = urllib.parse.unquote(parsed.path or "")
+    for marker in ("/place/", "/search/"):
+        if marker in path:
+            seg = path.split(marker, 1)[1].split("/")[0]
+            seg = seg.replace("+", " ").strip()
+            if seg and seg.lower() not in {"search", "place"}:
+                return seg
+    return ""
+
+
+def parse_pasted_places(text: str | None) -> dict:
+    """拆用家貼上嘅文字：店名、完整 Maps 連結、短連結、未支援嘅社群連結。
+
+    唔會去抓 Instagram／YouTube／小紅書。
+    """
+    raw = text or ""
+    urls = [_strip_url_tail(url) for url in _URL_RE.findall(raw)]
+    leftover = _URL_RE.sub(" ", raw)
+    seeds: list[dict] = []
+    social: list[str] = []
+    short: list[str] = []
+    other: list[str] = []
+    seen: set[str] = set()
+    for url in urls:
+        if url in seen:
+            continue
+        seen.add(url)
+        parsed = _parse_http_url(url)
+        if parsed is None:
+            other.append(url)
+            continue
+        host = _hostname(parsed)
+        path = parsed.path or ""
+        if _is_social_host(host):
+            social.append(url)
+            continue
+        if _is_short_maps(host, path):
+            short.append(url)
+            continue
+        if _is_maps_host(host, path):
+            query = maps_query_from_url(url)
+            place = seed_place(query) if query else None
+            if place:
+                seeds.append(place)
+            else:
+                other.append(url)
+            continue
+        other.append(url)
+    for line in leftover.splitlines():
+        name = _clean_place_line(line)
+        if len(name) < 2:
+            continue
+        place = seed_place(name)
+        if place:
+            seeds.append(place)
+    return {
+        "seeds": dedupe_places(seeds),
+        "social_urls": social,
+        "short_urls": short,
+        "other_urls": other,
+    }
+
+
+def _open_no_redirect(req: urllib.request.Request, timeout: float):
+    opener = urllib.request.build_opener(_StopRedirect)
+    return opener.open(req, timeout=timeout)
+
+
+def resolve_maps_short_url(url: str, timeout: float = 4.0, max_hops: int = 4) -> str:
+    """跟住 Google Maps 短連結，只允許跳去 Google host。解唔到就 raise ValueError。"""
+    current = (url or "").strip()
+    for _ in range(max_hops):
+        parsed = _parse_http_url(current)
+        if parsed is None or not _host_allowed_for_fetch(_hostname(parsed)):
+            raise ValueError("blocked url")
+        host = _hostname(parsed)
+        path = parsed.path or ""
+        if not _is_short_maps(host, path) and maps_query_from_url(current):
+            return current
+        if not _is_short_maps(host, path):
+            raise ValueError("not a maps short link")
+        req = urllib.request.Request(
+            current,
+            method="GET",
+            headers={"User-Agent": "lazy-trip-planner"},
+        )
+        try:
+            with _open_no_redirect(req, timeout) as resp:
+                final = resp.geturl()
+        except _Redirect as redirect:
+            current = redirect.url
+            continue
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ValueError("short link failed") from exc
+        if maps_query_from_url(final):
+            return final
+        raise ValueError("no maps query")
+    raise ValueError("too many redirects")
+
+
+def match_place(item: dict, places: Iterable[dict]) -> dict | None:
+    """用行程項目嘅店名／maps_query 對返收藏地點，方便喺行程顯示地址、時間、評分。"""
+    queries = [_norm_key(item.get("place_name")), _norm_key(item.get("maps_query"))]
+    query_set = {q for q in queries if q}
+    places = list(places or [])
+    for place in places:
+        keys = {k for k in (_norm_key(place.get("name", "")), _norm_key(place.get("name_zh", ""))) if k}
+        if keys & query_set:
+            return place
+    best = None
+    best_len = 0
+    for place in places:
+        keys = {k for k in (_norm_key(place.get("name", "")), _norm_key(place.get("name_zh", ""))) if len(k) >= 2}
+        for key in keys:
+            for query in query_set:
+                if key in query or query in key:
+                    if len(key) > best_len:
+                        best = place
+                        best_len = len(key)
+    return best
+
+
+def attach_place_facts(itinerary: dict, places: Iterable[dict]) -> dict:
+    """複製行程，並將對得返嘅地址／營業時間／評分寫入每個 item。唔改原物件。"""
+    places = list(places or [])
+    days = []
+    for day in itinerary.get("days") or []:
+        items = []
+        for item in day.get("items") or []:
+            cloned = dict(item)
+            match = match_place(cloned, places)
+            if match:
+                for key in ("address", "opening_hours", "rating", "area"):
+                    if not cloned.get(key) and match.get(key):
+                        cloned[key] = match[key]
+            items.append(cloned)
+        new_day = dict(day)
+        new_day["items"] = items
+        days.append(new_day)
+    return {**itinerary, "days": days}
 
 
 # ---------------------------------------------------------------- map links
@@ -339,6 +653,17 @@ def itinerary_to_markdown(itinerary: dict) -> str:
                 link = f" ([地圖]({maps_search_url({'name': it['maps_query']})}))"
             activity = f" — {it['activity']}" if it.get("activity") else ""
             lines.append(f"- {time}{meal}{name}{activity}{link}")
+            detail = []
+            if it.get("address"):
+                detail.append(f"地址：{it['address']}")
+            elif it.get("area"):
+                detail.append(f"地區：{it['area']}")
+            if it.get("opening_hours"):
+                detail.append(f"營業時間：{it['opening_hours']}")
+            if it.get("rating"):
+                detail.append(f"評分：{format_rating(it['rating']) or it['rating']}")
+            if detail:
+                lines.append("  - " + " · ".join(detail))
         route = day_directions_url(day)
         if route:
             lines.append("")

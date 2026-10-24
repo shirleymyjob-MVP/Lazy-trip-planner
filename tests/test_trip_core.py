@@ -15,7 +15,7 @@ PLACES_JSON = {
     "places": [
         {"name": "一蘭 渋谷店", "name_zh": "一蘭拉麵 澀谷店", "category": "restaurant",
          "area": "澀谷, 東京", "address": "東京都渋谷区神南1-22-7", "opening_hours": "24小時",
-         "notes": "豚骨拉麵", "confidence": "高", "source_images": [1]},
+         "notes": "豚骨拉麵", "rating": "4.2/5", "confidence": "高", "source_images": [1]},
         {"name": "一蘭渋谷店", "name_zh": "", "category": "other", "area": "",
          "address": "", "opening_hours": "", "notes": "要排隊", "confidence": "低", "source_images": [3]},
         {"name": "Blue Bottle Coffee", "name_zh": "藍瓶咖啡", "category": "Coffee",
@@ -31,6 +31,7 @@ def test_parse_places_dedupes_and_normalizes():
     ichiran = places[0]
     assert ichiran["source_images"] == [1, 3]
     assert ichiran["confidence"] == "高"
+    assert ichiran["rating"] == "4.2/5"
     assert "要排隊" in ichiran["notes"]
     bb = places[1]
     assert bb["category"] == "cafe"
@@ -142,7 +143,7 @@ def test_prepare_image_modes_and_resize():
         out = trip_core.prepare_image(_img_bytes(mode, (3200, 1000)))
         img = Image.open(io.BytesIO(out))
         assert img.format == "JPEG" and img.mode == "RGB"
-        assert max(img.size) == 1600
+        assert max(img.size) == trip_core.MAX_IMAGE_SIDE
     small = Image.open(io.BytesIO(trip_core.prepare_image(_img_bytes("RGB", (400, 300)))))
     assert small.size == (400, 300)
 
@@ -157,8 +158,9 @@ def test_analyze_screenshots_mocked():
     client = mock.MagicMock()
     client.models.generate_content.return_value = _Resp(json.dumps(PLACES_JSON, ensure_ascii=False))
     jpeg = trip_core.prepare_image(_img_bytes("RGB", (10, 10)))
-    places = gemini_client.analyze_screenshots(client, "m", [jpeg, jpeg])
-    assert len(places) == 2
+    result = gemini_client.analyze_screenshots(client, "m", [jpeg, jpeg])
+    assert len(result.places) == 2
+    assert result.places[0]["rating"] == "4.2/5"
     kwargs = client.models.generate_content.call_args.kwargs
     assert kwargs["model"] == "m"
     assert kwargs["config"].response_mime_type == "application/json"
@@ -166,7 +168,8 @@ def test_analyze_screenshots_mocked():
     parts = kwargs["contents"]
     assert parts[1] == "圖片 #1" and parts[3] == "圖片 #2"
     assert parts[2].inline_data.mime_type == "image/jpeg"
-    assert "日本旅行助手" not in parts[0]
+    assert "日本" in parts[0] and "唔好硬套日本" in parts[0]
+    assert "評分" in parts[0]
 
 
 def test_analyze_errors_are_friendly():
@@ -175,10 +178,11 @@ def test_analyze_errors_are_friendly():
     client = mock.MagicMock()
     client.models.generate_content.return_value = _Resp("totally not json")
     try:
-        gemini_client.analyze_screenshots(client, "m", [b"x"])
+        gemini_client.analyze_screenshots(client, "m", [b"x"], retry_sleep=0)
         assert False
     except gemini_client.GeminiError as e:
         assert "格式" in str(e)
+    assert client.models.generate_content.call_count == 2  # 壞 JSON 會再試一次
 
     client.models.generate_content.side_effect = errors.ClientError(
         429, {"error": {"code": 429, "message": "secret internal detail", "status": "RESOURCE_EXHAUSTED"}}
@@ -199,6 +203,8 @@ def test_generate_itinerary_mocked():
     assert it["title"] == "東京 3 日懶人遊"
     prompt = client.models.generate_content.call_args.kwargs["contents"]
     assert "3 日" in prompt and "東京" in prompt and "唔想太趕" in prompt
+    assert "4.2/5" in prompt
+    assert "唔好硬改成日本" in prompt
 
 
 def test_invalid_key_message():
@@ -213,3 +219,161 @@ def test_invalid_key_message():
         assert False
     except gemini_client.GeminiError as e:
         assert "API Key" in str(e)
+
+
+def test_rating_hours_and_place_facts():
+    assert trip_core.format_rating(4.5) == "4.5/5"
+    assert trip_core.format_rating("評分：未知") == ""
+    lines = trip_core.place_fact_lines({"area": "", "address": "", "opening_hours": "", "rating": ""})
+    assert lines == ["📍 地區：未有", "🏠 地址：未有", "🕒 營業時間：未有", "⭐ 評分：未有"]
+    filled = trip_core.place_fact_lines({
+        "area": "淺草, 東京", "address": "東京都台東區", "opening_hours": "6:00-17:00", "rating": "4.4/5",
+    })
+    assert "淺草, 東京" in filled[0] and "東京都台東區" in filled[1]
+    assert "6:00-17:00" in filled[2] and "4.4/5" in filled[3]
+
+
+def test_parse_pasted_places_names_maps_and_social():
+    text = """
+    - 一蘭拉麵 澀谷
+    1. 藍瓶咖啡
+    https://www.google.com/maps/search/?api=1&query=%E6%B7%BA%E8%8D%89%E5%AF%BA
+    https://www.google.com/maps/place/Ichiran+Shibuya/@35.66,139.70,17z
+    https://maps.app.goo.gl/abcDEF
+    https://www.instagram.com/reel/abc
+    https://youtu.be/xyz
+    https://www.xiaohongshu.com/explore/123
+    """
+    parsed = trip_core.parse_pasted_places(text)
+    names = {p["name"] for p in parsed["seeds"]}
+    assert "一蘭拉麵 澀谷" in names
+    assert "藍瓶咖啡" in names
+    assert "淺草寺" in names
+    assert "Ichiran Shibuya" in names
+    assert parsed["short_urls"] == ["https://maps.app.goo.gl/abcDEF"]
+    assert len(parsed["social_urls"]) == 3
+    assert all("instagram" in u or "youtu" in u or "xiaohongshu" in u for u in parsed["social_urls"])
+
+
+def test_resolve_maps_short_url_stays_on_google():
+    def fake_open(req, timeout):
+        raise trip_core._Redirect("https://www.google.com/maps/place/Ichiran+Shibuya")
+
+    with mock.patch.object(trip_core, "_open_no_redirect", fake_open):
+        final = trip_core.resolve_maps_short_url("https://maps.app.goo.gl/abc")
+    assert "Ichiran+Shibuya" in final
+
+    def blocked(req, timeout):
+        raise trip_core._Redirect("http://169.254.169.254/latest/meta-data")
+
+    with mock.patch.object(trip_core, "_open_no_redirect", blocked):
+        try:
+            trip_core.resolve_maps_short_url("https://maps.app.goo.gl/abc")
+            assert False, "should reject non-google redirect"
+        except ValueError:
+            pass
+    try:
+        trip_core.resolve_maps_short_url("https://example.com/place")
+        assert False, "should reject non-maps host"
+    except ValueError:
+        pass
+
+
+def test_attach_place_facts_onto_itinerary():
+    places = trip_core.parse_places_response(json.dumps(PLACES_JSON, ensure_ascii=False))
+    it = trip_core.parse_itinerary_response(json.dumps(ITIN, ensure_ascii=False))
+    shown = trip_core.attach_place_facts(it, places)
+    lunch = shown["days"][0]["items"][0]
+    assert "神南" in lunch["address"]
+    assert lunch["opening_hours"] == "24小時"
+    assert lunch["rating"] == "4.2/5"
+    assert "address" not in it["days"][0]["items"][0]
+    md = trip_core.itinerary_to_markdown(shown)
+    assert "地址：東京都渋谷区神南1-22-7" in md
+    assert "營業時間：24小時" in md
+    assert "評分：4.2/5" in md
+    assert trip_core.HAPPY_PATH_TAPS == 2
+
+
+def test_empty_response_is_retried_then_parsed():
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        _Resp("  "),
+        _Resp(json.dumps(PLACES_JSON, ensure_ascii=False)),
+    ]
+    result = gemini_client.analyze_screenshots(client, "m", [b"x"], retry_sleep=0)
+    assert len(result.places) == 2
+    assert client.models.generate_content.call_count == 2
+
+
+def test_partial_chunk_failure_keeps_other_places():
+    from google.genai import errors
+
+    client = mock.MagicMock()
+    calls = {"n": 0}
+
+    def side_effect(*_args, **_kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise errors.ServerError(
+                503, {"error": {"code": 503, "message": "secret-backend", "status": "UNAVAILABLE"}}
+            )
+        return _Resp(json.dumps({
+            "places": [{
+                "name": "淺草寺", "name_zh": "淺草寺", "category": "attraction",
+                "area": "淺草, 東京", "address": "東京都台東區淺草2-3-1",
+                "opening_hours": "06:00-17:00", "rating": "4.5/5",
+                "confidence": "高", "source_images": [1],
+            }]
+        }, ensure_ascii=False))
+
+    client.models.generate_content.side_effect = side_effect
+    result = gemini_client.analyze_screenshots(
+        client, "m", [b"a", b"b"], chunk_size=1, max_workers=1, parse_attempts=1, retry_sleep=0,
+    )
+    assert [p["name"] for p in result.places] == ["淺草寺"]
+    assert result.places[0]["source_images"] == [2]
+    assert result.warnings and "secret-backend" not in result.warnings[0]
+    assert "再分析" in result.warnings[0]
+
+
+def test_timeout_message_hides_internals():
+    import httpx
+
+    client = mock.MagicMock()
+    request = httpx.Request("POST", "https://example.test/gemini")
+    client.models.generate_content.side_effect = httpx.ReadTimeout("The read operation timed out", request=request)
+    try:
+        gemini_client.analyze_screenshots(client, "m", [b"x"], parse_attempts=1, retry_sleep=0)
+        assert False
+    except gemini_client.GeminiError as e:
+        assert "太慢" in str(e)
+        assert "read operation" not in str(e)
+
+
+def test_make_client_sets_timeout_and_retries():
+    client = gemini_client.make_client("fake-key")
+    opts = client._api_client._http_options
+    assert opts.timeout == gemini_client.DEFAULT_TIMEOUT_MS
+    assert opts.retry_options.attempts == gemini_client.DEFAULT_RETRY_ATTEMPTS
+    assert 429 in opts.retry_options.http_status_codes
+    assert 503 in opts.retry_options.http_status_codes
+
+
+def test_enrich_places_keeps_seed_when_model_adds_facts():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps({
+        "places": [{
+            "name": "淺草寺", "name_zh": "淺草寺", "category": "attraction",
+            "area": "淺草, 東京", "address": "東京都台東區淺草2-3-1",
+            "opening_hours": "6:00-17:00", "rating": "4.4/5",
+            "confidence": "高", "source_images": [],
+        }]
+    }, ensure_ascii=False))
+    seeds = [trip_core.seed_place("淺草寺")]
+    result = gemini_client.enrich_places(client, "m", seeds, retry_sleep=0)
+    assert len(result.places) == 1
+    assert result.places[0]["address"] == "東京都台東區淺草2-3-1"
+    assert result.places[0]["rating"] == "4.4/5"
+    prompt = client.models.generate_content.call_args.kwargs["contents"]
+    assert "淺草寺" in prompt and "唔好硬套日本" in prompt
