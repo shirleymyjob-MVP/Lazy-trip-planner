@@ -441,11 +441,14 @@ def test_enrich_places_keeps_seed_when_model_adds_facts():
     prompt = kwargs["contents"]
     assert "淺草寺" in prompt and "唔好硬套日本" in prompt
     assert "address" in prompt and "opening_hours" in prompt and "rating" in prompt
-    assert "今次冇 Google Maps" in prompt and "空字串" in prompt
+    assert "一定要三項都填" in prompt
+    assert "只填你有把握" not in prompt
     config = kwargs["config"]
     assert config.thinking_config.thinking_level == "LOW"
     assert config.thinking_config.thinking_budget is None
-    assert config.response_schema is gemini_client.PLACES_SCHEMA
+    assert config.response_schema is gemini_client.ENRICH_SCHEMA
+    assert "唔肯定就空字串" not in config.response_schema.properties["places"].items.properties["address"].description
+    assert "唔肯定就空字串" in gemini_client.PLACES_SCHEMA.properties["places"].items.properties["address"].description
     assert config.tools is None
     assert config.tool_config is None
     assert config.http_options.timeout == gemini_client.ENRICH_TIMEOUT_MS
@@ -537,6 +540,30 @@ def test_enrich_parses_fenced_json_and_biases_fukuoka():
     assert client.models.generate_content.call_args.kwargs["config"].tool_config is None
 
 
+def test_kchiara_text_enrich_keeps_facts_when_model_rewrites_the_name():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps({
+        "places": [{
+            "name": "キアラ", "name_zh": "琪亞拉", "category": "restaurant",
+            "area": "福岡", "address": "福岡市中央區大名1-1-1",
+            "opening_hours": "11:30-22:00", "rating": "4.1/5",
+            "confidence": "高", "source_images": [],
+        }]
+    }, ensure_ascii=False))
+    seed = trip_core.seed_place("kchiara", area="福岡")
+    result = gemini_client.enrich_places(client, "m", [seed], retry_sleep=0)
+    assert result.warnings == []
+    assert trip_core.place_is_complete(result.places[0])
+    assert result.places[0]["address"] == "福岡市中央區大名1-1-1"
+    assert result.places[0]["opening_hours"] == "11:30-22:00"
+    assert result.places[0]["rating"] == "4.1/5"
+    card = trip_core.merge_known_places([seed], result.places)
+    assert trip_core.place_is_complete(card[0])
+    assert "未有" not in "\n".join(trip_core.place_fact_lines(card[0]))
+    prompt = client.models.generate_content.call_args.kwargs["contents"]
+    assert "kchiara" in prompt and "福岡" in prompt and "一定要三項都填" in prompt
+
+
 def test_enrich_warns_when_maps_facts_stay_empty():
     client = mock.MagicMock()
     client.models.generate_content.return_value = _Resp(json.dumps({
@@ -581,7 +608,7 @@ def test_maps_429_falls_back_to_text_enrich_without_false_rate_limit():
     assert calls[0].kwargs["config"].tools[0].google_maps is not None
     assert calls[0].kwargs["config"].response_schema is None
     assert calls[1].kwargs["config"].tools is None
-    assert calls[1].kwargs["config"].response_schema is gemini_client.PLACES_SCHEMA
+    assert calls[1].kwargs["config"].response_schema is gemini_client.ENRICH_SCHEMA
     assert "人太多" not in calls[1].kwargs["contents"]
 
     later = mock.MagicMock()

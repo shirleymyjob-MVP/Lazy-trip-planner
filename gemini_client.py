@@ -112,6 +112,24 @@ PLACES_SCHEMA = _S(
     required=["places"],
 )
 
+def _enrich_fact_schema() -> types.Schema:
+    """文字核對用。截圖分析仍然用 PLACES_SCHEMA，唔好一齊放寬。"""
+    schema = PLACES_SCHEMA.model_copy(deep=True)
+    props = schema.properties["places"].items.properties
+    props["address"].description = (
+        "公開街道地址，要包含城市。店名同城市清楚就填，完全未聽過先空字串。"
+    )
+    props["opening_hours"].description = (
+        "公開營業時間，例如 11:00-22:00。店名同城市清楚就填，完全未聽過先空字串。"
+    )
+    props["rating"].description = (
+        "公開評分，例如 4.3/5。店名同城市清楚就填，完全未聽過先空字串。"
+    )
+    return schema
+
+
+ENRICH_SCHEMA = _enrich_fact_schema()
+
 ITINERARY_SCHEMA = _S(
     type=_T.OBJECT,
     properties={
@@ -269,23 +287,25 @@ ENRICH_PROMPT = """你係旅行助手。用 Google Maps 核對下面每個地方
 {{"places":[{{"name":"","name_zh":"","category":"restaurant","area":"","address":"","opening_hours":"","rating":"","notes":"","confidence":"中","source_images":[],"caption_index":0}}]}}
 """
 
-ENRICH_TEXT_PROMPT = """你係旅行助手。請為下面每個地方補地址、營業時間、評分。
-今次冇 Google Maps。只填你有把握嘅資料，唔好估門牌或分數。
-預設日本；如果名稱明顯係其他地方，照實填，唔好硬套日本。
+ENRICH_TEXT_PROMPT = """你係日本旅行資料編輯。下面每個地方已經有店名同城市。
+今次冇 Google Maps。用你所知嘅公開資料填地址、營業時間、評分。
+店名加城市已經清楚（例如 kchiara／キアラ、福岡）就一定要三項都填非空字串，唔好因為未即時查地圖就交白。
+完全未聽過嗰間先可以留空。唔好作一個明顯唔存在嘅門牌，但已知公開地址就要寫出嚟。
+預設日本；名稱明顯係其他地方就照實填，唔好硬套日本。
 
 輸入（店名同地區）：
 {seeds_json}
 
 每個地方：
-- name 必須沿用輸入嘅名稱，唔好改到對唔返
-- name_zh：繁體中文
+- name 必須沿用輸入嘅名稱，一個字都唔好改，否則對唔返
+- name_zh：可以補日文或中文，但唔好取代 name
 - category：restaurant / cafe / dessert / attraction / shop / other
 - area：沿用輸入地區
-- address：知道先填，唔知道就空字串
-- opening_hours：知道先填，唔知道就空字串
-- rating：知道先填，例子「4.3/5」，唔知道就空字串
+- address：公開街道地址，包含城市
+- opening_hours：公開營業時間，例如 11:00-22:00
+- rating：公開評分，例如 4.3/5
 - notes：廣東話口吻一句
-- confidence：高 / 中 / 低
+- confidence：填齊三項就高，只填到部分就中，三項都空先至低
 - source_images：空陣列
 """
 
@@ -744,6 +764,24 @@ def _place_keys(place: dict) -> set[str]:
     return {k for k in (trip_core._norm_key(place.get("name", "")), trip_core._norm_key(place.get("name_zh", ""))) if k}
 
 
+def _align_single_seed_name(seeds: list[dict], found: list[dict]) -> list[dict]:
+    """模型把 kchiara 改寫成 キアラ 時，地址會對唔返原卡。只有一對一先改回原名。"""
+    if len(seeds) != 1 or len(found) != 1:
+        return found
+    seed, extra = seeds[0], dict(found[0])
+    if _place_keys(seed) & _place_keys(extra):
+        return found
+    original_name = (extra.get("name") or "").strip()
+    original_zh = (extra.get("name_zh") or "").strip()
+    if seed.get("name"):
+        extra["name"] = seed["name"]
+    if seed.get("name_zh"):
+        extra["name_zh"] = seed["name_zh"]
+    elif original_name and original_name != (extra.get("name") or ""):
+        extra["name_zh"] = original_zh or original_name
+    return [extra]
+
+
 def _seeds_still_incomplete(seeds: list[dict], merged: list[dict]) -> bool:
     for seed in seeds:
         keys = _place_keys(seed)
@@ -802,7 +840,7 @@ def enrich_places(
             client,
             chosen,
             maps_prompt if use_maps else text_prompt,
-            None if use_maps else PLACES_SCHEMA,
+            None if use_maps else ENRICH_SCHEMA,
             0.2,
             trip_core.parse_places_response,
             failure_message="AI 回覆格式有問題，請再按一次認地方。",
@@ -850,6 +888,7 @@ def enrich_places(
     if not found:
         warnings.append("AI 未有補到資料，已先用你貼上嘅名稱。")
         found = []
+    found = _align_single_seed_name(seeds, found)
     merged = trip_core.dedupe_places(list(seeds) + found)
     if _seeds_still_incomplete(seeds, merged):
         warnings.append(ENRICH_INCOMPLETE_WARNING)
