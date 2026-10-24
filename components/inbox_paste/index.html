@@ -1,0 +1,222 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    margin: 0;
+    font-family: "Source Sans Pro", "PingFang HK", "Noto Sans TC", sans-serif;
+    color: inherit;
+  }
+  .zone {
+    border: 2px dashed #c45c26;
+    border-radius: 12px;
+    min-height: 92px;
+    padding: 14px 16px;
+    background: rgba(196, 92, 38, 0.06);
+    outline: none;
+    cursor: text;
+  }
+  .zone:focus { border-style: solid; box-shadow: 0 0 0 3px rgba(196, 92, 38, 0.25); }
+  .zone strong { display: block; font-size: 16px; margin-bottom: 4px; }
+  .zone p { margin: 0; font-size: 14px; line-height: 1.45; opacity: 0.85; }
+  label { display: block; margin: 10px 0 4px; font-size: 14px; }
+  input[type="text"] {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 16px;
+    padding: 8px 10px;
+    border-radius: 8px;
+    border: 1px solid #c8c8c8;
+  }
+  button {
+    margin-top: 10px;
+    font-size: 16px;
+    padding: 8px 14px;
+    border: 0;
+    border-radius: 8px;
+    background: #c45c26;
+    color: white;
+    cursor: pointer;
+  }
+  button:disabled { opacity: 0.55; cursor: default; }
+  #status { min-height: 1.2em; margin: 8px 0 0; font-size: 14px; }
+</style>
+</head>
+<body>
+  <!--
+    Streamlit 元件 iframe 嘅 allow 清單冇 clipboard-read，
+    navigator.clipboard.read() 多數會被擋。
+    Cmd/Ctrl+V 同 iPhone「貼上」用 paste 事件，唔使呢個權限。
+    按鈕會試 clipboard.read()，失敗就叫用家貼上。
+  -->
+  <div id="zone" class="zone" contenteditable="true" tabindex="0" role="textbox" aria-label="貼上截圖">
+    <strong>貼上截圖</strong>
+    <p>iPhone 撳「複製並刪除」之後，喺呢度貼上。桌面可以直接 Cmd/Ctrl+V。</p>
+  </div>
+  <label for="remark">備註（可留空，會交俾分析）</label>
+  <input id="remark" type="text" maxlength="200" placeholder="例如：只要圖中 1、4" />
+  <button id="clip" type="button">從剪貼簿貼上</button>
+  <p id="status" role="status"></p>
+  <script>
+    const zone = document.getElementById("zone");
+    const remark = document.getElementById("remark");
+    const clip = document.getElementById("clip");
+    const statusEl = document.getElementById("status");
+    const hint = zone.innerHTML;
+    let ready = false;
+
+    function post(type, extra) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, extra || {}), "*");
+    }
+
+    function setStatus(text) { statusEl.textContent = text || ""; }
+
+    function sendHeight() {
+      const height = Math.ceil(document.documentElement.scrollHeight);
+      post("streamlit:setFrameHeight", { height: height });
+    }
+
+    function imageFileFromData(data) {
+      if (!data) return null;
+      const items = data.items ? Array.from(data.items) : [];
+      for (const item of items) {
+        if (item.type && item.type.indexOf("image/") === 0 && item.getAsFile) {
+          const file = item.getAsFile();
+          if (file) return file;
+        }
+      }
+      const files = data.files ? Array.from(data.files) : [];
+      for (const file of files) {
+        if (file.type && file.type.indexOf("image/") === 0) return file;
+      }
+      return null;
+    }
+
+    function bytesToBase64(bytes) {
+      let binary = "";
+      const chunk = 0x8000;
+      for (let i = 0; i < bytes.length; i += chunk) {
+        binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+      }
+      return btoa(binary);
+    }
+
+    async function toJpegBase64(file) {
+      const bitmap = await createImageBitmap(file);
+      const maxSide = 1280;
+      const scale = Math.min(1, maxSide / Math.max(bitmap.width, bitmap.height));
+      const width = Math.max(1, Math.round(bitmap.width * scale));
+      const height = Math.max(1, Math.round(bitmap.height * scale));
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      canvas.getContext("2d").drawImage(bitmap, 0, 0, width, height);
+      const blob = await new Promise(function (resolve) {
+        canvas.toBlob(resolve, "image/jpeg", 0.8);
+      });
+      if (!blob) throw new Error("empty jpeg");
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      return bytesToBase64(bytes);
+    }
+
+    function newId() {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes).map(function (b) {
+        return b.toString(16).padStart(2, "0");
+      }).join("");
+    }
+
+    async function ingest(file) {
+      if (!file) {
+        setStatus("剪貼簿入面冇圖片。");
+        return;
+      }
+      clip.disabled = true;
+      setStatus("收到圖片，放進行程匣…");
+      try {
+        const data = await toJpegBase64(file);
+        post("streamlit:setComponentValue", {
+          dataType: "json",
+          value: { id: newId(), remark: remark.value || "", data: data },
+        });
+        zone.innerHTML = hint;
+        setStatus("已貼上。可以再貼下一張。");
+      } catch (err) {
+        setStatus("呢張圖讀唔到，試下再貼一次。");
+      } finally {
+        clip.disabled = false;
+        sendHeight();
+      }
+    }
+
+    function onPaste(event) {
+      const file = imageFileFromData(event.clipboardData);
+      if (!file) return;
+      event.preventDefault();
+      ingest(file);
+    }
+
+    zone.addEventListener("paste", onPaste);
+    zone.addEventListener("focus", function () { setStatus(""); });
+    try {
+      if (window.parent.__lazyTripPaste) {
+        window.parent.document.removeEventListener("paste", window.parent.__lazyTripPaste, true);
+      }
+      window.parent.__lazyTripPaste = onPaste;
+      window.parent.document.addEventListener("paste", onPaste, true);
+    } catch (err) {
+      /* 跨來源就只靠個框本身 */
+    }
+
+    clip.addEventListener("click", async function () {
+      const readers = [];
+      if (navigator.clipboard && navigator.clipboard.read) {
+        readers.push(function () { return navigator.clipboard.read(); });
+      }
+      try {
+        if (window.parent.navigator.clipboard && window.parent.navigator.clipboard.read) {
+          readers.push(function () { return window.parent.navigator.clipboard.read(); });
+        }
+      } catch (err) { /* ignore */ }
+      let sawImage = false;
+      for (const read of readers) {
+        try {
+          const items = await read();
+          for (const item of items) {
+            const type = (item.types || []).find(function (name) { return name.indexOf("image/") === 0; });
+            if (!type) continue;
+            sawImage = true;
+            const blob = await item.getType(type);
+            await ingest(new File([blob], "clipboard.jpg", { type: type }));
+            return;
+          }
+        } catch (err) { /* 下一個方法 */ }
+      }
+      zone.focus();
+      setStatus(sawImage
+        ? "剪貼簿入面冇用到嘅圖片。"
+        : "按鈕讀唔到剪貼簿。請撳上面個框，再按 Cmd/Ctrl+V；iPhone 就長按框再揀貼上。");
+      sendHeight();
+    });
+
+    window.addEventListener("message", function (event) {
+      const data = event.data || {};
+      if (data.type !== "streamlit:render") return;
+      if (!ready) {
+        ready = true;
+        if (!zone.dataset.focused) {
+          zone.dataset.focused = "1";
+          zone.focus();
+        }
+      }
+      sendHeight();
+    });
+
+    post("streamlit:componentReady", { apiVersion: 1 });
+    sendHeight();
+  </script>
+</body>
+</html>
