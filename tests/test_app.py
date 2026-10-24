@@ -33,7 +33,10 @@ def test_app_places_and_itinerary_flow():
     at.run()
     assert not at.exception
     assert len(at.checkbox) == 2
+    heads = [h.value for h in at.subheader]
+    assert heads.index("1. 行程要求") < heads.index("2. 提供來源") < heads.index("3. 生成行程")
     assert at.text_input[0].value == "日本"
+    assert int(at.number_input[0].value) == 3
     page = "\n".join(m.value for m in at.markdown)
     assert "東京都渋谷区神南1-22-7" in page
     assert "24小時" in page
@@ -46,11 +49,13 @@ def test_app_places_and_itinerary_flow():
          mock.patch.object(gemini_client, "generate_itinerary", return_value=fake_itin) as gen:
         at.number_input[0].set_value(2)
         at.text_input[0].input("東京")
+        pref = [area for area in at.text_area if "偏好" in area.label][0]
+        pref.input("唔想行太多")
         submit = [b for b in at.button if "生成行程" in b.label][0]
         submit.click().run()
         assert not at.exception
         args = gen.call_args.args
-        assert len(args[2]) == 1 and args[3] == 2 and args[4] == "東京"
+        assert len(args[2]) == 1 and args[3] == 2 and args[4] == "東京" and args[5] == "唔想行太多"
     assert at.session_state["itinerary"]["title"] == "東京 3 日懶人遊"
     assert at.session_state["usage"] == 1
     md = "\n".join(m.value for m in at.markdown)
@@ -158,6 +163,24 @@ def test_analysis_failure_does_not_spend_quota():
     assert any("仲有 2/2 次" in c.value for c in at.caption)
 
 
+def test_requirements_render_before_sources():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    assert not at.exception
+    heads = [h.value for h in at.subheader]
+    assert heads == ["1. 行程要求", "2. 提供來源"]
+    assert at.text_input[0].value == "日本"
+    assert int(at.number_input[0].value) == 3
+    labels = [area.label for area in at.text_area]
+    assert labels.index(next(label for label in labels if "偏好" in label)) < labels.index(
+        next(label for label in labels if "貼" in label)
+    )
+    assert any("行程要求" in c.value and "提供來源" in c.value for c in at.caption)
+    assert any("手動步數" in c.value and str(trip_core.HAPPY_PATH_TAPS) in c.value for c in at.caption)
+    assert not any("生成行程" in b.label for b in at.button)
+
+
 def test_japan_preset_fills_destination():
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
@@ -178,7 +201,8 @@ def test_paste_maps_link_enriches_and_skips_social():
         "https://www.google.com/maps/search/?api=1&query=%E6%B7%BA%E8%8D%89%E5%AF%BA\n"
         "https://www.instagram.com/p/abc"
     )
-    at.text_area[0].input(text).run()
+    paste = [area for area in at.text_area if "貼" in area.label][0]
+    paste.input(text).run()
     enriched = trip_core.parse_places_response(json.dumps({"places": [{
         "name": "淺草寺", "name_zh": "淺草寺", "category": "attraction",
         "area": "淺草, 東京", "address": "東京都台東區淺草2-3-1",

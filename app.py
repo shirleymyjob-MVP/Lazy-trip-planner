@@ -1,8 +1,7 @@
 """懶人行程規劃 — Streamlit entry point.
 
-流程：上傳截圖（自動認地方）或貼店名／Google Maps 連結 → 地點卡顯示
-地址、營業時間、評分 → 揀地方 → 生成行程 → 下載 Markdown。
-預設日本，其他目的地可以改。
+流程：先填行程要求（預設日本）→ 上傳截圖或貼店名／Google Maps 連結 →
+地點卡顯示地址、營業時間、評分 → 生成行程 → 下載 Markdown。
 """
 from __future__ import annotations
 
@@ -88,6 +87,8 @@ def init_state():
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
     st.session_state.setdefault("destination_field", "日本")
+    st.session_state.setdefault("days_field", 3)
+    st.session_state.setdefault("notes_field", "")
 
 
 def remaining_quota() -> int:
@@ -244,25 +245,52 @@ init_state()
 
 # ---------------------------------------------------------------- header
 st.title("✈️ 懶人行程規劃（原型版）")
-st.caption("日本行程為主：上傳 IG／YouTube／小紅書截圖，或者貼店名／Google Maps 連結。其他目的地一樣改得。")
+st.caption("日本行程為主：先定要求，再上傳 IG／YouTube／小紅書截圖，或者貼店名／Google Maps 連結。其他目的地一樣改得。")
 st.caption(trip_core.HAPPY_PATH_CAPTION)
 
 with st.expander("點樣用？", expanded=not st.session_state.places):
     st.markdown(
         f"""
-1. 上傳最多 **{MAX_IMAGES_PER_UPLOAD} 張**截圖。上傳完會**自動認地方**，唔使再撳分析。
-2. 或者貼店名／Google Maps 連結（一行一個），撳 **認地方**。社群連結請改上傳截圖。
-3. 地點卡已經有地區、地址、營業時間、評分。剔走唔想去嘅，目的地預設日本。
-4. 撳 **生成行程**，下載 Markdown。
+1. **行程要求**喺最上面：目的地預設日本、日數預設 3、偏好可留空。唔使先撳儲存。
+2. 跟住上傳最多 **{MAX_IMAGES_PER_UPLOAD} 張**截圖。上傳完會**自動認地方**，唔使再撳分析。
+3. 或者貼店名／Google Maps 連結（一行一個），撳 **認地方**。社群連結請改上傳截圖。
+4. 地點卡已經有地區、地址、營業時間、評分。剔走唔想去嘅，撳 **生成行程**。
 
 _原型版：每個 session 最多 {MAX_ANALYSES} 次成功嘅 AI 動作（失敗同自動重試唔計）。截圖只會用嚟即時分析。_
 """
     )
 
+# ---------------------------------------------------------------- requirements (before sources)
+st.subheader("1. 行程要求")
+st.caption("預設日本、3 日。想改先改；唔改就可以直接去下面提供截圖或連結。")
+preset_cols = st.columns(len(JAPAN_PRESETS))
+for col, name in zip(preset_cols, JAPAN_PRESETS):
+    if col.button(name, key=f"preset_{st.session_state.batch}_{name}"):
+        if st.session_state.get("destination_field") != name:
+            st.session_state.destination_field = name
+            st.rerun()
+day_col, dest_col = st.columns(2)
+with day_col:
+    st.number_input("玩幾多日？", min_value=1, max_value=14, step=1, key="days_field")
+with dest_col:
+    st.text_input(
+        "目的地",
+        key="destination_field",
+        placeholder="日本、東京、大阪，或其他國家",
+    )
+st.text_area(
+    "偏好／其他要求（可留空）",
+    key="notes_field",
+    placeholder="例如：第一日下晝先到、唔想行太多、想食多啲拉麵、帶小朋友",
+    height=80,
+)
+
+# ---------------------------------------------------------------- upload + paste
+st.subheader("2. 提供來源")
+st.caption("上傳截圖會自動認地方。或者貼店名／Google Maps 連結，再撳「認地方」。")
 if not API_KEY:
     st.error("AI 服務未設定好，暫時用唔到分析功能。（管理員請喺 Streamlit Secrets 設定 GEMINI_API_KEY）")
 
-# ---------------------------------------------------------------- upload + paste
 uploaded = st.file_uploader(
     "上傳截圖（可以一次揀多張，上傳完會自動分析）",
     type=["png", "jpg", "jpeg", "webp"],
@@ -392,31 +420,18 @@ if places:
     ]
 
     st.divider()
-    st.subheader("🗓️ 幫我排行程")
-    st.caption("目的地預設日本、日數預設 3。想指定城市先揀下面，否則直接生成。")
-    preset_cols = st.columns(len(JAPAN_PRESETS))
-    for col, name in zip(preset_cols, JAPAN_PRESETS):
-        if col.button(name, key=f"preset_{st.session_state.batch}_{name}"):
-            if st.session_state.get("destination_field") != name:
-                st.session_state.destination_field = name
-                st.rerun()
-    with st.form("itinerary_form"):
-        days = st.number_input("玩幾多日？", min_value=1, max_value=14, value=3, step=1)
-        destination = st.text_input(
-            "目的地",
-            key="destination_field",
-            placeholder="日本、東京、大阪，或其他國家",
-        )
-        notes = st.text_area(
-            "其他要求（可留空）",
-            placeholder="例如：第一日下晝先到、唔想行太多、想食多啲拉麵、帶小朋友",
-        )
-        submitted = st.form_submit_button(
-            f"✨ 用 {len(selected)} 個地方生成行程",
-            type="primary",
-            disabled=not API_KEY,
-        )
+    st.subheader("3. 生成行程")
+    st.caption("用上面嘅目的地、日數同偏好。地點預設全選，可以直接生成。")
+    submitted = st.button(
+        f"✨ 用 {len(selected)} 個地方生成行程",
+        type="primary",
+        disabled=not API_KEY,
+        key=f"generate_{st.session_state.batch}",
+    )
     if submitted:
+        days = int(st.session_state.get("days_field") or 3)
+        destination = st.session_state.get("destination_field") or "日本"
+        notes = st.session_state.get("notes_field") or ""
         if not selected:
             st.warning("最少要剔一個地方先排到行程。")
         elif remaining_quota() == 0:
@@ -426,7 +441,7 @@ if places:
                 status.write("會按地區分日，並盡量避開清單入面已知嘅非營業時間。")
                 try:
                     itinerary = gemini_client.generate_itinerary(
-                        _client(), MODEL, selected, int(days), destination, notes
+                        _client(), MODEL, selected, days, destination, notes
                     )
                 except gemini_client.GeminiError as err:
                     status.update(label="排行程失敗", state="error")

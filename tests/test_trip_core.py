@@ -293,6 +293,8 @@ def test_attach_place_facts_onto_itinerary():
     assert "營業時間：24小時" in md
     assert "評分：4.2/5" in md
     assert trip_core.HAPPY_PATH_TAPS == 2
+    assert "行程要求" in trip_core.HAPPY_PATH_CAPTION
+    assert "提供來源" in trip_core.HAPPY_PATH_CAPTION
 
 
 def test_empty_response_is_retried_then_parsed():
