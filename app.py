@@ -55,8 +55,8 @@ def _clamp_int(value: int, lo: int, hi: int) -> int:
 
 
 API_KEY = get_secret("GEMINI_API_KEY")
-_DEFAULT_MODEL = getattr(gemini_client, "DEFAULT_MODEL", "gemini-3.8-flash")
-MODEL = get_secret("GEMINI_MODEL", _DEFAULT_MODEL) or _DEFAULT_MODEL
+# 認店名、核對、排日程都用 lite，唔跟 GEMINI_MODEL（3.8-flash 排日程會拖到 120 秒）。
+ITINERARY_MODEL = getattr(gemini_client, "DEFAULT_ITINERARY_MODEL", "gemini-3.5-flash-lite")
 # 每個 browser session 最多幾多次成功嘅 AI 動作（分析入匣、開始排行程）。
 # 失敗、SDK 重試、同一輪入面幾張圖唔另計。
 MAX_ANALYSES = get_int_secret("MAX_ANALYSES_PER_SESSION", 10)
@@ -65,7 +65,6 @@ TIMEOUT_MS = _clamp_int(
     10_000,
     180_000,
 )
-# 認店名同核對樣本唔跟 GEMINI_MODEL。排日程先用 MODEL。
 NAMES_MODEL = getattr(gemini_client, "DEFAULT_NAMES_MODEL", "gemini-3.5-flash-lite")
 ENRICH_MODEL = getattr(gemini_client, "DEFAULT_ENRICH_MODEL", "gemini-3.5-flash-lite")
 # 免費額度預設唔叫 Maps。Secret 或環境變數 GEMINI_USE_MAPS=1 先開啟。
@@ -800,6 +799,7 @@ if submitted:
     elif remaining_quota() == 0:
         st.warning("今個 session 嘅免費次數用完喇 🙏 之後會推出登入／付費版本。")
     else:
+        plan_error = ""
         with st.status("AI 排緊行程…", expanded=True) as status:
             status.write(f"會先核對未齊嘅地址、時間、評分，再用目的地{plan_destination}、日數、偏好、同行排。")
             try:
@@ -816,7 +816,7 @@ if submitted:
                 planned_at = time.perf_counter()
                 itinerary = gemini_client.generate_itinerary(
                     _client(),
-                    MODEL,
+                    ITINERARY_MODEL,
                     selected_places,
                     request["days"],
                     plan_destination,
@@ -826,13 +826,12 @@ if submitted:
                 )
                 finished = time.perf_counter()
             except gemini_client.GeminiError as err:
-                status.update(label="排行程失敗", state="error")
-                st.session_state.notice = ("error", str(err))
-                st.error(str(err))
+                plan_error = str(err)
+                status.update(label=f"排行程失敗：{plan_error}", state="error")
             except Exception:  # noqa: BLE001
                 logger.exception("Unexpected error during itinerary generation")
-                st.session_state.notice = ("error", "排行程途中出咗意外，請再試一次。")
-                st.error("排行程途中出咗意外，請再試一次。")
+                plan_error = "排行程途中出咗意外，請再試一次。"
+                status.update(label=f"排行程失敗：{plan_error}", state="error")
             else:
                 st.session_state.usage += 1
                 st.session_state.itinerary = itinerary
@@ -848,6 +847,9 @@ if submitted:
                         item["status"] = "已排程"
                 st.session_state.notice = None
                 status.update(label="行程排好喇", state="complete")
+        if plan_error:
+            st.session_state.notice = ("error", plan_error)
+            st.error(plan_error)
 
 # ---------------------------------------------------------------- itinerary view
 itinerary = st.session_state.itinerary

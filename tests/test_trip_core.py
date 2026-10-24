@@ -258,7 +258,10 @@ def test_generate_itinerary_mocked():
     assert "4.2/5" in prompt
     assert "唔好硬改成日本" in prompt
     assert client.models.generate_content.call_args.kwargs["model"] == "m"
-    assert client.models.generate_content.call_args.kwargs["config"].http_options is None
+    http_options = client.models.generate_content.call_args.kwargs["config"].http_options
+    assert http_options.timeout == gemini_client.ITINERARY_TIMEOUT_MS
+    assert http_options.retry_options.attempts == 1
+    assert client.models.generate_content.call_args.kwargs["config"].thinking_config.thinking_level == "LOW"
 
 
 def test_invalid_key_message():
@@ -770,6 +773,31 @@ def test_analyze_passes_remarks_and_filters_caption_index():
     assert "美食" in prompt
     assert "caption_index" in prompt
     assert "唔好硬套日本" in prompt
+
+
+def test_generate_itinerary_defaults_to_lite_and_surfaces_timeout():
+    import httpx
+
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps(ITIN, ensure_ascii=False))
+    places = trip_core.parse_places_response(json.dumps(PLACES_JSON, ensure_ascii=False))
+    gemini_client.generate_itinerary(client, None, places, 3, "福岡")
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs["model"] == "gemini-3.5-flash-lite"
+    assert kwargs["model"] == gemini_client.DEFAULT_ITINERARY_MODEL
+    assert kwargs["config"].http_options.timeout == 45_000
+
+    request = httpx.Request("POST", "https://example.test/gemini")
+    client.models.generate_content.side_effect = httpx.ReadTimeout(
+        "The read operation timed out", request=request,
+    )
+    try:
+        gemini_client.generate_itinerary(client, "", places, 3, "福岡", retry_sleep=0)
+        assert False
+    except gemini_client.GeminiError as err:
+        assert "太慢" in str(err)
+        assert "排行程失敗" not in str(err)
+        assert "read operation" not in str(err)
 
 
 def test_itinerary_prompt_uses_preferences_party_and_hours():

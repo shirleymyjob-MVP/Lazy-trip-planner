@@ -20,10 +20,14 @@ import trip_core
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-# 行程匣認店名，同排行程前核對地址，都用 lite。測試傳入嘅 model 會覆蓋。
-# 排日程仍然用 DEFAULT_MODEL（或 secret GEMINI_MODEL）。
+# 認店名、文字核對、排日程都用 lite。測試傳入嘅 model 會覆蓋。
+# DEFAULT_MODEL 只係 Maps 開啟後被拒絕時嘅後備，排日程唔再用佢。
 DEFAULT_NAMES_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_ENRICH_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_ITINERARY_MODEL = "gemini-3.5-flash-lite"
+# 排日程係文字 JSON。唔好跟共用 client 嘅 120 秒，否則 3.8-flash 掛死就只見到「排行程失敗」。
+ITINERARY_TIMEOUT_MS = 45_000
+ITINERARY_HTTP_ATTEMPTS = 1
 # 核對係文字請求。單次 HTTP 20 秒、SDK 唔再重試，避免 5xx 疊上共用 client 嘅 120 秒。
 # enrich_places 只會喺快失敗嘅 5xx／「唔穩定」時再試一次。
 ENRICH_TIMEOUT_MS = 20_000
@@ -897,10 +901,20 @@ def enrich_places(
     return AnalysisResult(merged, warnings)
 
 
-def generate_itinerary(client, model: str, places: list[dict], days: int,
+def _itinerary_http_options() -> types.HttpOptions:
+    """覆蓋呢次請求。共用 client 仍然係 120 秒、attempts=2，排日程唔跟。"""
+    return types.HttpOptions(
+        timeout=ITINERARY_TIMEOUT_MS,
+        retry_options=types.HttpRetryOptions(attempts=ITINERARY_HTTP_ATTEMPTS),
+    )
+
+
+def generate_itinerary(client, model: str | None, places: list[dict], days: int,
                        destination: str = "", notes: str = "",
                        *, preferences: str = "", party: str = "",
-                       parse_attempts: int = 2, retry_sleep: float = 0.4) -> dict:
+                       parse_attempts: int = 1, retry_sleep: float = 0.4) -> dict:
+    """排日程。未傳 model 就用 lite。thinking 仍然係 low。單次 HTTP 45 秒、唔再跟 SDK 重試。"""
+    chosen = (model or "").strip() or DEFAULT_ITINERARY_MODEL
     slim = [
         {
             k: p.get(k)
@@ -917,14 +931,28 @@ def generate_itinerary(client, model: str, places: list[dict], days: int,
         notes=(notes or "").strip() or "（冇）",
         places_json=json.dumps(slim, ensure_ascii=False, indent=1),
     )
-    return _generate_parsed(
-        client,
-        model,
-        prompt,
-        ITINERARY_SCHEMA,
-        0.4,
-        trip_core.parse_itinerary_response,
-        failure_message="AI 排行程時格式出錯，請再按一次生成。",
-        parse_attempts=parse_attempts,
-        retry_sleep=retry_sleep,
-    )
+
+    def once():
+        return _generate_parsed(
+            client,
+            chosen,
+            prompt,
+            ITINERARY_SCHEMA,
+            0.4,
+            trip_core.parse_itinerary_response,
+            failure_message="AI 排行程時格式出錯，請再按一次生成。",
+            parse_attempts=parse_attempts,
+            retry_sleep=retry_sleep,
+            http_options=_itinerary_http_options(),
+        )
+
+    started = time.monotonic()
+    try:
+        return once()
+    except GeminiError as err:
+        elapsed = time.monotonic() - started
+        if _is_unstable(err) and elapsed <= ENRICH_RETRY_MAX_ELAPSED_S:
+            logger.info("Itinerary unstable after %.1fs; retrying once", elapsed)
+            _sleep(ENRICH_RETRY_SLEEP_S)
+            return once()
+        raise

@@ -102,6 +102,7 @@ def test_app_plan_from_inbox_uses_trip_basics():
         submit.click().run()
         assert not at.exception
         args = gen.call_args.args
+        assert args[1] == "gemini-3.5-flash-lite"
         assert len(args[2]) == 1 and args[3] == 2 and args[4] == "東京"
         assert "唔想行太多" in args[5]
         assert "只要圖中 1、4" in args[5]
@@ -114,6 +115,27 @@ def test_app_plan_from_inbox_uses_trip_basics():
     at.run()
     assert at.session_state["itinerary"] is not None
     assert any("仲有 1/2 次" in c.value for c in at.caption)
+
+
+def test_plan_failure_shows_the_model_message_without_using_a_turn():
+    places = trip_core.parse_places_response(json.dumps(PLACES_JSON, ensure_ascii=False))
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["inbox"] = [
+        _inbox_item(places[0], item_id="c" * 32, label="截圖 1", city="東京"),
+    ]
+    at.run()
+    message = "AI 回應太慢（已自動重試）。請少傳幾張圖，或者過一陣再試。"
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", side_effect=gemini_client.GeminiError(message)):
+        submit = [b for b in at.button if b.label == "✨ 開始排行程"][0]
+        assert not submit.disabled
+        submit.click().run()
+    assert not at.exception
+    shown = "\n".join(block.value for block in list(at.error) + list(at.warning))
+    assert message in shown
+    assert at.session_state["usage"] == 0
+    assert at.session_state["itinerary"] is None
 
 
 def test_unreadable_upload_is_skipped():
