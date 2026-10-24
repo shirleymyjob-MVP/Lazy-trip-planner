@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import streamlit as st
@@ -54,10 +55,13 @@ def get_client(api_key: str):
 def init_state():
     defaults = {
         "places": [],          # 去重後嘅地點
-        "image_count": 0,      # 已分析過幾多張圖（用嚟編號）
         "itinerary": None,
         "usage": 0,            # 今個 session 用咗幾多次 AI
-        "batch": 0,            # 每次分析 +1，用嚟重設 checkbox key
+        "batch": 0,            # 每次清除 +1，用嚟重設 checkbox / uploader key
+        # file id -> 畫面編號。分析完再 rerun 都唔好改編號，先至同卡片「圖 #n」對得上。
+        "image_labels": {},
+        "next_image_num": 1,
+        "prepared_images": {},  # file id -> JPEG bytes，失敗就係 None
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
@@ -68,9 +72,16 @@ def remaining_quota() -> int:
 
 
 def reset_all():
-    for k in ("places", "image_count", "itinerary"):
+    for k in ("places", "itinerary", "image_labels", "next_image_num", "prepared_images"):
         st.session_state.pop(k, None)
     st.session_state.batch = st.session_state.get("batch", 0) + 1
+
+
+def _upload_key(uploaded_file) -> str:
+    file_id = getattr(uploaded_file, "file_id", None)
+    if file_id:
+        return str(file_id)
+    return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
 
 
 init_state()
@@ -107,24 +118,45 @@ if len(uploaded) > MAX_IMAGES_PER_UPLOAD:
     st.warning(f"一次最多分析 {MAX_IMAGES_PER_UPLOAD} 張，今次只會用頭 {MAX_IMAGES_PER_UPLOAD} 張。")
     uploaded = uploaded[:MAX_IMAGES_PER_UPLOAD]
 
+# (file key, JPEG bytes) for files that decoded. Numbers are assigned afterwards
+# so a bad file does not consume a screenshot number.
+decoded: list[tuple[str, bytes]] = []
+kept_images: dict = {}
 if uploaded:
-    cols = st.columns(min(len(uploaded), 5))
-    for i, f in enumerate(uploaded):
-        with cols[i % len(cols)]:
-            st.image(f, caption=f"#{st.session_state.image_count + i + 1}", width="stretch")
+    cache: dict = dict(st.session_state.prepared_images)
+    for f in uploaded:
+        key = _upload_key(f)
+        if key not in cache:
+            try:
+                cache[key] = trip_core.prepare_image(f.getvalue())
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to read image %s", getattr(f, "name", "?"))
+                cache[key] = None
+        kept_images[key] = cache[key]
+        if cache[key] is None:
+            st.warning(f"「{f.name}」讀唔到，可能唔係圖片檔，已略過。")
+            continue
+        decoded.append((key, cache[key]))
+    labels = dict(st.session_state.image_labels)
+    st.session_state.next_image_num = trip_core.assign_display_numbers(
+        [key for key, _ in decoded], labels, st.session_state.next_image_num
+    )
+    st.session_state.image_labels = labels
+    if decoded:
+        cols = st.columns(min(len(decoded), 5))
+        for i, (key, data) in enumerate(decoded):
+            with cols[i % len(cols)]:
+                st.image(data, caption=f"#{labels[key]}", width="stretch")
+st.session_state.prepared_images = kept_images
 
-can_analyze = bool(uploaded) and bool(API_KEY) and remaining_quota() > 0
+prepared = [(key, st.session_state.image_labels[key], data) for key, data in decoded]
+can_analyze = bool(prepared) and bool(API_KEY) and remaining_quota() > 0
 if uploaded and remaining_quota() == 0:
     st.warning("今個 session 嘅免費次數用完喇 🙏 之後會推出登入／付費版本。")
 
 if st.button("🔍 分析截圖", type="primary", disabled=not can_analyze):
-    images: list[bytes] = []
-    for f in uploaded:
-        try:
-            images.append(trip_core.prepare_image(f.getvalue()))
-        except Exception:  # noqa: BLE001
-            logger.exception("Failed to read image %s", getattr(f, "name", "?"))
-            st.warning(f"「{f.name}」讀唔到，可能唔係圖片檔，已略過。")
+    images = [data for _key, _num, data in prepared]
+    display_numbers = [num for _key, num, _data in prepared]
     if images:
         with st.spinner(f"AI 睇緊 {len(images)} 張截圖..."):
             try:
@@ -138,10 +170,7 @@ if st.button("🔍 分析截圖", type="primary", disabled=not can_analyze):
                 st.error("分析途中出咗意外，請再試一次。")
                 new_places = None
         if new_places is not None:
-            offset = st.session_state.image_count
-            for p in new_places:
-                p["source_images"] = [i + offset for i in p.get("source_images", [])]
-            st.session_state.image_count += len(images)
+            trip_core.map_batch_source_images(new_places, display_numbers)
             before = len(st.session_state.places)
             st.session_state.places = trip_core.dedupe_places(st.session_state.places + new_places)
             added = len(st.session_state.places) - before
@@ -244,7 +273,11 @@ if itinerary:
                 icon = "🍽️ " if it["is_meal"] else ""
                 time = f"`{it['time']}` " if it["time"] else ""
                 map_url = trip_core.maps_search_url({"name": it["maps_query"]}) if it["maps_query"] else None
-                name = f"[{it['place_name']}]({map_url})" if map_url and it["place_name"] else it["place_name"]
+                if map_url and it["place_name"]:
+                    # 店名若含 ] 會截斷 Markdown link，地圖連結會指錯地方。
+                    name = f"[{trip_core.escape_markdown_label(it['place_name'])}]({map_url})"
+                else:
+                    name = it["place_name"]
                 activity = f" — {it['activity']}" if it["activity"] else ""
                 st.markdown(f"- {time}{icon}{name}{activity}")
             route = trip_core.day_directions_url(day)

@@ -202,6 +202,41 @@ def dedupe_places(places: Iterable[dict]) -> list[dict]:
     return result
 
 
+def assign_display_numbers(keys: Iterable[str], labels: dict[str, int], next_num: int) -> int:
+    """俾未見過嘅 key 分配穩定圖片編號（由 next_num 起）。
+
+    已有編號唔會改。會直接改 labels，並回傳下一個未用編號。
+    """
+    for key in keys:
+        if key not in labels:
+            labels[key] = next_num
+            next_num += 1
+    return next_num
+
+
+def map_batch_source_images(places: Iterable[dict], display_numbers: list[int]) -> None:
+    """將模型回傳嘅 1-based batch 位置，對應呢批實際送出嘅圖片編號。
+
+    display_numbers 同送俾模型嘅圖片順序一致。超出範圍嘅編號會捨棄。
+    """
+    for place in places:
+        mapped: list[int] = []
+        for idx in place.get("source_images") or []:
+            # bool 係 int 子類，唔好當圖片編號。
+            if isinstance(idx, bool) or not isinstance(idx, int):
+                continue
+            if 1 <= idx <= len(display_numbers):
+                number = display_numbers[idx - 1]
+                if number not in mapped:
+                    mapped.append(number)
+        place["source_images"] = mapped
+
+
+def escape_markdown_label(text: str) -> str:
+    """跳脫 Markdown link label 入面會截斷連結嘅字元。"""
+    return text.replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+
+
 # ---------------------------------------------------------------- map links
 def place_query(place: dict) -> str:
     """Google Maps 搜尋字串：名稱 + 地址（冇地址就用地區）。"""

@@ -114,6 +114,29 @@ def _img_bytes(mode, size, fmt="PNG"):
     return buf.getvalue()
 
 
+def test_display_numbers_stay_with_the_file_and_map_batch_positions():
+    labels: dict[str, int] = {}
+    nxt = trip_core.assign_display_numbers(["a", "b"], labels, 1)
+    assert labels == {"a": 1, "b": 2} and nxt == 3
+    # 同一批檔再出現唔好改編號；新檔先用下一個號。
+    nxt = trip_core.assign_display_numbers(["b", "c"], labels, nxt)
+    assert labels["b"] == 2 and labels["c"] == 3 and nxt == 4
+
+    places = [
+        {"source_images": [1, 2]},
+        {"source_images": [2, 0, 9, True, "x"]},
+    ]
+    # 呢批實際送出嘅係畫面 #3 同 #4（例如上一批已經用咗 1、2）。
+    trip_core.map_batch_source_images(places, [3, 4])
+    assert places[0]["source_images"] == [3, 4]
+    assert places[1]["source_images"] == [4]
+
+
+def test_escape_markdown_label():
+    assert trip_core.escape_markdown_label("Cafe [Borderless]") == "Cafe \\[Borderless\\]"
+    assert trip_core.escape_markdown_label("a\\b") == "a\\\\b"
+
+
 def test_prepare_image_modes_and_resize():
     for mode in ("RGBA", "P", "LA", "L", "RGB"):
         out = trip_core.prepare_image(_img_bytes(mode, (3200, 1000)))
