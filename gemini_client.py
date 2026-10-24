@@ -67,10 +67,14 @@ PLACES_SCHEMA = _S(
                     "confidence": _S(type=_T.STRING, enum=list(trip_core.CONFIDENCE_LEVELS)),
                     "source_images": _S(type=_T.ARRAY, items=_S(type=_T.INTEGER),
                                         description="出現喺第幾張圖（由 1 開始）"),
+                    "caption_index": _S(
+                        type=_T.INTEGER,
+                        description="截圖說明嘅編號，① 或 1. = 1。冇編號就 0",
+                    ),
                 },
                 required=[
                     "name", "name_zh", "category", "area", "address", "opening_hours",
-                    "rating", "confidence", "source_images",
+                    "rating", "confidence", "source_images", "caption_index",
                 ],
             ),
         )
@@ -115,41 +119,59 @@ ITINERARY_SCHEMA = _S(
 )
 
 # ---------------------------------------------------------------- prompts
-PLACES_PROMPT = """你係日本旅行助手，幫唔想自己搜尋嘅「懶人」整理旅遊截圖。
-以下係用家喺 Instagram／YouTube／小紅書等截落嚟嘅 {n} 張截圖（每張前面有「圖片 #編號」）。
-預設目的地係日本。如果畫面明顯係其他國家或城市，照實填，唔好硬套日本。
+PLACES_PROMPT = """你係旅行助手，幫唔想自己搜尋嘅「懶人」整理旅遊截圖。
+以下係用家上傳嘅 {n} 張截圖（每張前面有「圖片 #編號」）。多數係 Instagram／YouTube／小紅書畫面。
+你只可以讀截圖入面睇到嘅字同畫面，唔好假設可以打開任何連結。
+目的地：{destination}
+偏好：{preferences}
+同行：{party}
+用家對呢批截圖嘅備註：{remarks}
 
-請識別餐廳、cafe、甜品、景點、商店或其他值得去嘅地方：
+請識別餐廳、cafe、甜品、景點、商店或其他值得去嘅地方。
+如果備註要求只留某幾個編號（例如「只要圖中 1、4」「圖中1，4」「①④」），只輸出該編號嘅地方，其他編號唔好輸出。
+如果備註話唔要或不要某幾個編號，就唔好輸出嗰幾個。
+預設目的地係日本。如果畫面明顯係其他國家或城市，照實填，唔好硬套日本。
+偏好係美食就優先餐廳同甜品；景點就優先景點；兩邊都有就兩類都要。備註指定嘅編號最優先。
+
+每個地方：
 - name：原文名稱（日本地方盡量保留日文）
 - name_zh：繁體中文名；冇正式譯名就音譯
 - category：restaurant / cafe / dessert / attraction / shop / other
-- area：地區同城市。日本例子：「澀谷, 東京」「道頓堀, 大阪」。其他國家就寫實際城市
+- area：地區同城市。日本例子：「博多, 福岡」「澀谷, 東京」。其他國家就寫實際城市
 - address：畫面有就照抄。畫面冇、但你對呢間店嘅公開地址有把握先填；否則空字串。唔好作門牌
 - opening_hours：畫面有就照抄。否則只係你有把握先填，唔肯定就空字串
 - rating：例如「4.3/5」或「4.3/5（約1200則）」。畫面有就照抄；否則只係你有把握先填公開評分，唔好估，唔肯定就空字串
 - notes：繁體中文、廣東話口吻，一句特色或必食。唔好重複評分
 - confidence：高 / 中 / 低（你有幾肯定呢個名同位置正確）
 - source_images：出現喺邊幾張圖（用上面嘅編號）
+- caption_index：截圖說明入面嘅編號。① 或 1. 對應 1，② 對應 2。例如「①鉄板焼 日和」係 1，「④ GRASS FED／GELATERIA SAKURA」係 4。冇編號就填 0
 同一個地方只列一次，source_images 填晒所有編號。
 完全認唔到就回傳空 list。"""
 
-ITINERARY_PROMPT = """你係日本旅行規劃師，幫「懶人」將收藏嘅地方排成 {days} 日行程。
+ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方排成 {days} 日行程。
 目的地：{destination}
+偏好：{preferences}
+同行：{party}
+其他要求：{notes}
 如果目的地係「日本」又未指定城市，就按地點清單入面嘅城市分日，唔好假設全部喺東京。
-用家備註：{notes}
+其他國家目的地同樣照辦，唔好硬改成日本。
 
-地點清單（JSON）：
+地點清單（JSON，可能有 address、opening_hours、rating）：
 {places_json}
 
-要求：
-- 按地區將就近嘅地方排喺同一日，減少轉車
+排程必須同時用到：
+1. 上面嘅行程要求（目的地、日數、偏好、同行；其他要求入面如果有出發日期都要跟）
+2. 每個地方嘅 opening_hours：唔好排喺明顯未開門或休息時段；冇時間就唔好假設 24 小時
+3. 距離同地理：同一區、地址相近嘅排同一日、順路走；唔好同一日跨好遠嘅城市（例如福岡同東京）。多個城市就按城市分日
+4. 偏好：美食多排餐廳；甜品／咖啡留下午；景點做主線；購物、文化、自然就按偏好加比重
+5. 同行：自己一個可以密啲；情侶留食飯時間；朋友可以一齊行；家庭（有小朋友）同長輩同行就少步行、多休息、唔好太早太晚
+
+其他：
 - 每日由朝到晚排大約時間（time，例如 09:30），早餐／午餐／晚餐 is_meal=true，優先用清單入面嘅餐廳、cafe、甜品
-- 地方太多就揀重點，太少就留自由時間，唔好硬塞
+- 地方太多就揀合偏好嘅重點，太少就留自由時間，唔好硬塞
 - place_name 用繁體中文（可附原文），activity 用廣東話口吻一句
 - maps_query：原文名 + 地址或地區，方便 Google Maps
-- 如果清單有 opening_hours，唔好排喺明顯未開門嘅時段
-- tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實
-- 其他國家目的地同樣照辦，唔好硬改成日本"""
+- tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實營業時間"""
 
 ENRICH_PROMPT = """你係日本旅行助手。用家貼咗地方名或 Google Maps 搜尋字，請整理成地點清單。
 預設日本；如果名稱明顯係其他地方，照實填，唔好硬套日本。
@@ -289,8 +311,20 @@ def _friendly_api_error(exc: Exception) -> str:
     return "連接 AI 服務失敗，請稍後再試。"
 
 
-def _chunk_places(client, model: str, images: list[bytes], *, parse_attempts: int, retry_sleep: float) -> list[dict]:
-    contents: list = [PLACES_PROMPT.format(n=len(images))]
+def _places_prompt(n: int, trip: dict) -> str:
+    return PLACES_PROMPT.format(
+        n=n,
+        destination=(trip.get("destination") or "").strip() or "日本",
+        preferences=(trip.get("preferences") or "").strip() or "（冇特別偏好）",
+        party=(trip.get("party") or "").strip() or "（未指定）",
+        remarks=(trip.get("remarks") or "").strip() or "（冇）",
+    )
+
+
+def _chunk_places(
+    client, model: str, images: list[bytes], trip: dict, *, parse_attempts: int, retry_sleep: float,
+) -> list[dict]:
+    contents: list = [_places_prompt(len(images), trip)]
     for idx, data in enumerate(images, start=1):
         contents.append(f"圖片 #{idx}")
         contents.append(types.Part.from_bytes(data=data, mime_type="image/jpeg"))
@@ -307,10 +341,10 @@ def _chunk_places(client, model: str, images: list[bytes], *, parse_attempts: in
     )
 
 
-def _run_chunk(client, model, start: int, chunk: list[bytes], *, parse_attempts: int, retry_sleep: float):
+def _run_chunk(client, model, start: int, chunk: list[bytes], trip: dict, *, parse_attempts: int, retry_sleep: float):
     try:
         places = _chunk_places(
-            client, model, chunk, parse_attempts=parse_attempts, retry_sleep=retry_sleep,
+            client, model, chunk, trip, parse_attempts=parse_attempts, retry_sleep=retry_sleep,
         )
     except GeminiError as err:
         return [], str(err)
@@ -333,6 +367,10 @@ def analyze_screenshots(
     model: str,
     images: list[bytes],
     *,
+    remarks: str = "",
+    destination: str = "",
+    preferences: str = "",
+    party: str = "",
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_workers: int = DEFAULT_MAX_WORKERS,
     parse_attempts: int = 2,
@@ -345,6 +383,12 @@ def analyze_screenshots(
     """
     if not images:
         return AnalysisResult([], [])
+    trip = {
+        "remarks": remarks,
+        "destination": destination,
+        "preferences": preferences,
+        "party": party,
+    }
     size = max(1, int(chunk_size))
     chunks: list[tuple[int, list[bytes]]] = []
     start = 0
@@ -355,7 +399,7 @@ def analyze_screenshots(
     ordered: list[tuple[list[dict], str | None]] = [([], None) for _ in chunks]
     if len(chunks) == 1:
         ordered[0] = _run_chunk(
-            client, model, chunks[0][0], chunks[0][1],
+            client, model, chunks[0][0], chunks[0][1], trip,
             parse_attempts=parse_attempts, retry_sleep=retry_sleep,
         )
     else:
@@ -363,7 +407,7 @@ def analyze_screenshots(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = {
                 pool.submit(
-                    _run_chunk, client, model, offset, chunk,
+                    _run_chunk, client, model, offset, chunk, trip,
                     parse_attempts=parse_attempts, retry_sleep=retry_sleep,
                 ): index
                 for index, (offset, chunk) in enumerate(chunks)
@@ -384,7 +428,10 @@ def analyze_screenshots(
         warnings.append(
             f"有 {len(failures)} 組截圖分析失敗，其餘地方已列出。{failures[0]} 可以撳「再分析」補返。"
         )
-    return AnalysisResult(trip_core.dedupe_places(places), warnings)
+    kept, note = trip_core.apply_caption_filter(trip_core.dedupe_places(places), remarks)
+    if note:
+        warnings.append(note)
+    return AnalysisResult(kept, warnings)
 
 
 def enrich_places(
@@ -426,7 +473,8 @@ def enrich_places(
 
 def generate_itinerary(client, model: str, places: list[dict], days: int,
                        destination: str = "", notes: str = "",
-                       *, parse_attempts: int = 2, retry_sleep: float = 0.4) -> dict:
+                       *, preferences: str = "", party: str = "",
+                       parse_attempts: int = 2, retry_sleep: float = 0.4) -> dict:
     slim = [
         {
             k: p.get(k)
@@ -438,6 +486,8 @@ def generate_itinerary(client, model: str, places: list[dict], days: int,
     prompt = ITINERARY_PROMPT.format(
         days=days,
         destination=(destination or "").strip() or "日本",
+        preferences=(preferences or "").strip() or "（冇特別偏好）",
+        party=(party or "").strip() or "（未指定）",
         notes=(notes or "").strip() or "（冇）",
         places_json=json.dumps(slim, ensure_ascii=False, indent=1),
     )

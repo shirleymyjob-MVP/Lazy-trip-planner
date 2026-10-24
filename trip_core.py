@@ -4,6 +4,7 @@
 """
 from __future__ import annotations
 
+import base64
 import io
 import ipaddress
 import json
@@ -21,16 +22,59 @@ from PIL import Image, ImageOps
 MAX_IMAGE_SIDE = 1280
 JPEG_QUALITY = 80
 
-# QA 快樂路徑仍然係 2 下：要求有預設，唔使先撳儲存。
-# 畫面順序係 行程要求 → 提供來源 → 生成行程。
-HAPPY_PATH_TAPS = 2
+# 兩段分開計，唔好併成一個「而家就要做完」嘅步數。
+# 放入行程匣：貼上係 1 步（備註可順手寫，唔使再確認）。iPhone 可能要先撳一下貼上框。
+# 稍後排行程：預設全選，撳「開始排行程」係 1 步。改城市／日數／偏好／同行係選項。
+CAPTURE_TO_INBOX_TAPS = 1
+PLAN_FROM_INBOX_TAPS = 1
 HAPPY_PATH_CAPTION = (
-    f"手動步數（快樂路徑）：{HAPPY_PATH_TAPS}。"
-    "畫面順序：行程要求（預設日本、3 日，唔使改）→ 提供來源 → 生成行程。"
-    "① 上傳截圖（自動認地方）或貼店名／Google Maps 連結後撳「認地方」"
-    "② 撳「生成行程」（地點預設全選）。"
-    "地址、營業時間、評分喺地點卡同行程入面，唔使離開呢版去 Google Maps 對基本資料。"
+    f"放入行程匣：{CAPTURE_TO_INBOX_TAPS} 步。"
+    "貼上截圖（Cmd/Ctrl+V 或「從剪貼簿貼上」）就會自動認地方並放進行程匣，未填日期同偏好都收得。"
+    "備註可順手寫，例如「只要圖中 1、4」，唔使再撳確認。"
+    "iPhone 撳完「複製並刪除」之後，可能要先撳一下貼上框再貼上。"
+    f"稍後排行程：{PLAN_FROM_INBOX_TAPS} 步。"
+    "行程匣有地方之後，預設全選，撳「開始排行程」。"
+    "目的地預設日本、3 日、美食同景點、同朋友；想改先選，唔使儲存。"
+    "地址、營業時間、評分喺行程匣卡同行程入面，唔使離開呢版去 Google Maps 對基本資料。"
 )
+
+# 目的地清單（2026-10-24 核對，冬季節由 10 月 25 日開始）：
+# 國泰 CX 自營香港直飛：東京（HND／NRT）、大阪（KIX）、名古屋（NGO）、福岡（FUK）、札幌（CTS）。
+# 香港快運 UO 而家訂到直飛：東京、大阪、名古屋、福岡、沖繩（那霸）、廣島、仙台、高松、小松。
+# 石垣係 UO 季節線（2026 年夏飛到 8 月，下一季約 2027 年 3 月先再有票）。
+# 未列入：靜岡（2025-10 起停飛）、宮古／下地島（2025-10 後冇班）、鹿兒島、熊本、長崎（冇直航）。
+# 京都冇機場，當熱門城市，經大阪關西。
+DESTINATION_DEFAULT = "日本（未指定城市）"
+DESTINATION_OTHER = "其他（自己填）"
+# (畫面選項, 交俾 AI 嘅目的地, 種類)
+DESTINATION_OPTIONS: tuple[tuple[str, str, str], ...] = (
+    (DESTINATION_DEFAULT, "日本", "default"),
+    ("東京（國泰、香港快運直飛）", "東京", "popular"),
+    ("大阪（國泰、香港快運直飛）", "大阪", "popular"),
+    ("京都（熱門，經大阪關西）", "京都（經大阪關西）", "popular"),
+    ("福岡（國泰、香港快運直飛）", "福岡", "popular"),
+    ("札幌（國泰直飛新千歲）", "札幌", "popular"),
+    ("名古屋（國泰、香港快運直飛）", "名古屋", "popular"),
+    ("沖繩・那霸（香港快運直飛）", "沖繩（那霸）", "popular"),
+    ("廣島（香港快運直飛）", "廣島", "direct"),
+    ("仙台（香港快運直飛）", "仙台", "direct"),
+    ("高松（香港快運直飛）", "高松", "direct"),
+    ("小松（香港快運直飛）", "小松", "direct"),
+    ("石垣（香港快運季節直飛）", "石垣", "direct"),
+    (DESTINATION_OTHER, "", "other"),
+)
+ROUTE_NOTE = (
+    "包括熱門城市，同國泰或香港快運由香港直飛嘅日本城市（2026年10月，包括福岡）。"
+    "京都經大阪。石垣係季節線。自由文字只係揀「其他」先出現。"
+)
+
+PREFERENCE_OPTIONS = ("美食", "甜品／咖啡", "景點", "購物", "文化體驗", "自然／戶外", "其他")
+PREFERENCE_DEFAULT = ("美食", "景點")
+PARTY_OPTIONS = ("自己一個", "情侶", "朋友", "家庭（有小朋友）", "長輩同行", "其他")
+PARTY_DEFAULT = "朋友"
+DAY_OPTIONS = tuple(str(n) for n in range(1, 15))
+DAY_DEFAULT = "3"
+OTHER_CHOICE = "其他"
 
 CATEGORIES = ("restaurant", "cafe", "dessert", "attraction", "shop", "other")
 CATEGORY_LABELS = {
@@ -192,6 +236,295 @@ def _to_int_list(value: Any) -> list[int]:
     return out
 
 
+_CITY_HINTS = (
+    ("福岡", "福岡"),
+    ("博多", "福岡"),
+    ("fukuoka", "福岡"),
+    ("hakata", "福岡"),
+    ("東京", "東京"),
+    ("tokyo", "東京"),
+    ("大阪", "大阪"),
+    ("osaka", "大阪"),
+    ("京都", "京都"),
+    ("kyoto", "京都"),
+    ("札幌", "札幌"),
+    ("北海道", "札幌"),
+    ("sapporo", "札幌"),
+    ("名古屋", "名古屋"),
+    ("nagoya", "名古屋"),
+    ("廣島", "廣島"),
+    ("広島", "廣島"),
+    ("hiroshima", "廣島"),
+    ("仙台", "仙台"),
+    ("sendai", "仙台"),
+    ("高松", "高松"),
+    ("takamatsu", "高松"),
+    ("小松", "小松"),
+    ("komatsu", "小松"),
+    ("石垣", "石垣"),
+    ("ishigaki", "石垣"),
+    ("那霸", "沖繩"),
+    ("沖繩", "沖繩"),
+    ("沖縄", "沖繩"),
+    ("okinawa", "沖繩"),
+    ("naha", "沖繩"),
+)
+
+
+def infer_city(places: Iterable[dict]) -> str:
+    """由地點嘅地區／地址估一個城市。博多、福岡縣都算福岡。估唔到就空字串。"""
+    scores: dict[str, int] = {}
+    for place in places or []:
+        blob = " ".join(
+            str(place.get(key) or "")
+            for key in ("area", "address", "name", "name_zh", "notes")
+        ).lower()
+        for needle, city in _CITY_HINTS:
+            if needle.lower() in blob:
+                scores[city] = scores.get(city, 0) + 1
+                break
+    if not scores:
+        return ""
+    return max(scores, key=lambda city: (scores[city], city))
+
+
+def decode_clipboard_payload(payload: Any, *, max_chars: int = 12_000_000) -> tuple[str, bytes, str] | None:
+    """將貼上元件交返嚟嘅 JSON 變成 (id, jpeg, 備註)。唔係圖片或太大就回傳 None。"""
+    if not isinstance(payload, dict):
+        return None
+    paste_id = str(payload.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{16,64}", paste_id):
+        return None
+    remark = str(payload.get("remark") or "").strip()[:200]
+    raw = payload.get("data") or ""
+    if not isinstance(raw, str) or not raw or len(raw) > max_chars:
+        return None
+    try:
+        data = base64.b64decode(raw, validate=True)
+    except (ValueError, TypeError):
+        return None
+    if not data or len(data) > 8_000_000:
+        return None
+    try:
+        jpeg = prepare_image(data)
+    except Exception:  # noqa: BLE001 - 剪貼簿可以係任何位元組
+        return None
+    return paste_id, jpeg, remark
+
+
+def destination_labels() -> list[str]:
+    return [label for label, _dest, _kind in DESTINATION_OPTIONS]
+
+
+def _destination_row(label: str) -> tuple[str, str, str] | None:
+    for row in DESTINATION_OPTIONS:
+        if row[0] == label:
+            return row
+    return None
+
+
+def compose_trip_request(
+    destination_label: str,
+    *,
+    destination_other: str = "",
+    days: str | int = DAY_DEFAULT,
+    preferences: Iterable[str] | None = None,
+    preference_other: str = "",
+    party: str = PARTY_DEFAULT,
+    party_other: str = "",
+    start_date: str = "",
+    remarks: str = "",
+) -> dict:
+    """將畫面選項收成分析同排行程用嘅字串。自由文字只係揀咗「其他」先用。"""
+    row = _destination_row(destination_label or DESTINATION_DEFAULT)
+    if row is None or row[2] == "other":
+        destination = (destination_other or "").strip() or "日本"
+    else:
+        destination = row[1]
+    try:
+        day_count = int(str(days).strip())
+    except (TypeError, ValueError):
+        day_count = int(DAY_DEFAULT)
+    day_count = max(1, min(14, day_count))
+    chosen = list(preferences) if preferences is not None else list(PREFERENCE_DEFAULT)
+    pref_bits: list[str] = []
+    for item in chosen:
+        if item == OTHER_CHOICE:
+            extra = (preference_other or "").strip()
+            pref_bits.append(extra or OTHER_CHOICE)
+        elif item:
+            pref_bits.append(str(item))
+    if (party or "") == OTHER_CHOICE:
+        party_text = (party_other or "").strip() or OTHER_CHOICE
+    else:
+        party_text = (party or "").strip() or PARTY_DEFAULT
+    notes: list[str] = []
+    if (start_date or "").strip():
+        notes.append(f"出發日期：{start_date.strip()}")
+    if OTHER_CHOICE in chosen and (preference_other or "").strip():
+        notes.append(preference_other.strip())
+    if (party or "") == OTHER_CHOICE and (party_other or "").strip():
+        notes.append(f"同行：{party_other.strip()}")
+    return {
+        "destination": destination,
+        "days": day_count,
+        "preferences": "、".join(pref_bits) or "（冇特別偏好）",
+        "party": party_text,
+        "notes": "；".join(notes),
+        "remarks": (remarks or "").strip(),
+        "start_date": (start_date or "").strip(),
+    }
+
+
+_CIRCLED_DIGITS = "①②③④⑤⑥⑦⑧⑨⑩⑪⑫⑬⑭⑮⑯⑰⑱⑲⑳"
+
+
+def caption_mark(index: int) -> str:
+    if 1 <= index <= len(_CIRCLED_DIGITS):
+        return _CIRCLED_DIGITS[index - 1]
+    return str(index)
+
+
+def normalize_caption_index(value: Any) -> int:
+    if value is None or value is False:
+        return 0
+    text = _clean_str(value)
+    if not text:
+        return 0
+    if text in _CIRCLED_DIGITS:
+        return _CIRCLED_DIGITS.index(text) + 1
+    chars: list[str] = []
+    for ch in text:
+        if ch in _CIRCLED_DIGITS:
+            chars.append(str(_CIRCLED_DIGITS.index(ch) + 1))
+        elif "０" <= ch <= "９":
+            chars.append(chr(ord(ch) - ord("０") + ord("0")))
+        else:
+            chars.append(ch)
+    match = re.search(r"\d+", "".join(chars))
+    if not match:
+        return 0
+    number = int(match.group())
+    if 1 <= number <= 30:
+        return number
+    return 0
+
+
+def _normalize_remark_digits(text: str) -> str:
+    chars: list[str] = []
+    for ch in text:
+        if ch in _CIRCLED_DIGITS:
+            chars.append(str(_CIRCLED_DIGITS.index(ch) + 1))
+            chars.append(" ")
+        elif "０" <= ch <= "９":
+            chars.append(chr(ord(ch) - ord("０") + ord("0")))
+        else:
+            chars.append(ch)
+    return "".join(chars)
+
+
+def _numbers_from_fragment(fragment: str) -> list[int]:
+    found: list[int] = []
+    for raw in re.findall(r"\d+", fragment or ""):
+        number = int(raw)
+        if 1 <= number <= 30 and number not in found:
+            found.append(number)
+    return found
+
+
+_EXCLUDE_NUMBERS = re.compile(
+    r"(?:唔要|不要|唔需|不需要|排除|除外|去掉|刪除|删掉|skip)"
+    r"[^0-9]{0,12}"
+    r"((?:\d+\s*[、，,和及同&\s]*)+)",
+    re.IGNORECASE,
+)
+_INCLUDE_NUMBERS = re.compile(
+    r"(?:只要|只係|只留|僅留|僅要|僅|只想|想要)"
+    r"[^0-9]{0,16}"
+    r"((?:\d+\s*[、，,和及同&\s]*)+)",
+    re.IGNORECASE,
+)
+_CAPTION_NUMBERS = re.compile(
+    r"(?:圖中|圖入面|圖入邊|圖裏|圖里|圖片中|編號|caption)"
+    r"[^0-9]{0,8}"
+    r"((?:\d+\s*[、，,和及同&\s]*)+)",
+    re.IGNORECASE,
+)
+
+
+def _collect_numbers(pattern: re.Pattern, source: str) -> tuple[list[int], list[tuple[int, int]]]:
+    numbers: list[int] = []
+    spans: list[tuple[int, int]] = []
+    for match in pattern.finditer(source):
+        for number in _numbers_from_fragment(match.group(1)):
+            if number not in numbers:
+                numbers.append(number)
+        spans.append(match.span())
+    return numbers, spans
+
+
+def parse_caption_filter(remarks: str | None) -> dict | None:
+    """由備註抽出要留或要剔除嘅圖中編號。冇指示就回傳 None。
+
+    「只要圖中 1、4」「圖中1，4」「①④」→ keep。
+    「唔要／不要 2、3」→ drop，唔會當成要留。
+    """
+    raw = (remarks or "").strip()
+    if not raw:
+        return None
+    text = _normalize_remark_digits(raw)
+    drop, drop_spans = _collect_numbers(_EXCLUDE_NUMBERS, text)
+    masked = list(text)
+    for start, end in drop_spans:
+        for pos in range(start, end):
+            masked[pos] = " "
+    masked_text = "".join(masked)
+    keep, _spans = _collect_numbers(_INCLUDE_NUMBERS, masked_text)
+    if not keep:
+        keep, _spans = _collect_numbers(_CAPTION_NUMBERS, masked_text)
+    if not keep and not drop:
+        leftover = re.sub(r"[\d\s、，,和及同&／/．.]+", "", text)
+        if leftover == "" and re.search(r"\d", text):
+            keep = _numbers_from_fragment(text)
+    if not keep and not drop:
+        return None
+    spec: dict = {}
+    if keep:
+        spec["keep"] = set(keep)
+    if drop:
+        spec["drop"] = set(drop)
+    return spec
+
+
+def apply_caption_filter(places: Iterable[dict], remarks: str | None) -> tuple[list[dict], str]:
+    """按備註篩編號。認到嘅地方完全冇 caption_index 時唔好清空，只加警告。"""
+    items = [dict(place) for place in places or []]
+    spec = parse_caption_filter(remarks)
+    if not spec:
+        return items, ""
+    if not any(int(place.get("caption_index") or 0) for place in items):
+        return items, "備註提到圖中編號，但認到嘅地方未有編號，所以未有篩走。請再睇下清單。"
+    keep = spec.get("keep")
+    drop = spec.get("drop") or set()
+    filtered: list[dict] = []
+    for place in items:
+        index = int(place.get("caption_index") or 0)
+        if keep is not None and index not in keep:
+            continue
+        if index and index in drop:
+            continue
+        filtered.append(place)
+    if not filtered:
+        return items, "按備註篩完冇剩餘地方，已保留全部結果。可以改備註再分析。"
+    if len(filtered) == len(items):
+        return filtered, ""
+    if keep is not None:
+        marks = "、".join(caption_mark(n) for n in sorted(keep))
+        return filtered, f"已按備註只留圖中 {marks}。"
+    marks = "、".join(caption_mark(n) for n in sorted(drop))
+    return filtered, f"已按備註拿走路圖中 {marks}。"
+
+
 def normalize_place(raw: dict) -> dict | None:
     """將一個模型回傳嘅 place 整理成固定 schema；冇名就回傳 None。"""
     if not isinstance(raw, dict):
@@ -212,6 +545,7 @@ def normalize_place(raw: dict) -> dict | None:
         "notes": _clean_str(raw.get("notes")),
         "confidence": normalize_confidence(raw.get("confidence")),
         "source_images": _to_int_list(src),
+        "caption_index": normalize_caption_index(raw.get("caption_index")),
     }
 
 
@@ -243,6 +577,8 @@ def _merge(a: dict, b: dict) -> dict:
         merged["notes"] = "；".join(x for x in (merged.get("notes"), b["notes"]) if x)
     if merged.get("category") == "other" and b.get("category") != "other":
         merged["category"] = b["category"]
+    if not merged.get("caption_index") and b.get("caption_index"):
+        merged["caption_index"] = b["caption_index"]
     rank = {"高": 0, "中": 1, "低": 2}
     if rank.get(b.get("confidence"), 1) < rank.get(merged.get("confidence"), 1):
         merged["confidence"] = b["confidence"]

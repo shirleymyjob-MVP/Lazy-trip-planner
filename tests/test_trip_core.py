@@ -292,9 +292,11 @@ def test_attach_place_facts_onto_itinerary():
     assert "地址：東京都渋谷区神南1-22-7" in md
     assert "營業時間：24小時" in md
     assert "評分：4.2/5" in md
-    assert trip_core.HAPPY_PATH_TAPS == 2
-    assert "行程要求" in trip_core.HAPPY_PATH_CAPTION
-    assert "提供來源" in trip_core.HAPPY_PATH_CAPTION
+    assert trip_core.CAPTURE_TO_INBOX_TAPS == 1
+    assert trip_core.PLAN_FROM_INBOX_TAPS == 1
+    assert "行程匣" in trip_core.HAPPY_PATH_CAPTION
+    assert "開始排行程" in trip_core.HAPPY_PATH_CAPTION
+    assert "貼店名" not in trip_core.HAPPY_PATH_CAPTION
 
 
 def test_empty_response_is_retried_then_parsed():
@@ -379,3 +381,153 @@ def test_enrich_places_keeps_seed_when_model_adds_facts():
     assert result.places[0]["rating"] == "4.4/5"
     prompt = client.models.generate_content.call_args.kwargs["contents"]
     assert "淺草寺" in prompt and "唔好硬套日本" in prompt
+
+
+def _fukuoka_places():
+    names = [
+        (1, "鉄板焼 日和", "鐵板燒 日和", "restaurant"),
+        (2, "OLGA LE BON BON DONUTS", "Olga 甜甜圈", "dessert"),
+        (3, "Hakata Tempura NAGAOKA", "博多天婦羅 NAGAOKA", "restaurant"),
+        (4, "GELATERIA SAKURA", "櫻花雪糕", "dessert"),
+    ]
+    return [
+        {
+            "name": name, "name_zh": zh, "category": category,
+            "area": "博多, 福岡", "address": "福岡市", "opening_hours": "11:00-20:00",
+            "rating": "4.0/5", "confidence": "高", "source_images": [1],
+            "caption_index": index,
+        }
+        for index, name, zh, category in names
+    ]
+
+
+def test_direct_city_list_includes_fukuoka_and_skips_ended_routes():
+    labels = " ".join(trip_core.destination_labels())
+    for city in ("東京", "大阪", "京都", "福岡", "札幌", "名古屋", "那霸", "廣島", "仙台", "高松", "小松", "石垣"):
+        assert city in labels
+    for city in ("鹿兒島", "熊本", "長崎", "靜岡", "宮古", "下地島"):
+        assert city not in labels
+    request = trip_core.compose_trip_request("福岡（國泰、香港快運直飛）")
+    assert request["destination"] == "福岡"
+    assert request["days"] == 3
+    assert request["preferences"] == "美食、景點"
+    assert request["party"] == "朋友"
+    kyoto = trip_core.compose_trip_request("京都（熱門，經大阪關西）")
+    assert "大阪" in kyoto["destination"]
+    other = trip_core.compose_trip_request(
+        trip_core.DESTINATION_OTHER,
+        destination_other="韓國首爾",
+        days="2",
+        preferences=["購物", "其他"],
+        preference_other="唔想行太多",
+        party="其他",
+        party_other="兩代同遊",
+        start_date="2026-11-01",
+    )
+    assert other["destination"] == "韓國首爾"
+    assert other["days"] == 2
+    assert other["preferences"] == "購物、唔想行太多"
+    assert other["party"] == "兩代同遊"
+    assert "出發日期：2026-11-01" in other["notes"]
+    assert "唔想行太多" in other["notes"]
+
+
+def test_caption_filter_keeps_requested_numbers():
+    places = _fukuoka_places()
+    for remarks in ("只要圖中 1、4", "圖中1，4", "①④"):
+        kept, note = trip_core.apply_caption_filter(places, remarks)
+        assert [place["caption_index"] for place in kept] == [1, 4], remarks
+        assert "①" in note and "④" in note
+    dropped, note = trip_core.apply_caption_filter(places, "唔要圖中 2、3")
+    assert [place["caption_index"] for place in dropped] == [1, 4]
+    assert "拿走路" in note
+    unnumbered = [{**place, "caption_index": 0} for place in places]
+    kept, note = trip_core.apply_caption_filter(unnumbered, "只要圖中 1、4")
+    assert len(kept) == 4
+    assert "未有編號" in note
+    untouched, note = trip_core.apply_caption_filter(places, "想食拉麵")
+    assert len(untouched) == 4 and note == ""
+
+
+def test_analyze_passes_remarks_and_filters_caption_index():
+    client = mock.MagicMock()
+    payload = {"places": [
+        {**place, "caption_index": place["caption_index"]}
+        for place in _fukuoka_places()
+    ]}
+    client.models.generate_content.return_value = _Resp(json.dumps(payload, ensure_ascii=False))
+    result = gemini_client.analyze_screenshots(
+        client, "m", [b"x"],
+        remarks="只要圖中 1、4",
+        destination="福岡",
+        preferences="美食、景點",
+        party="朋友",
+        retry_sleep=0,
+    )
+    assert [place["name"] for place in result.places] == ["鉄板焼 日和", "GELATERIA SAKURA"]
+    assert any("①" in warning for warning in result.warnings)
+    prompt = client.models.generate_content.call_args.kwargs["contents"][0]
+    assert "只要圖中 1、4" in prompt
+    assert "福岡" in prompt
+    assert "美食" in prompt
+    assert "caption_index" in prompt
+    assert "唔好硬套日本" in prompt
+
+
+def test_itinerary_prompt_uses_preferences_party_and_hours():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps(ITIN, ensure_ascii=False))
+    places = trip_core.parse_places_response(json.dumps(PLACES_JSON, ensure_ascii=False))
+    gemini_client.generate_itinerary(
+        client, "m", places, 4, "福岡", "出發日期：2026-11-01",
+        preferences="美食、景點", party="家庭（有小朋友）",
+    )
+    prompt = client.models.generate_content.call_args.kwargs["contents"]
+    assert "4 日" in prompt and "福岡" in prompt
+    assert "美食、景點" in prompt
+    assert "家庭（有小朋友）" in prompt
+    assert "出發日期：2026-11-01" in prompt
+    assert "opening_hours" in prompt
+    assert "距離" in prompt
+
+
+def test_infer_city_fukuoka_from_caption_address():
+    places = [{
+        "name": "博多炉端 魚男",
+        "name_zh": "博多爐端 魚男",
+        "area": "中洲, 福岡",
+        "address": "福岡縣福岡市中央區今泉 1-4-23",
+    }]
+    assert trip_core.infer_city(places) == "福岡"
+    assert trip_core.infer_city([{"area": "澀谷, 東京", "address": ""}]) == "東京"
+    assert trip_core.infer_city([{"name": "某店", "area": ""}]) == ""
+
+
+def test_decode_clipboard_payload_accepts_image_and_remark():
+    raw = _img_bytes("RGB", (20, 10))
+    import base64
+    payload = {
+        "id": "ab" * 16,
+        "remark": "只要圖中 1、4",
+        "data": base64.b64encode(raw).decode(),
+    }
+    decoded = trip_core.decode_clipboard_payload(payload)
+    assert decoded is not None
+    paste_id, jpeg, remark = decoded
+    assert paste_id == payload["id"]
+    assert remark == "只要圖中 1、4"
+    assert jpeg[:2] == b"\xff\xd8"
+    assert trip_core.decode_clipboard_payload({"id": "nope", "data": payload["data"]}) is None
+    assert trip_core.decode_clipboard_payload(None) is None
+
+
+def test_paste_component_offers_clipboard_and_paste_target():
+    html = open(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "components", "inbox_paste", "index.html"),
+        encoding="utf-8",
+    ).read()
+    assert "從剪貼簿貼上" in html
+    assert "paste" in html
+    assert "clipboard.read" in html
+    assert "streamlit:setComponentValue" in html
+    assert "只要圖中 1、4" in html
