@@ -31,6 +31,7 @@ HAPPY_PATH_CAPTION = (
     f"放入行程匣：{CAPTURE_TO_INBOX_TAPS} 步。"
     "貼上截圖（Cmd/Ctrl+V 或「從剪貼簿貼上」）就會自動認地方並放進行程匣，未填日期同偏好都收得。"
     "備註可順手寫，例如「只要圖中 1、4」，唔使再撳確認。"
+    "貼上唔使揀城市，分析完會按畫面自動標地區；睇唔準就係未分類，可以之後一撳改。"
     "iPhone 撳完「複製並刪除」之後，可能要先撳一下貼上框再貼上。"
     f"稍後排行程：{PLAN_FROM_INBOX_TAPS} 步。"
     "行程匣有地方之後，預設全選，撳「開始排行程」。"
@@ -269,23 +270,116 @@ _CITY_HINTS = (
     ("okinawa", "沖繩"),
     ("naha", "沖繩"),
 )
+# 區名／英文別名。今泉、博多、Hakata 都歸福岡，唔使用家先揀。
+_DISTRICT_HINTS = (
+    ("今泉", "福岡"),
+    ("中洲", "福岡"),
+    ("天神", "福岡"),
+    ("博多", "福岡"),
+    ("hakata", "福岡"),
+    ("渋谷", "東京"),
+    ("澀谷", "東京"),
+    ("新宿", "東京"),
+    ("淺草", "東京"),
+    ("浅草", "東京"),
+    ("銀座", "東京"),
+    ("道頓堀", "大阪"),
+    ("心齋橋", "大阪"),
+    ("心斎橋", "大阪"),
+    ("難波", "大阪"),
+    ("梅田", "大阪"),
+    ("祇園", "京都"),
+    ("嵐山", "京都"),
+    ("國際通", "沖繩"),
+    ("薄野", "札幌"),
+)
+UNSORTED_REGION = "未分類"
+REGION_CONFIDENT = "高"
+REGION_LOW = "低"
+REGION_MANUAL = "手動"
+QUICK_REGION_FIXES = ("福岡", "東京", "大阪", "京都", "札幌", "名古屋", "沖繩", "廣島")
+
+
+def _region_blob(places: Iterable[dict] | None, remark: str = "") -> str:
+    parts = [remark or ""]
+    for place in places or []:
+        parts.extend(
+            str(place.get(key) or "")
+            for key in ("area", "address", "name", "name_zh", "notes")
+        )
+    text = " ".join(parts)
+    # 「東京都」入面有「京都」兩個字，唔好因此當京都。
+    text = text.replace("東京都", "東京")
+    return text.lower()
+
+
+def classify_region(places: Iterable[dict] | None = None, remark: str = "") -> tuple[str, str]:
+    """由截圖認到嘅字同備註估地區。
+
+    只得一個明確地區先算高信心。幾個地區打和，或者完全估唔到，就係低信心（畫面顯示未分類）。
+    """
+    blob = _region_blob(places, remark)
+    hits: dict[str, int] = {}
+    for needle, city in (*_DISTRICT_HINTS, *_CITY_HINTS):
+        if needle.lower() in blob:
+            hits[city] = hits.get(city, 0) + 1
+    if len(hits) == 1:
+        return next(iter(hits)), REGION_CONFIDENT
+    if not hits:
+        return "", REGION_LOW
+    best = max(hits.values())
+    winners = [city for city, count in hits.items() if count == best]
+    if len(winners) == 1 and best >= 2:
+        return winners[0], REGION_CONFIDENT
+    return "", REGION_LOW
 
 
 def infer_city(places: Iterable[dict]) -> str:
-    """由地點嘅地區／地址估一個城市。博多、福岡縣都算福岡。估唔到就空字串。"""
-    scores: dict[str, int] = {}
-    for place in places or []:
-        blob = " ".join(
-            str(place.get(key) or "")
-            for key in ("area", "address", "name", "name_zh", "notes")
-        ).lower()
-        for needle, city in _CITY_HINTS:
-            if needle.lower() in blob:
-                scores[city] = scores.get(city, 0) + 1
-                break
-    if not scores:
+    """高信心先返回城市。博多、今泉、福岡縣都算福岡。估唔準就空字串。"""
+    city, confidence = classify_region(places)
+    if confidence != REGION_CONFIDENT:
         return ""
-    return max(scores, key=lambda city: (scores[city], city))
+    return city
+
+
+def inbox_region_name(item: dict) -> str:
+    """行程匣項目用來分組嘅地區。低信心或者未有城市就係未分類。"""
+    city = (item.get("city") or "").strip()
+    confidence = item.get("region_confidence")
+    if confidence == REGION_LOW:
+        return UNSORTED_REGION
+    if city:
+        return city
+    return UNSORTED_REGION
+
+
+def group_inbox(items: Iterable[dict]) -> list[tuple[str, list[dict]]]:
+    """按地區分組。已知城市先，未分類放最後。"""
+    buckets: dict[str, list[dict]] = {}
+    for item in items or []:
+        name = inbox_region_name(item)
+        buckets.setdefault(name, []).append(item)
+
+    def sort_key(name: str) -> tuple:
+        if name == UNSORTED_REGION:
+            return (2, 0, name)
+        if name in QUICK_REGION_FIXES:
+            return (0, QUICK_REGION_FIXES.index(name), name)
+        return (1, 0, name)
+
+    return [(name, buckets[name]) for name in sorted(buckets, key=sort_key)]
+
+
+def shared_inbox_region(items: Iterable[dict]) -> str:
+    """揀咗嘅項目如果都係同一個已分類地區，就返回嗰個地區。"""
+    names = {
+        inbox_region_name(item)
+        for item in items or []
+        if inbox_region_name(item) != UNSORTED_REGION
+    }
+    if len(names) == 1:
+        return next(iter(names))
+    return ""
 
 
 def decode_clipboard_payload(payload: Any, *, max_chars: int = 12_000_000) -> tuple[str, bytes, str] | None:

@@ -296,6 +296,7 @@ def test_attach_place_facts_onto_itinerary():
     assert trip_core.PLAN_FROM_INBOX_TAPS == 1
     assert "行程匣" in trip_core.HAPPY_PATH_CAPTION
     assert "開始排行程" in trip_core.HAPPY_PATH_CAPTION
+    assert "未分類" in trip_core.HAPPY_PATH_CAPTION
     assert "貼店名" not in trip_core.HAPPY_PATH_CAPTION
 
 
@@ -501,6 +502,38 @@ def test_infer_city_fukuoka_from_caption_address():
     assert trip_core.infer_city(places) == "福岡"
     assert trip_core.infer_city([{"area": "澀谷, 東京", "address": ""}]) == "東京"
     assert trip_core.infer_city([{"name": "某店", "area": ""}]) == ""
+    assert trip_core.infer_city([
+        {"area": "東京", "address": ""},
+        {"area": "福岡", "address": ""},
+    ]) == ""
+
+
+def test_classify_region_from_caption_words_and_group_inbox():
+    city, confidence = trip_core.classify_region(remark="今泉")
+    assert (city, confidence) == ("福岡", trip_core.REGION_CONFIDENT)
+    city, confidence = trip_core.classify_region([{"name": "Hakata Tempura"}])
+    assert (city, confidence) == ("福岡", trip_core.REGION_CONFIDENT)
+    city, confidence = trip_core.classify_region([{"address": "東京都千代田區"}])
+    assert (city, confidence) == ("東京", trip_core.REGION_CONFIDENT)
+    city, confidence = trip_core.classify_region([{"address": "京都府京都市"}])
+    assert (city, confidence) == ("京都", trip_core.REGION_CONFIDENT)
+    city, confidence = trip_core.classify_region([
+        {"area": "東京"},
+        {"area": "福岡"},
+    ])
+    assert (city, confidence) == ("", trip_core.REGION_LOW)
+
+    fukuoka = {"city": "福岡", "region_confidence": trip_core.REGION_CONFIDENT}
+    tokyo = {"city": "東京", "region_confidence": trip_core.REGION_CONFIDENT}
+    unsorted = {"city": "", "region_confidence": trip_core.REGION_LOW}
+    manual = {"city": "大阪", "region_confidence": trip_core.REGION_MANUAL}
+    grouped = trip_core.group_inbox([unsorted, tokyo, fukuoka, manual])
+    assert [name for name, _items in grouped] == ["福岡", "東京", "大阪", "未分類"]
+    assert trip_core.inbox_region_name(unsorted) == "未分類"
+    assert trip_core.inbox_region_name({"city": "東京"}) == "東京"
+    assert trip_core.shared_inbox_region([fukuoka, unsorted]) == "福岡"
+    assert trip_core.shared_inbox_region([fukuoka, tokyo]) == ""
+    assert trip_core.shared_inbox_region([unsorted]) == ""
 
 
 def test_decode_clipboard_payload_accepts_image_and_remark():
@@ -531,3 +564,5 @@ def test_paste_component_offers_clipboard_and_paste_target():
     assert "clipboard.read" in html
     assert "streamlit:setComponentValue" in html
     assert "只要圖中 1、4" in html
+    assert "<select" not in html.lower()
+    assert "目的地" not in html

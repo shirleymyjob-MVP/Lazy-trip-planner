@@ -46,6 +46,11 @@ def _inbox_item(place: dict, *, item_id: str, label: str, remark: str = "", city
     }
 
 
+def _with_region(item: dict, confidence: str) -> dict:
+    item["region_confidence"] = confidence
+    return item
+
+
 def test_app_without_key_shows_friendly_error():
     at = AppTest.from_file(APP, default_timeout=30).run()
     assert not at.exception
@@ -76,7 +81,7 @@ def test_app_plan_from_inbox_uses_trip_basics():
     assert "東京都渋谷区神南1-22-7" in page
     assert "24小時" in page
     assert "狀態：未排程" in page
-    assert "城市：東京" in page
+    assert "地區：東京" in page
     assert "只要圖中 1、4" in page
     assert _select(at, "目的地").value == trip_core.DESTINATION_DEFAULT
     assert _select(at, "幾多日").value == "3"
@@ -149,7 +154,12 @@ def test_upload_maps_second_image_and_does_not_reanalyze():
     assert inbox[0]["places"] == []
     assert inbox[1]["places"][0]["name"] == "博多炉端 魚男"
     assert inbox[1]["city"] == "福岡"
+    assert inbox[1]["region_confidence"] == trip_core.REGION_CONFIDENT
+    assert inbox[0]["region_confidence"] == trip_core.REGION_LOW
+    assert trip_core.inbox_region_name(inbox[0]) == trip_core.UNSORTED_REGION
     assert inbox[1]["status"] == "未排程"
+    assert _select(at, "目的地").value == trip_core.DESTINATION_DEFAULT
+    assert not any("地區" in box.label for box in at.selectbox)
     page = "\n".join(m.value for m in at.markdown)
     assert "今泉1-4-23" in page and "18:00-23:00" in page and "4.5/5" in page
     with mock.patch.object(gemini_client, "analyze_screenshots", side_effect=AssertionError("reanalyzed")):
@@ -240,6 +250,130 @@ def test_fukuoka_is_a_plan_option_without_blocking_inbox():
     assert _select(at, "目的地").value == "福岡（國泰、香港快運直飛）"
     _select(at, "目的地").set_value(trip_core.DESTINATION_OTHER).run()
     assert any(box.label == "其他目的地" for box in at.text_input)
+
+
+def test_inbox_filter_and_optional_region_fix():
+    fukuoka = _with_region(
+        _inbox_item(
+            {"name": "博多炉端 魚男", "name_zh": "博多爐端 魚男", "category": "restaurant", "area": "今泉, 福岡"},
+            item_id="a" * 32,
+            label="截圖 1",
+            city="福岡",
+        ),
+        trip_core.REGION_CONFIDENT,
+    )
+    unknown = _with_region(
+        _inbox_item(
+            {"name": "神秘小店", "name_zh": "神秘小店", "category": "other"},
+            item_id="b" * 32,
+            label="截圖 2",
+            city="",
+        ),
+        trip_core.REGION_LOW,
+    )
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.secrets["MAX_ANALYSES_PER_SESSION"] = 2
+    at.session_state["inbox"] = [fukuoka, unknown]
+    at.run()
+    assert not at.exception
+    page = "\n".join(m.value for m in at.markdown)
+    assert "地區：福岡" in page
+    assert "地區：未分類" in page
+    assert "**福岡** · 1 張" in page
+    assert "**未分類** · 1 張" in page
+    assert any("唔使揀地區" in c.value for c in at.caption)
+    assert not any("地區" in box.label for box in at.selectbox)
+    region_filter = _pill(at, "按地區睇")
+    assert region_filter.value == "全部"
+    assert region_filter.options[0].startswith("全部")
+    assert any(option.startswith("福岡") for option in region_filter.options)
+    assert any(option.startswith("未分類") for option in region_filter.options)
+    _pill(at, "按地區睇").set_value("福岡").run()
+    assert not at.exception
+    filtered = "\n".join(m.value for m in at.markdown)
+    assert "博多爐端 魚男" in filtered
+    assert "神秘小店" not in filtered
+    _pill(at, "按地區睇").set_value("全部").run()
+    fix = [pill for pill in at.pills if "可以一撳改（唔改都得）" in pill.proto.label][0]
+    fix.set_value("大阪").run()
+    assert not at.exception
+    fixed = at.session_state["inbox"][1]
+    assert fixed["city"] == "大阪"
+    assert fixed["region_confidence"] == trip_core.REGION_MANUAL
+    assert "地區：大阪" in "\n".join(m.value for m in at.markdown)
+    fixed["analysis"] = "failed"
+    fixed["warning"] = "再試"
+    at.run()
+    tokyo = trip_core.parse_places_response(json.dumps({
+        "places": [{
+            "name": "渋谷店", "name_zh": "澀谷店", "category": "cafe",
+            "area": "澀谷, 東京", "address": "東京都渋谷區",
+            "confidence": "高", "source_images": [1],
+        }]
+    }, ensure_ascii=False))
+    with mock.patch.object(
+        gemini_client, "analyze_screenshots",
+        return_value=gemini_client.AnalysisResult(tokyo, []),
+    ):
+        retry = [b for b in at.button if b.label == "再試一次分析"][0]
+        retry.click().run()
+    assert not at.exception
+    kept = at.session_state["inbox"][1]
+    assert kept["city"] == "大阪"
+    assert kept["region_confidence"] == trip_core.REGION_MANUAL
+
+
+def test_failed_analysis_tags_fukuoka_from_remark():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    remark = [box for box in at.text_input if "上傳備註" in box.label][0]
+    remark.input("今泉 Hakata").run()
+    with mock.patch.object(
+        gemini_client, "analyze_screenshots",
+        side_effect=gemini_client.GeminiError("測試失敗"),
+    ):
+        at.file_uploader[0].upload("ig.png", _png("orange"), "image/png").run()
+    assert not at.exception
+    item = at.session_state["inbox"][0]
+    assert item["analysis"] == "failed"
+    assert item["city"] == "福岡"
+    assert item["region_confidence"] == trip_core.REGION_CONFIDENT
+    assert "地區：福岡" in "\n".join(m.value for m in at.markdown)
+    assert _select(at, "目的地").value == trip_core.DESTINATION_DEFAULT
+    assert at.session_state["usage"] == 0
+
+
+def test_plan_follows_shared_region_until_user_picks_a_city():
+    item = _with_region(
+        _inbox_item(
+            {"name": "博多炉端 魚男", "name_zh": "博多爐端 魚男", "category": "restaurant"},
+            item_id="c" * 32,
+            label="截圖 1",
+            city="福岡",
+        ),
+        trip_core.REGION_CONFIDENT,
+    )
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.secrets["MAX_ANALYSES_PER_SESSION"] = 3
+    at.session_state["inbox"] = [item]
+    at.run()
+    assert any("跟行程匣地區「福岡」" in c.value for c in at.caption)
+    fake_itin = trip_core.parse_itinerary_response(json.dumps(ITIN, ensure_ascii=False))
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=fake_itin) as gen:
+        submit = [b for b in at.button if b.label == "✨ 開始排行程"][0]
+        assert not submit.disabled
+        submit.click().run()
+        assert gen.call_args.args[4] == "福岡"
+        _select(at, "目的地").set_value("大阪（國泰、香港快運直飛）").run()
+        assert not any("跟行程匣地區" in c.value for c in at.caption)
+        submit = [b for b in at.button if b.label == "✨ 開始排行程"][0]
+        submit.click().run()
+        assert gen.call_args.args[4] == "大阪"
+    assert not at.exception
 
 
 def test_plan_button_stays_disabled_until_inbox_has_places():
