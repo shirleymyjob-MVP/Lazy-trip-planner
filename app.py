@@ -54,17 +54,18 @@ def _clamp_int(value: int, lo: int, hi: int) -> int:
 
 
 API_KEY = get_secret("GEMINI_API_KEY")
-MODEL = get_secret("GEMINI_MODEL", gemini_client.DEFAULT_MODEL) or gemini_client.DEFAULT_MODEL
+_DEFAULT_MODEL = getattr(gemini_client, "DEFAULT_MODEL", "gemini-3.8-flash")
+MODEL = get_secret("GEMINI_MODEL", _DEFAULT_MODEL) or _DEFAULT_MODEL
 # 每個 browser session 最多幾多次成功嘅 AI 動作（分析入匣、開始排行程）。
 # 失敗、SDK 重試、同一輪入面幾張圖唔另計。
 MAX_ANALYSES = get_int_secret("MAX_ANALYSES_PER_SESSION", 10)
 TIMEOUT_MS = _clamp_int(
-    get_int_secret("GEMINI_TIMEOUT_MS", gemini_client.DEFAULT_TIMEOUT_MS),
+    get_int_secret("GEMINI_TIMEOUT_MS", getattr(gemini_client, "DEFAULT_TIMEOUT_MS", 90_000)),
     10_000,
     180_000,
 )
 RETRY_ATTEMPTS = _clamp_int(
-    get_int_secret("GEMINI_RETRY_ATTEMPTS", gemini_client.DEFAULT_RETRY_ATTEMPTS),
+    get_int_secret("GEMINI_RETRY_ATTEMPTS", getattr(gemini_client, "DEFAULT_RETRY_ATTEMPTS", 2)),
     1,
     4,
 )

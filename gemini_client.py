@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-3.8-flash"
 # 單次請求上限。截圖分批之後，一批通常幾秒到幾十秒；掛死就唔好等到無限。
+# app.py 啟動時用 getattr 後備 90_000，避免舊模組未有呢個常數就崩潰。
 DEFAULT_TIMEOUT_MS = 90_000
 # 包含第一次。2 = 失敗再試一次（429／5xx／逾時／連線中斷）。
 DEFAULT_RETRY_ATTEMPTS = 2
