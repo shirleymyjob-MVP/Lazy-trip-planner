@@ -1,2 +1,5 @@
 streamlit
 yt-dlp
+easyocr
+deep-translator
+Pillow
