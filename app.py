@@ -64,8 +64,9 @@ TIMEOUT_MS = _clamp_int(
     10_000,
     180_000,
 )
-# 認店名唔跟 GEMINI_MODEL。核對同排日程先用 MODEL。
+# 認店名同核對樣本唔跟 GEMINI_MODEL。排日程先用 MODEL。
 NAMES_MODEL = getattr(gemini_client, "DEFAULT_NAMES_MODEL", "gemini-3.5-flash-lite")
+ENRICH_MODEL = getattr(gemini_client, "DEFAULT_ENRICH_MODEL", "gemini-3.5-flash-lite")
 RETRY_ATTEMPTS = _clamp_int(
     get_int_secret("GEMINI_RETRY_ATTEMPTS", getattr(gemini_client, "DEFAULT_RETRY_ATTEMPTS", 2)),
     1,
@@ -457,7 +458,7 @@ def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
 
 
 def _enrich_places(places: list[dict]) -> list[dict]:
-    raw = gemini_client.enrich_places(_client(), MODEL, places)
+    raw = gemini_client.enrich_places(_client(), ENRICH_MODEL, places)
     result = raw if isinstance(raw, gemini_client.AnalysisResult) else gemini_client.AnalysisResult(list(raw), [])
     return result.places
 

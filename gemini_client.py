@@ -19,9 +19,16 @@ import trip_core
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-# 行程匣只認店名。lite 預設思考少，避免 vision+JSON 拖過逾時。
-# 核對地址同排日程仍然用 DEFAULT_MODEL。測試傳入嘅 model 會覆蓋呢個預設。
+# 行程匣認店名，同排行程前核對地址，都用 lite。測試傳入嘅 model 會覆蓋。
+# 排日程仍然用 DEFAULT_MODEL（或 secret GEMINI_MODEL）。
 DEFAULT_NAMES_MODEL = "gemini-3.5-flash-lite"
+DEFAULT_ENRICH_MODEL = "gemini-3.5-flash-lite"
+# 核對係文字請求。單次 HTTP 20 秒、SDK 唔再重試，避免 5xx 疊上共用 client 嘅 120 秒。
+# enrich_places 只會喺快失敗嘅 5xx／「唔穩定」時再試一次。
+ENRICH_TIMEOUT_MS = 20_000
+ENRICH_HTTP_ATTEMPTS = 1
+ENRICH_RETRY_SLEEP_S = 1.5
+ENRICH_RETRY_MAX_ELAPSED_S = 12.0
 # 單次請求上限（毫秒）。Gemini 3 即使用 low thinking，視覺 JSON 都可以近一分鐘。
 # app.py 啟動時用 getattr 後備 120_000，避免舊模組未有呢個常數就崩潰。
 # Streamlit secret GEMINI_TIMEOUT_MS 如果設咗，會覆蓋呢個預設。
@@ -234,7 +241,9 @@ ENRICH_PROMPT = """你係日本旅行助手。用家貼咗地方名或 Google Ma
 - name_zh：繁體中文
 - category：restaurant / cafe / dessert / attraction / shop / other
 - area：地區同城市（日本例子：「淺草, 東京」）
-- address、opening_hours、rating：有把握先填，否則空字串。rating 例子「4.3/5」。唔好估門牌或分數
+- address：有把握先填街道地址，否則空字串。唔好估門牌
+- opening_hours：有把握先填營業時間，否則空字串
+- rating：有把握先填，例子「4.3/5」，否則空字串。唔好估分數
 - notes：廣東話口吻一句
 - confidence：高 / 中 / 低
 - source_images：空陣列
@@ -281,15 +290,25 @@ def _is_timeout(exc: Exception) -> bool:
     return "timed out" in detail or "deadline exceeded" in detail
 
 
-def _generate_text(client, model: str, contents, schema: types.Schema, temperature: float) -> str:
+def _generate_text(
+    client,
+    model: str,
+    contents,
+    schema: types.Schema,
+    temperature: float,
+    http_options: types.HttpOptions | None = None,
+) -> str:
     # Gemini 3 預設 thinking 係 medium，視覺 JSON 會超過逾時。
     # 只用 thinking_level；thinking_budget 喺 Gemini 3 會 400。
-    config = types.GenerateContentConfig(
-        response_mime_type="application/json",
-        response_schema=schema,
-        temperature=temperature,
-        thinking_config=types.ThinkingConfig(thinking_level="low"),
-    )
+    config_kwargs = {
+        "response_mime_type": "application/json",
+        "response_schema": schema,
+        "temperature": temperature,
+        "thinking_config": types.ThinkingConfig(thinking_level="low"),
+    }
+    if http_options is not None:
+        config_kwargs["http_options"] = http_options
+    config = types.GenerateContentConfig(**config_kwargs)
     try:
         response = client.models.generate_content(model=model, contents=contents, config=config)
     except Exception as exc:  # noqa: BLE001 - 所有 API 錯誤都轉做友善訊息
@@ -317,13 +336,14 @@ def _generate_parsed(
     failure_message: str,
     parse_attempts: int,
     retry_sleep: float,
+    http_options: types.HttpOptions | None = None,
 ):
     """空回覆或壞 JSON 先再試。HTTP 錯誤唔喺呢層打多次，避免同 SDK 重試疊加。"""
     attempts = max(1, int(parse_attempts))
     last_error: GeminiError | None = None
     for attempt in range(attempts):
         try:
-            text = _generate_text(client, model, contents, schema, temperature)
+            text = _generate_text(client, model, contents, schema, temperature, http_options)
         except GeminiError as err:
             last_error = err
             if not err.retryable or attempt >= attempts - 1:
@@ -560,26 +580,54 @@ def recognize_names(
     )
 
 
+def _is_unstable(err: BaseException) -> bool:
+    """5xx 或已轉成「AI 服務暫時唔穩定」嘅錯誤。逾時訊息唔算，避免再等滿一次。"""
+    if "唔穩定" in str(err):
+        return True
+    code = getattr(err, "code", None) or getattr(err, "status_code", None)
+    if isinstance(code, int) and code >= 500:
+        return True
+    cause = err.__cause__
+    if cause is not None and cause is not err:
+        return _is_unstable(cause)
+    return False
+
+
+def _enrich_http_options() -> types.HttpOptions:
+    """覆蓋呢次請求嘅逾時同 SDK 重試。共用 client 仍然係 120 秒、attempts=2。"""
+    return types.HttpOptions(
+        timeout=ENRICH_TIMEOUT_MS,
+        retry_options=types.HttpRetryOptions(attempts=ENRICH_HTTP_ATTEMPTS),
+    )
+
+
 def enrich_places(
     client,
-    model: str,
+    model: str | None,
     seeds: list[dict],
     *,
-    parse_attempts: int = 2,
+    parse_attempts: int = 1,
     retry_sleep: float = 0.4,
 ) -> AnalysisResult:
-    """用文字補地址、營業時間、評分。模型漏咗嘅店名會保留。"""
+    """用文字補地址、營業時間、評分。模型漏咗嘅店名會保留。
+
+    未傳 model（空字串或 None）就用 DEFAULT_ENRICH_MODEL。測試可以傳別嘅 id。
+    5xx／「唔穩定」而且第一次喺 ENRICH_RETRY_MAX_ELAPSED_S 內失敗，先瞓 1.5 秒再試一次。
+    呢次 HTTP 唔跟 SDK 重試，所以唔會變成 120 秒乘幾次。
+    """
     if not seeds:
         return AnalysisResult([], [])
+    chosen = (model or "").strip() or DEFAULT_ENRICH_MODEL
     slim = [
         {k: place.get(k) for k in ("name", "name_zh", "area", "address") if place.get(k)}
         for place in seeds
     ]
     prompt = ENRICH_PROMPT.format(seeds_json=json.dumps(slim, ensure_ascii=False, indent=1))
-    try:
-        found = _generate_parsed(
+
+    def once():
+        return _generate_parsed(
             client,
-            model,
+            chosen,
             prompt,
             PLACES_SCHEMA,
             0.2,
@@ -587,9 +635,20 @@ def enrich_places(
             failure_message="AI 回覆格式有問題，請再按一次認地方。",
             parse_attempts=parse_attempts,
             retry_sleep=retry_sleep,
+            http_options=_enrich_http_options(),
         )
-    except GeminiError:
-        raise
+
+    started = time.monotonic()
+    try:
+        found = once()
+    except GeminiError as err:
+        elapsed = time.monotonic() - started
+        if _is_unstable(err) and elapsed <= ENRICH_RETRY_MAX_ELAPSED_S:
+            logger.info("Enrich unstable after %.1fs; retrying once", elapsed)
+            _sleep(ENRICH_RETRY_SLEEP_S)
+            found = once()
+        else:
+            raise
     warnings: list[str] = []
     if not found:
         warnings.append("AI 未有補到資料，已先用你貼上嘅名稱。")

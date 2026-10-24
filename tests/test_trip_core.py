@@ -192,6 +192,7 @@ def test_recognize_names_is_the_fast_path():
     assert config.response_schema is gemini_client.NAMES_SCHEMA
     assert config.thinking_config.thinking_level == "LOW"
     assert config.thinking_config.thinking_budget is None
+    assert config.http_options is None
     prompt = kwargs["contents"][0]
     assert "只係快認店名" in prompt
     assert "只要圖中 1、4" in prompt
@@ -248,6 +249,8 @@ def test_generate_itinerary_mocked():
     assert "3 日" in prompt and "東京" in prompt and "唔想太趕" in prompt
     assert "4.2/5" in prompt
     assert "唔好硬改成日本" in prompt
+    assert client.models.generate_content.call_args.kwargs["model"] == "m"
+    assert client.models.generate_content.call_args.kwargs["config"].http_options is None
 
 
 def test_invalid_key_message():
@@ -425,8 +428,69 @@ def test_enrich_places_keeps_seed_when_model_adds_facts():
     assert len(result.places) == 1
     assert result.places[0]["address"] == "東京都台東區淺草2-3-1"
     assert result.places[0]["rating"] == "4.4/5"
-    prompt = client.models.generate_content.call_args.kwargs["contents"]
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs["model"] == "m"
+    prompt = kwargs["contents"]
     assert "淺草寺" in prompt and "唔好硬套日本" in prompt
+    assert "address" in prompt and "opening_hours" in prompt and "rating" in prompt
+    assert "空字串" in prompt
+    assert kwargs["config"].thinking_config.thinking_level == "LOW"
+    assert kwargs["config"].thinking_config.thinking_budget is None
+    assert kwargs["config"].http_options.timeout == gemini_client.ENRICH_TIMEOUT_MS
+    assert kwargs["config"].http_options.retry_options.attempts == 1
+
+
+def _enrich_ok_payload():
+    return _Resp(json.dumps({
+        "places": [{
+            "name": "淺草寺", "name_zh": "淺草寺", "category": "attraction",
+            "area": "淺草, 東京", "address": "東京都台東區淺草2-3-1",
+            "opening_hours": "6:00-17:00", "rating": "4.4/5",
+            "confidence": "高", "source_images": [],
+        }]
+    }, ensure_ascii=False))
+
+
+def test_enrich_defaults_to_lite_and_retries_fast_5xx_once():
+    from google.genai import errors
+
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        errors.ServerError(
+            503, {"error": {"code": 503, "message": "backend down", "status": "UNAVAILABLE"}}
+        ),
+        _enrich_ok_payload(),
+    ]
+    sleeps = []
+    with mock.patch.object(gemini_client, "_sleep", side_effect=lambda seconds: sleeps.append(seconds)):
+        result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺")])
+    assert result.places[0]["address"] == "東京都台東區淺草2-3-1"
+    assert result.places[0]["opening_hours"] == "6:00-17:00"
+    assert result.places[0]["rating"] == "4.4/5"
+    assert trip_core.place_is_complete(result.places[0])
+    assert client.models.generate_content.call_count == 2
+    assert sleeps == [gemini_client.ENRICH_RETRY_SLEEP_S]
+    assert 1 <= gemini_client.ENRICH_RETRY_SLEEP_S <= 2
+    assert client.models.generate_content.call_args.kwargs["model"] == gemini_client.DEFAULT_ENRICH_MODEL
+    assert gemini_client.DEFAULT_ENRICH_MODEL == "gemini-3.5-flash-lite"
+
+
+def test_enrich_does_not_retry_a_slow_5xx():
+    from google.genai import errors
+
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = errors.ServerError(
+        503, {"error": {"code": 503, "message": "backend down", "status": "UNAVAILABLE"}}
+    )
+    with mock.patch.object(gemini_client.time, "monotonic", side_effect=[0.0, 20.0]):
+        with mock.patch.object(gemini_client, "_sleep", side_effect=AssertionError("should not sleep")):
+            try:
+                gemini_client.enrich_places(client, "", [trip_core.seed_place("淺草寺")], retry_sleep=0)
+                assert False
+            except gemini_client.GeminiError as err:
+                assert "唔穩定" in str(err)
+                assert "backend down" not in str(err)
+    assert client.models.generate_content.call_count == 1
 
 
 def _fukuoka_places():

@@ -22,7 +22,7 @@ MVP 只收**截圖**。真實用法係：見到地方就截圖，iPhone 撳「�
 
 本機量度（2026-10-24，冇呼叫 Gemini）：3024×4032 純色 JPEG 縮圖中位數 **149 ms**（20 次，p95 172 ms）。地區判斷 1000 次約 **5 ms**。一張圖寫入再讀出分享行程少過 **1 ms**。呢啲係送去模型之前嘅準備時間。
 
-快路徑同慢路徑係分開嘅：`recognize_names` 只問店名同地區；`enrich_places` 先至補地址、營業時間、評分；`generate_itinerary` 先排日程。
+快路徑同慢路徑係分開嘅：`recognize_names` 只問店名同地區；`enrich_places` 用 `gemini-3.5-flash-lite` 補地址、營業時間、評分；`generate_itinerary` 先排日程。
 
 ## 目的地清單（2026 年 10 月）
 
@@ -68,7 +68,7 @@ MVP 只收**截圖**。真實用法係：見到地方就截圖，iPhone 撳「�
 | Key | 必填 | 預設 | 用途 |
 |---|---|---|---|
 | `GEMINI_API_KEY` | ✅ | – | Gemini API key |
-| `GEMINI_MODEL` | | `gemini-3.8-flash` | 核對地址同排日程用嘅模型。認店名固定用 `gemini-3.5-flash-lite`，唔跟呢個 secret |
+| `GEMINI_MODEL` | | `gemini-3.8-flash` | 排日程用嘅模型。認店名同核對樣本固定用 `gemini-3.5-flash-lite`，唔跟呢個 secret |
 | `MAX_ANALYSES_PER_SESSION` | | `10` | 每個 session 最多幾多次**成功** AI 動作 |
 | `GEMINI_TIMEOUT_MS` | | `120000` | 單次 Gemini HTTP 逾時（毫秒）。設咗就會覆蓋程式預設 |
 | `GEMINI_RETRY_ATTEMPTS` | | `2` | HTTP 嘗試次數（包含第一次；2 = 逾時／429／5xx 再試一次）。認店名、核對、排日程共用。認店名壞 JSON 唔會再解析第二次 |
