@@ -457,10 +457,15 @@ def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
         _apply_region(item)
 
 
-def _enrich_places(places: list[dict]) -> list[dict]:
+def _enrich_result(places: list[dict]) -> gemini_client.AnalysisResult:
     raw = gemini_client.enrich_places(_client(), ENRICH_MODEL, places)
-    result = raw if isinstance(raw, gemini_client.AnalysisResult) else gemini_client.AnalysisResult(list(raw), [])
-    return result.places
+    if isinstance(raw, gemini_client.AnalysisResult):
+        return raw
+    return gemini_client.AnalysisResult(list(raw), [])
+
+
+def _enrich_places(places: list[dict]) -> list[dict]:
+    return _enrich_result(places).places
 
 
 @st.fragment(run_every=0.8)
@@ -718,14 +723,24 @@ elif selected_places and API_KEY and remaining_quota() > 0 and missing_facts:
     if st.button("先核對一個樣本", key=f"sample_{st.session_state.batch}"):
         try:
             started = time.perf_counter()
-            enriched = _enrich_places(missing_facts[:1])
-            _overlay_enriched(selected_items, enriched)
+            result = _enrich_result(missing_facts[:1])
+            _overlay_enriched(selected_items, result.places)
             st.session_state.usage += 1
             st.session_state.last_plan_timing = {
                 "sample_s": round(time.perf_counter() - started, 3),
                 "source": "sample",
             }
-            st.session_state.notice = None
+            updated = trip_core.dedupe_places(
+                place for item in selected_items for place in (item.get("places") or [])
+            )
+            if trip_core.first_complete_place(updated):
+                st.session_state.notice = None
+            else:
+                bits = [gemini_client.ENRICH_INCOMPLETE_WARNING]
+                for warning in result.warnings:
+                    if warning and warning not in bits:
+                        bits.append(warning)
+                st.session_state.notice = ("warning", " ".join(bits))
             st.rerun()
         except gemini_client.GeminiError as err:
             st.error(str(err))

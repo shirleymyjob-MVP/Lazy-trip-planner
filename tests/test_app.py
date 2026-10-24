@@ -430,6 +430,43 @@ def test_plan_waits_for_one_complete_sample_and_shows_eta():
     assert any(b.label == "✨ 開始排行程" and not b.disabled for b in at.button)
 
 
+def test_sample_enrich_warns_when_facts_stay_empty():
+    item = _with_region(
+        _inbox_item(
+            {"name": "kchiara", "name_zh": "キアラ", "category": "restaurant", "area": "福岡"},
+            item_id="e" * 32,
+            label="截圖 1",
+            city="福岡",
+        ),
+        trip_core.REGION_CONFIDENT,
+    )
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["inbox"] = [item]
+    at.run()
+    incomplete = trip_core.parse_places_response(json.dumps({
+        "places": [{
+            "name": "kchiara", "name_zh": "キアラ", "category": "restaurant",
+            "area": "福岡", "address": "", "opening_hours": "", "rating": "",
+            "confidence": "低", "source_images": [],
+        }]
+    }, ensure_ascii=False))
+    with mock.patch.object(
+        gemini_client, "enrich_places",
+        return_value=gemini_client.AnalysisResult(
+            incomplete, [gemini_client.ENRICH_INCOMPLETE_WARNING],
+        ),
+    ):
+        sample = [b for b in at.button if b.label == "先核對一個樣本"][0]
+        sample.click().run()
+    assert not at.exception
+    assert at.session_state["usage"] == 1
+    assert any(gemini_client.ENRICH_INCOMPLETE_WARNING in w.value for w in at.warning)
+    assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
+    page = "\n".join(m.value for m in at.markdown)
+    assert "收費前樣本" not in page
+
+
 def test_async_recognize_shows_pending_state_before_the_model(monkeypatch):
     monkeypatch.setenv("LAZY_TRIP_SYNC_RECOGNIZE", "0")
     at = AppTest.from_file(APP, default_timeout=30)

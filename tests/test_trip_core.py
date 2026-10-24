@@ -433,11 +433,16 @@ def test_enrich_places_keeps_seed_when_model_adds_facts():
     prompt = kwargs["contents"]
     assert "淺草寺" in prompt and "唔好硬套日本" in prompt
     assert "address" in prompt and "opening_hours" in prompt and "rating" in prompt
-    assert "空字串" in prompt
-    assert kwargs["config"].thinking_config.thinking_level == "LOW"
-    assert kwargs["config"].thinking_config.thinking_budget is None
-    assert kwargs["config"].http_options.timeout == gemini_client.ENRICH_TIMEOUT_MS
-    assert kwargs["config"].http_options.retry_options.attempts == 1
+    assert "Google Maps" in prompt and "空字串" in prompt
+    config = kwargs["config"]
+    assert config.thinking_config.thinking_level == "LOW"
+    assert config.thinking_config.thinking_budget is None
+    assert config.response_schema is None
+    assert config.response_mime_type is None
+    assert config.tools[0].google_maps is not None
+    assert config.tool_config is None
+    assert config.http_options.timeout == gemini_client.ENRICH_TIMEOUT_MS
+    assert config.http_options.retry_options.attempts == 1
 
 
 def _enrich_ok_payload():
@@ -491,6 +496,83 @@ def test_enrich_does_not_retry_a_slow_5xx():
                 assert "唔穩定" in str(err)
                 assert "backend down" not in str(err)
     assert client.models.generate_content.call_count == 1
+
+
+def test_enrich_parses_fenced_json_and_biases_fukuoka():
+    client = mock.MagicMock()
+    body = json.dumps({
+        "places": [{
+            "name": "kchiara", "name_zh": "キアラ", "category": "restaurant",
+            "area": "福岡", "address": "福岡市中央區",
+            "opening_hours": "12:00-22:00", "rating": "4.1/5",
+            "confidence": "高", "source_images": [],
+        }]
+    }, ensure_ascii=False)
+    client.models.generate_content.return_value = _Resp(f"```json\n{body}\n```")
+    seed = trip_core.seed_place("kchiara", name_zh="キアラ", area="福岡")
+    result = gemini_client.enrich_places(client, "m", [seed], retry_sleep=0)
+    assert trip_core.place_is_complete(result.places[0])
+    assert result.warnings == []
+    config = client.models.generate_content.call_args.kwargs["config"]
+    lat_lng = config.tool_config.retrieval_config.lat_lng
+    assert lat_lng.latitude == 33.59
+    assert lat_lng.longitude == 130.40
+    tokyo = trip_core.seed_place("淺草寺", area="東京都台東區")
+    gemini_client.enrich_places(client, "m", [tokyo], retry_sleep=0)
+    biased = client.models.generate_content.call_args.kwargs["config"].tool_config.retrieval_config.lat_lng
+    assert biased.latitude == 35.68
+    assert biased.longitude == 139.76
+    mixed = [
+        trip_core.seed_place("一蘭", area="福岡"),
+        trip_core.seed_place("淺草寺", area="東京"),
+    ]
+    gemini_client.enrich_places(client, "m", mixed, retry_sleep=0)
+    assert client.models.generate_content.call_args.kwargs["config"].tool_config is None
+
+
+def test_enrich_warns_when_maps_facts_stay_empty():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps({
+        "places": [{
+            "name": "kchiara", "name_zh": "キアラ", "category": "restaurant",
+            "area": "福岡", "address": "", "opening_hours": "", "rating": "",
+            "confidence": "低", "source_images": [],
+        }]
+    }, ensure_ascii=False))
+    seed = trip_core.seed_place("kchiara", name_zh="キアラ", area="福岡")
+    result = gemini_client.enrich_places(client, "m", [seed], retry_sleep=0)
+    assert not trip_core.place_is_complete(result.places[0])
+    assert gemini_client.ENRICH_INCOMPLETE_WARNING in result.warnings
+
+
+def test_enrich_falls_back_when_lite_rejects_maps_tool():
+    from google.genai import errors
+
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        errors.ClientError(
+            400,
+            {"error": {"code": 400, "message": "google_maps is not supported for this model", "status": "INVALID_ARGUMENT"}},
+        ),
+        _enrich_ok_payload(),
+    ]
+    result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺")], retry_sleep=0)
+    assert result.places[0]["address"] == "東京都台東區淺草2-3-1"
+    models = [call.kwargs["model"] for call in client.models.generate_content.call_args_list]
+    assert models == [gemini_client.DEFAULT_ENRICH_MODEL, gemini_client.DEFAULT_MODEL]
+
+    explicit = mock.MagicMock()
+    explicit.models.generate_content.side_effect = errors.ClientError(
+        400,
+        {"error": {"code": 400, "message": "google_maps is not supported for this model", "status": "INVALID_ARGUMENT"}},
+    )
+    try:
+        gemini_client.enrich_places(explicit, "m", [trip_core.seed_place("淺草寺")], retry_sleep=0)
+        assert False
+    except gemini_client.GeminiError:
+        pass
+    assert explicit.models.generate_content.call_count == 1
+    assert explicit.models.generate_content.call_args.kwargs["model"] == "m"
 
 
 def _fukuoka_places():

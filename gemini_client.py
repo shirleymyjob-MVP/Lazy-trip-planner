@@ -29,6 +29,14 @@ ENRICH_TIMEOUT_MS = 20_000
 ENRICH_HTTP_ATTEMPTS = 1
 ENRICH_RETRY_SLEEP_S = 1.5
 ENRICH_RETRY_MAX_ELAPSED_S = 12.0
+ENRICH_INCOMPLETE_WARNING = "核對後仍然缺地址／營業時間／評分"
+# 只係 Maps 搜尋偏向。一個地區先傳；多過一個或者唔肯定就唔傳。
+_ENRICH_MAPS_BIAS = (
+    ("福岡", 33.59, 130.40),
+    ("東京", 35.68, 139.76),
+    ("大阪", 34.69, 135.50),
+    ("京都", 35.01, 135.77),
+)
 # 單次請求上限（毫秒）。Gemini 3 即使用 low thinking，視覺 JSON 都可以近一分鐘。
 # app.py 啟動時用 getattr 後備 120_000，避免舊模組未有呢個常數就崩潰。
 # Streamlit secret GEMINI_TIMEOUT_MS 如果設咗，會覆蓋呢個預設。
@@ -230,24 +238,28 @@ ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方�
 - maps_query：原文名 + 地址或地區，方便 Google Maps
 - tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實營業時間"""
 
-ENRICH_PROMPT = """你係日本旅行助手。用家貼咗地方名或 Google Maps 搜尋字，請整理成地點清單。
+ENRICH_PROMPT = """你係旅行助手。用 Google Maps 核對下面每個地方嘅真實資料。
 預設日本；如果名稱明顯係其他地方，照實填，唔好硬套日本。
 
-輸入：
+輸入（店名同地區，例如 kchiara／キアラ、福岡）：
 {seeds_json}
 
-每個地方：
+每個地方都要用 Google Maps 查。店存在就一定要填到：
 - name 必須沿用輸入嘅名稱，唔好改到對唔返
 - name_zh：繁體中文
 - category：restaurant / cafe / dessert / attraction / shop / other
-- area：地區同城市（日本例子：「淺草, 東京」）
-- address：有把握先填街道地址，否則空字串。唔好估門牌
-- opening_hours：有把握先填營業時間，否則空字串
-- rating：有把握先填，例子「4.3/5」，否則空字串。唔好估分數
+- area：沿用輸入地區
+- address：Maps 上嘅地址
+- opening_hours：Maps 上嘅營業時間
+- rating：Maps 上嘅評分，例子「4.3/5」
 - notes：廣東話口吻一句
 - confidence：高 / 中 / 低
 - source_images：空陣列
-認唔到嘅行可以跳過。"""
+只有 Maps 搵唔到呢間店，address、opening_hours、rating 先可以空字串。唔好估門牌或分數。
+
+只回傳 JSON。可以用 ```json 圍住。格式：
+{{"places":[{{"name":"","name_zh":"","category":"restaurant","area":"","address":"","opening_hours":"","rating":"","notes":"","confidence":"中","source_images":[],"caption_index":0}}]}}
+"""
 
 
 # ---------------------------------------------------------------- client
@@ -294,18 +306,26 @@ def _generate_text(
     client,
     model: str,
     contents,
-    schema: types.Schema,
+    schema: types.Schema | None,
     temperature: float,
     http_options: types.HttpOptions | None = None,
+    tools: list | None = None,
+    tool_config: types.ToolConfig | None = None,
 ) -> str:
     # Gemini 3 預設 thinking 係 medium，視覺 JSON 會超過逾時。
     # 只用 thinking_level；thinking_budget 喺 Gemini 3 會 400。
+    # Google Maps tool 同 response_schema 一齊用會 400，所以有 tools 就唔傳 schema。
     config_kwargs = {
-        "response_mime_type": "application/json",
-        "response_schema": schema,
         "temperature": temperature,
         "thinking_config": types.ThinkingConfig(thinking_level="low"),
     }
+    if tools:
+        config_kwargs["tools"] = tools
+        if tool_config is not None:
+            config_kwargs["tool_config"] = tool_config
+    elif schema is not None:
+        config_kwargs["response_mime_type"] = "application/json"
+        config_kwargs["response_schema"] = schema
     if http_options is not None:
         config_kwargs["http_options"] = http_options
     config = types.GenerateContentConfig(**config_kwargs)
@@ -329,7 +349,7 @@ def _generate_parsed(
     client,
     model: str,
     contents,
-    schema: types.Schema,
+    schema: types.Schema | None,
     temperature: float,
     parser,
     *,
@@ -337,13 +357,17 @@ def _generate_parsed(
     parse_attempts: int,
     retry_sleep: float,
     http_options: types.HttpOptions | None = None,
+    tools: list | None = None,
+    tool_config: types.ToolConfig | None = None,
 ):
     """空回覆或壞 JSON 先再試。HTTP 錯誤唔喺呢層打多次，避免同 SDK 重試疊加。"""
     attempts = max(1, int(parse_attempts))
     last_error: GeminiError | None = None
     for attempt in range(attempts):
         try:
-            text = _generate_text(client, model, contents, schema, temperature, http_options)
+            text = _generate_text(
+                client, model, contents, schema, temperature, http_options, tools, tool_config,
+            )
         except GeminiError as err:
             last_error = err
             if not err.retryable or attempt >= attempts - 1:
@@ -601,6 +625,55 @@ def _enrich_http_options() -> types.HttpOptions:
     )
 
 
+def _enrich_tool_config(seeds: list[dict]) -> types.ToolConfig | None:
+    """地區明確係一個已知城市先偏向 Maps。東京都唔好當成京都。"""
+    blob = " ".join((place.get("area") or "") for place in seeds)
+    blob = blob.replace("東京都", "東京")
+    hits = [(lat, lng) for name, lat, lng in _ENRICH_MAPS_BIAS if name in blob]
+    if len(hits) != 1:
+        return None
+    lat, lng = hits[0]
+    return types.ToolConfig(
+        retrieval_config=types.RetrievalConfig(
+            lat_lng=types.LatLng(latitude=lat, longitude=lng),
+        )
+    )
+
+
+def _maps_tool_rejected(err: BaseException) -> bool:
+    """lite 模型拒絕 Google Maps tool 時先換 DEFAULT_MODEL。一般 400 唔算。"""
+    chunks: list[str] = []
+    current: BaseException | None = err
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        chunks.append(str(current))
+        chunks.append(str(getattr(current, "message", "") or ""))
+        current = current.__cause__
+    blob = " ".join(chunks).lower()
+    if "google_maps" in blob or "google maps" in blob:
+        return True
+    unsupported = any(token in blob for token in ("not supported", "unsupported", "does not support", "isn't supported"))
+    return unsupported and ("tool" in blob or "maps" in blob)
+
+
+def _place_keys(place: dict) -> set[str]:
+    return {k for k in (trip_core._norm_key(place.get("name", "")), trip_core._norm_key(place.get("name_zh", ""))) if k}
+
+
+def _seeds_still_incomplete(seeds: list[dict], merged: list[dict]) -> bool:
+    for seed in seeds:
+        keys = _place_keys(seed)
+        match = None
+        for place in merged:
+            if keys and keys & _place_keys(place):
+                match = place
+                break
+        if match is None or not trip_core.place_is_complete(match):
+            return True
+    return False
+
+
 def enrich_places(
     client,
     model: str | None,
@@ -609,11 +682,13 @@ def enrich_places(
     parse_attempts: int = 1,
     retry_sleep: float = 0.4,
 ) -> AnalysisResult:
-    """用文字補地址、營業時間、評分。模型漏咗嘅店名會保留。
+    """用 Google Maps 補地址、營業時間、評分。模型漏咗嘅店名會保留。
 
     未傳 model（空字串或 None）就用 DEFAULT_ENRICH_MODEL。測試可以傳別嘅 id。
+    lite 拒絕 Maps tool 就改用 DEFAULT_MODEL 再叫一次。
     5xx／「唔穩定」而且第一次喺 ENRICH_RETRY_MAX_ELAPSED_S 內失敗，先瞓 1.5 秒再試一次。
     呢次 HTTP 唔跟 SDK 重試，所以唔會變成 120 秒乘幾次。
+    Maps tool 唔同 response_schema 一齊用，JSON 由文字解析（容許 ```json）。
     """
     if not seeds:
         return AnalysisResult([], [])
@@ -623,37 +698,56 @@ def enrich_places(
         for place in seeds
     ]
     prompt = ENRICH_PROMPT.format(seeds_json=json.dumps(slim, ensure_ascii=False, indent=1))
+    maps_tool = types.Tool(google_maps=types.GoogleMaps())
+    tool_config = _enrich_tool_config(seeds)
+    active = chosen
 
-    def once():
+    def once(model_id: str):
         return _generate_parsed(
             client,
-            chosen,
+            model_id,
             prompt,
-            PLACES_SCHEMA,
+            None,
             0.2,
             trip_core.parse_places_response,
             failure_message="AI 回覆格式有問題，請再按一次認地方。",
             parse_attempts=parse_attempts,
             retry_sleep=retry_sleep,
             http_options=_enrich_http_options(),
+            tools=[maps_tool],
+            tool_config=tool_config,
         )
+
+    def attempt():
+        nonlocal active
+        try:
+            return once(active)
+        except GeminiError as err:
+            if active == DEFAULT_ENRICH_MODEL and active != DEFAULT_MODEL and _maps_tool_rejected(err):
+                logger.info("Maps tool rejected by %s; retrying enrich on %s", active, DEFAULT_MODEL)
+                active = DEFAULT_MODEL
+                return once(active)
+            raise
 
     started = time.monotonic()
     try:
-        found = once()
+        found = attempt()
     except GeminiError as err:
         elapsed = time.monotonic() - started
         if _is_unstable(err) and elapsed <= ENRICH_RETRY_MAX_ELAPSED_S:
             logger.info("Enrich unstable after %.1fs; retrying once", elapsed)
             _sleep(ENRICH_RETRY_SLEEP_S)
-            found = once()
+            found = attempt()
         else:
             raise
     warnings: list[str] = []
     if not found:
         warnings.append("AI 未有補到資料，已先用你貼上嘅名稱。")
         found = []
-    return AnalysisResult(trip_core.dedupe_places(list(seeds) + found), warnings)
+    merged = trip_core.dedupe_places(list(seeds) + found)
+    if _seeds_still_incomplete(seeds, merged):
+        warnings.append(ENRICH_INCOMPLETE_WARNING)
+    return AnalysisResult(merged, warnings)
 
 
 def generate_itinerary(client, model: str, places: list[dict], days: int,
