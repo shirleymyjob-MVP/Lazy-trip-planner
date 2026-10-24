@@ -55,6 +55,7 @@ def test_app_without_key_shows_friendly_error():
     at = AppTest.from_file(APP, default_timeout=30).run()
     assert not at.exception
     assert any("AI 服務未設定好" in e.value for e in at.error)
+    assert any(c.value.startswith("build:") or "build:" in c.value for c in at.caption)
     assert any("開始排行程" in b.label and b.disabled for b in at.button)
     assert any("放入行程匣" in c.value and "稍後排行程" in c.value for c in at.caption)
     assert any(str(trip_core.CAPTURE_TO_INBOX_TAPS) in c.value and "行程匣" in c.value for c in at.caption)
@@ -465,6 +466,35 @@ def test_sample_enrich_warns_when_facts_stay_empty():
     assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
     page = "\n".join(m.value for m in at.markdown)
     assert "收費前樣本" not in page
+
+
+def test_sample_enrich_failure_is_yellow_not_the_crowd_line():
+    item = _with_region(
+        _inbox_item(
+            {"name": "kchiara", "name_zh": "キアラ", "category": "restaurant", "area": "福岡"},
+            item_id="f" * 32,
+            label="截圖 1",
+            city="福岡",
+        ),
+        trip_core.REGION_CONFIDENT,
+    )
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["inbox"] = [item]
+    at.run()
+    with mock.patch.object(
+        gemini_client, "enrich_places",
+        side_effect=gemini_client.GeminiError("Google Maps 核對未開通，已停用。"),
+    ):
+        sample = [b for b in at.button if b.label == "先核對一個樣本"][0]
+        sample.click().run()
+    assert not at.exception
+    assert at.session_state["usage"] == 0
+    shown = "\n".join(block.value for block in list(at.warning) + list(at.error))
+    assert gemini_client.CROWD_RATE_LIMIT_MESSAGE not in shown
+    assert gemini_client.ENRICH_INCOMPLETE_WARNING in shown
+    assert gemini_client.MAPS_UNAVAILABLE_WARNING in shown
+    assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
 
 
 def test_async_recognize_shows_pending_state_before_the_model(monkeypatch):

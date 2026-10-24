@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import re
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -67,6 +68,9 @@ TIMEOUT_MS = _clamp_int(
 # 認店名同核對樣本唔跟 GEMINI_MODEL。排日程先用 MODEL。
 NAMES_MODEL = getattr(gemini_client, "DEFAULT_NAMES_MODEL", "gemini-3.5-flash-lite")
 ENRICH_MODEL = getattr(gemini_client, "DEFAULT_ENRICH_MODEL", "gemini-3.5-flash-lite")
+# 免費額度預設唔叫 Maps。Secret 或環境變數 GEMINI_USE_MAPS=1 先開啟。
+_MAPS_FLAG = get_secret("GEMINI_USE_MAPS", os.environ.get("GEMINI_USE_MAPS", ""))
+USE_MAPS = str(_MAPS_FLAG or "").strip().lower() in {"1", "true", "yes", "on"}
 RETRY_ATTEMPTS = _clamp_int(
     get_int_secret("GEMINI_RETRY_ATTEMPTS", getattr(gemini_client, "DEFAULT_RETRY_ATTEMPTS", 2)),
     1,
@@ -457,8 +461,22 @@ def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
         _apply_region(item)
 
 
+def _build_sha() -> str:
+    """俾 UAT 對住頁尾 build: 確認 Streamlit 載緊邊個 commit。"""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=str(Path(__file__).parent),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        sha = ""
+    return sha or "unknown"
+
+
 def _enrich_result(places: list[dict]) -> gemini_client.AnalysisResult:
-    raw = gemini_client.enrich_places(_client(), ENRICH_MODEL, places)
+    raw = gemini_client.enrich_places(_client(), ENRICH_MODEL, places, use_maps=USE_MAPS)
     if isinstance(raw, gemini_client.AnalysisResult):
         return raw
     return gemini_client.AnalysisResult(list(raw), [])
@@ -743,10 +761,21 @@ elif selected_places and API_KEY and remaining_quota() > 0 and missing_facts:
                 st.session_state.notice = ("warning", " ".join(bits))
             st.rerun()
         except gemini_client.GeminiError as err:
-            st.error(str(err))
+            message = str(err)
+            if message == gemini_client.CROWD_RATE_LIMIT_MESSAGE:
+                st.error(message)
+            else:
+                bits = [gemini_client.ENRICH_INCOMPLETE_WARNING]
+                if not USE_MAPS:
+                    bits.append(gemini_client.MAPS_UNAVAILABLE_WARNING)
+                if message and message not in bits and gemini_client.CROWD_RATE_LIMIT_MESSAGE not in message:
+                    bits.append(message)
+                st.session_state.notice = ("warning", " ".join(bits))
+                st.rerun()
         except Exception:  # noqa: BLE001
             logger.exception("Sample enrich failed")
-            st.error("核對樣本失敗，請再試一次。")
+            st.session_state.notice = ("warning", "核對樣本失敗，請再試一次。")
+            st.rerun()
 can_plan = bool(API_KEY) and bool(sample) and remaining_quota() > 0
 if not selected_places:
     st.caption("行程匣未有可排嘅地方，所以下面個掣未撳得。")
@@ -880,5 +909,7 @@ if timing.get("source") == "plan":
         "呢個係呢次呼叫嘅秒數，未當收費過關實測。"
     )
 st.divider()
-st.caption(f"原型版本 | 行程匣 MVP | 今個 session 仲有 {remaining_quota()}/{MAX_ANALYSES} 次")
+st.caption(
+    f"原型版本 | 行程匣 MVP | 今個 session 仲有 {remaining_quota()}/{MAX_ANALYSES} 次 | build: {_build_sha()}"
+)
 _persist_shared_trip()

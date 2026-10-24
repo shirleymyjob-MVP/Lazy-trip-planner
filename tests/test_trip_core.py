@@ -441,13 +441,12 @@ def test_enrich_places_keeps_seed_when_model_adds_facts():
     prompt = kwargs["contents"]
     assert "淺草寺" in prompt and "唔好硬套日本" in prompt
     assert "address" in prompt and "opening_hours" in prompt and "rating" in prompt
-    assert "Google Maps" in prompt and "空字串" in prompt
+    assert "今次冇 Google Maps" in prompt and "空字串" in prompt
     config = kwargs["config"]
     assert config.thinking_config.thinking_level == "LOW"
     assert config.thinking_config.thinking_budget is None
-    assert config.response_schema is None
-    assert config.response_mime_type is None
-    assert config.tools[0].google_maps is not None
+    assert config.response_schema is gemini_client.PLACES_SCHEMA
+    assert config.tools is None
     assert config.tool_config is None
     assert config.http_options.timeout == gemini_client.ENRICH_TIMEOUT_MS
     assert config.http_options.retry_options.attempts == 1
@@ -518,7 +517,7 @@ def test_enrich_parses_fenced_json_and_biases_fukuoka():
     }, ensure_ascii=False)
     client.models.generate_content.return_value = _Resp(f"```json\n{body}\n```")
     seed = trip_core.seed_place("kchiara", name_zh="キアラ", area="福岡")
-    result = gemini_client.enrich_places(client, "m", [seed], retry_sleep=0)
+    result = gemini_client.enrich_places(client, "m", [seed], retry_sleep=0, use_maps=True)
     assert trip_core.place_is_complete(result.places[0])
     assert result.warnings == []
     config = client.models.generate_content.call_args.kwargs["config"]
@@ -526,7 +525,7 @@ def test_enrich_parses_fenced_json_and_biases_fukuoka():
     assert lat_lng.latitude == 33.59
     assert lat_lng.longitude == 130.40
     tokyo = trip_core.seed_place("淺草寺", area="東京都台東區")
-    gemini_client.enrich_places(client, "m", [tokyo], retry_sleep=0)
+    gemini_client.enrich_places(client, "m", [tokyo], retry_sleep=0, use_maps=True)
     biased = client.models.generate_content.call_args.kwargs["config"].tool_config.retrieval_config.lat_lng
     assert biased.latitude == 35.68
     assert biased.longitude == 139.76
@@ -534,7 +533,7 @@ def test_enrich_parses_fenced_json_and_biases_fukuoka():
         trip_core.seed_place("一蘭", area="福岡"),
         trip_core.seed_place("淺草寺", area="東京"),
     ]
-    gemini_client.enrich_places(client, "m", mixed, retry_sleep=0)
+    gemini_client.enrich_places(client, "m", mixed, retry_sleep=0, use_maps=True)
     assert client.models.generate_content.call_args.kwargs["config"].tool_config is None
 
 
@@ -551,6 +550,9 @@ def test_enrich_warns_when_maps_facts_stay_empty():
     result = gemini_client.enrich_places(client, "m", [seed], retry_sleep=0)
     assert not trip_core.place_is_complete(result.places[0])
     assert gemini_client.ENRICH_INCOMPLETE_WARNING in result.warnings
+    assert gemini_client.MAPS_UNAVAILABLE_WARNING in result.warnings
+    assert client.models.generate_content.call_args.kwargs["config"].tools is None
+    assert gemini_client.CROWD_RATE_LIMIT_MESSAGE not in " ".join(result.warnings)
 
 
 def _quota_error(message: str):
@@ -567,7 +569,9 @@ def test_maps_429_falls_back_to_text_enrich_without_false_rate_limit():
         _quota_error("You exceeded your current quota, please check your plan and billing details."),
         _enrich_ok_payload(),
     ]
-    result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺", area="東京")], retry_sleep=0)
+    result = gemini_client.enrich_places(
+        client, None, [trip_core.seed_place("淺草寺", area="東京")], retry_sleep=0, use_maps=True,
+    )
     assert trip_core.place_is_complete(result.places[0])
     assert result.warnings == []
     calls = client.models.generate_content.call_args_list
@@ -582,7 +586,9 @@ def test_maps_429_falls_back_to_text_enrich_without_false_rate_limit():
 
     later = mock.MagicMock()
     later.models.generate_content.return_value = _enrich_ok_payload()
-    gemini_client.enrich_places(later, "m", [trip_core.seed_place("kchiara", area="福岡")], retry_sleep=0)
+    gemini_client.enrich_places(
+        later, "m", [trip_core.seed_place("kchiara", area="福岡")], retry_sleep=0, use_maps=True,
+    )
     assert later.models.generate_content.call_count == 1
     assert later.models.generate_content.call_args.kwargs["model"] == "m"
     assert later.models.generate_content.call_args.kwargs["config"].tools is None
@@ -601,7 +607,8 @@ def test_maps_429_then_empty_text_warns_instead_of_rate_limit():
         }, ensure_ascii=False)),
     ]
     result = gemini_client.enrich_places(
-        client, None, [trip_core.seed_place("kchiara", name_zh="キアラ", area="福岡")], retry_sleep=0,
+        client, None, [trip_core.seed_place("kchiara", name_zh="キアラ", area="福岡")],
+        retry_sleep=0, use_maps=True,
     )
     assert not trip_core.place_is_complete(result.places[0])
     assert gemini_client.ENRICH_INCOMPLETE_WARNING in result.warnings
@@ -623,13 +630,13 @@ def test_text_enrich_hard_quota_is_not_retried_as_crowd():
             assert "額度滿" in str(err)
             assert "而家用緊嘅人太多" not in str(err)
             assert "過一陣" in str(err)
-    assert client.models.generate_content.call_count == 2
+    assert client.models.generate_content.call_count == 1
+    assert client.models.generate_content.call_args.kwargs["config"].tools is None
 
 
 def test_text_enrich_transient_429_retries_once():
     client = mock.MagicMock()
     client.models.generate_content.side_effect = [
-        _quota_error("Resource exhausted. Please retry later."),
         _quota_error("Resource exhausted. Please retry later."),
         _enrich_ok_payload(),
     ]
@@ -637,9 +644,9 @@ def test_text_enrich_transient_429_retries_once():
     with mock.patch.object(gemini_client, "_sleep", side_effect=lambda seconds: sleeps.append(seconds)):
         result = gemini_client.enrich_places(client, None, [trip_core.seed_place("淺草寺")], retry_sleep=0)
     assert trip_core.place_is_complete(result.places[0])
-    assert client.models.generate_content.call_count == 3
+    assert client.models.generate_content.call_count == 2
     assert sleeps == [gemini_client.ENRICH_RATE_RETRY_SLEEP_S]
-    assert calls_use_maps(client, 0) and not calls_use_maps(client, 1) and not calls_use_maps(client, 2)
+    assert not calls_use_maps(client, 0) and not calls_use_maps(client, 1)
 
 
 def calls_use_maps(client, index: int) -> bool:

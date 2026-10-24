@@ -22,7 +22,7 @@ MVP 只收**截圖**。真實用法係：見到地方就截圖，iPhone 撳「�
 
 本機量度（2026-10-24，冇呼叫 Gemini）：3024×4032 純色 JPEG 縮圖中位數 **149 ms**（20 次，p95 172 ms）。地區判斷 1000 次約 **5 ms**。一張圖寫入再讀出分享行程少過 **1 ms**。呢啲係送去模型之前嘅準備時間。
 
-快路徑同慢路徑係分開嘅：`recognize_names` 只問店名同地區；`enrich_places` 先試 `gemini-3.5-flash-lite` 同 Google Maps 補地址、營業時間、評分。免費額度冇 Maps，嗰個 429 會改做文字核對，並寫明唔係人太多；文字核對仍然缺資料先出警告。`generate_itinerary` 先排日程。
+快路徑同慢路徑係分開嘅：`recognize_names` 只問店名同地區；`enrich_places` 預設只用 `gemini-3.5-flash-lite` 文字核對地址、營業時間、評分。`GEMINI_USE_MAPS=1` 先試 Google Maps。頁尾 `build:` 係而家載入嘅 commit。`generate_itinerary` 先排日程。
 
 ## 目的地清單（2026 年 10 月）
 
@@ -72,6 +72,7 @@ MVP 只收**截圖**。真實用法係：見到地方就截圖，iPhone 撳「�
 | `MAX_ANALYSES_PER_SESSION` | | `10` | 每個 session 最多幾多次**成功** AI 動作 |
 | `GEMINI_TIMEOUT_MS` | | `120000` | 單次 Gemini HTTP 逾時（毫秒）。設咗就會覆蓋程式預設 |
 | `GEMINI_RETRY_ATTEMPTS` | | `2` | HTTP 嘗試次數（包含第一次；2 = 逾時／429／5xx 再試一次）。認店名、核對、排日程共用。認店名壞 JSON 唔會再解析第二次 |
+| `GEMINI_USE_MAPS` | | 關 | 設 `1` 先用 Google Maps 核對。免費額度預設唔叫，避免即刻 429 |
 
 ## 本地開發
 ```bash

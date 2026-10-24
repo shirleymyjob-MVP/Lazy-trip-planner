@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -30,8 +31,10 @@ ENRICH_HTTP_ATTEMPTS = 1
 ENRICH_RETRY_SLEEP_S = 1.5
 ENRICH_RETRY_MAX_ELAPSED_S = 12.0
 ENRICH_INCOMPLETE_WARNING = "核對後仍然缺地址／營業時間／評分"
-# 免費額度冇 Google Maps。呢個 429 唔係 generateContent 人太多。
+# 免費額度冇 Google Maps。預設唔叫 Maps，避免每次核對都即刻 429。
 MAPS_UNAVAILABLE_WARNING = "Google Maps 核對未開通（免費額度通常冇 Maps），已改用文字核對。唔好當成服務擠塞。"
+# 只用於文字核對嘅暫時限速。Maps 429 唔可以用呢句。
+CROWD_RATE_LIMIT_MESSAGE = "而家用緊嘅人太多（或者用量額度滿咗），請過一陣再試。"
 ENRICH_RATE_RETRY_SLEEP_S = 2.0
 # 同一個 process 裡 Maps 已 429／拒絕過就唔再叫，避免每撳一次都燒一次注定失敗嘅額度。
 _maps_grounding_disabled = False
@@ -479,7 +482,7 @@ def _friendly_api_error(exc: Exception, *, used_maps: bool = False) -> str:
             return "Google Maps 核對未開通（免費額度通常冇 Maps）。請過一陣再試文字核對。"
         if _is_hard_quota(exc):
             return "AI 用量額度滿咗，請過一陣或者檢查帳單。唔好當成服務擠塞。"
-        return "而家用緊嘅人太多（或者用量額度滿咗），請過一陣再試。"
+        return CROWD_RATE_LIMIT_MESSAGE
     if code in (401, 403):
         return "AI 服務設定有問題（API Key 無效或冇權限），請通知管理員。"
     if code == 404:
@@ -754,6 +757,14 @@ def _seeds_still_incomplete(seeds: list[dict], merged: list[dict]) -> bool:
     return False
 
 
+def _maps_opt_in(flag: bool | str | None) -> bool:
+    """預設關閉。Secret 或環境變數 GEMINI_USE_MAPS=1 先會叫 Maps。"""
+    raw = os.environ.get("GEMINI_USE_MAPS", "") if flag is None else flag
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def enrich_places(
     client,
     model: str | None,
@@ -761,20 +772,21 @@ def enrich_places(
     *,
     parse_attempts: int = 1,
     retry_sleep: float = 0.4,
+    use_maps: bool | str | None = None,
 ) -> AnalysisResult:
-    """用 Google Maps 補地址、營業時間、評分。模型漏咗嘅店名會保留。
+    """補地址、營業時間、評分。預設只叫文字模型，唔叫 Google Maps。
 
     未傳 model（空字串或 None）就用 DEFAULT_ENRICH_MODEL。測試可以傳別嘅 id。
-    Maps 429 或拒絕 tool 就停用 Maps，改叫同模型嘅文字核對一次，唔好再燒 Maps 額度，
-    亦唔好話成「人太多」。文字核對如果係暫時 429（冇帳單／quota 字眼）先瞓 2 秒再試一次。
+    GEMINI_USE_MAPS=1 先試 Maps。Maps 429 或拒絕 tool 就停用，改文字核對，
+    唔好講成「人太多」。文字核對如果係暫時 429（冇帳單／quota 字眼）先瞓 2 秒再試一次。
     5xx 而且第一次喺 ENRICH_RETRY_MAX_ELAPSED_S 內失敗，先瞓 1.5 秒再試一次。
     呢次 HTTP 唔跟 SDK 重試，所以唔會變成 120 秒乘幾次。
-    Maps tool 唔同 response_schema 一齊用，JSON 由文字解析（容許 ```json）。
     """
     global _maps_grounding_disabled
     if not seeds:
         return AnalysisResult([], [])
     chosen = (model or "").strip() or DEFAULT_ENRICH_MODEL
+    want_maps = _maps_opt_in(use_maps) and not _maps_grounding_disabled
     slim = [
         {k: place.get(k) for k in ("name", "name_zh", "area", "address") if place.get(k)}
         for place in seeds
@@ -821,8 +833,8 @@ def enrich_places(
                 return once(use_maps=False)
             raise
 
-    maps_fell_back = _maps_grounding_disabled
-    if maps_fell_back:
+    maps_skipped = not want_maps
+    if maps_skipped:
         found = call_once_with_fast_retry(use_maps=False)
     else:
         try:
@@ -832,7 +844,7 @@ def enrich_places(
                 raise
             logger.info("Maps grounding blocked (%s); falling back to text enrich", err)
             _maps_grounding_disabled = True
-            maps_fell_back = True
+            maps_skipped = True
             found = call_once_with_fast_retry(use_maps=False)
     warnings: list[str] = []
     if not found:
@@ -841,7 +853,7 @@ def enrich_places(
     merged = trip_core.dedupe_places(list(seeds) + found)
     if _seeds_still_incomplete(seeds, merged):
         warnings.append(ENRICH_INCOMPLETE_WARNING)
-        if maps_fell_back:
+        if maps_skipped:
             warnings.append(MAPS_UNAVAILABLE_WARNING)
     return AnalysisResult(merged, warnings)
 
