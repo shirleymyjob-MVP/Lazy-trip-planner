@@ -29,15 +29,21 @@ CAPTURE_TO_INBOX_TAPS = 1
 PLAN_FROM_INBOX_TAPS = 1
 HAPPY_PATH_CAPTION = (
     f"放入行程匣：{CAPTURE_TO_INBOX_TAPS} 步。"
-    "貼上截圖（Cmd/Ctrl+V 或「從剪貼簿貼上」）就會自動認地方並放進行程匣，未填日期同偏好都收得。"
+    "貼上截圖（Cmd/Ctrl+V 或「從剪貼簿貼上」）或者批量上載相簿，未填日期同偏好都收得。"
+    "貼完會先顯示「認緊」，之後出店名，或者「認唔到」。"
     "備註可順手寫，例如「只要圖中 1、4」，唔使再撳確認。"
-    "貼上唔使揀城市，分析完會按畫面自動標地區；睇唔準就係未分類，可以之後一撳改。"
+    "貼上唔使揀城市。認完會按畫面自動標地區，一間店可以屬於多過一個地區（例如一蘭）。"
+    "睇唔準就係未分類，可以之後一撳改。"
     "iPhone 撳完「複製並刪除」之後，可能要先撳一下貼上框再貼上。"
     f"稍後排行程：{PLAN_FROM_INBOX_TAPS} 步。"
-    "行程匣有地方之後，預設全選，撳「開始排行程」。"
-    "目的地預設日本、3 日、美食同景點、同朋友；想改先選，唔使儲存。"
-    "地址、營業時間、評分喺行程匣卡同行程入面，唔使離開呢版去 Google Maps 對基本資料。"
+    "開始排行程之前會先顯示一個齊地址、營業時間、評分嘅樣本同預計等待。"
+    "目的地預設日本、3 日、美食同景點、同朋友；行程匣已經有地區就唔使再揀城市。"
+    "分享連結可以俾另一個人一齊貼相、改備註、剔選同排行程。"
 )
+# ETA 係預算，方便收費前講等待。呢度冇真實 Gemini 時延實測。
+PLAN_ENRICH_BUDGET_S = 20
+PLAN_ITINERARY_BUDGET_S = 25
+FAST_NAME_BUDGET_S = 8
 
 # 目的地清單（2026-10-24 核對，冬季節由 10 月 25 日開始）：
 # 國泰 CX 自營香港直飛：東京（HND／NRT）、大阪（KIX）、名古屋（NGO）、福岡（FUK）、札幌（CTS）。
@@ -313,16 +319,34 @@ def _region_blob(places: Iterable[dict] | None, remark: str = "") -> str:
     return text.lower()
 
 
-def classify_region(places: Iterable[dict] | None = None, remark: str = "") -> tuple[str, str]:
-    """由截圖認到嘅字同備註估地區。
-
-    只得一個明確地區先算高信心。幾個地區打和，或者完全估唔到，就係低信心（畫面顯示未分類）。
-    """
+def _region_hits(places: Iterable[dict] | None, remark: str = "") -> dict[str, int]:
     blob = _region_blob(places, remark)
     hits: dict[str, int] = {}
     for needle, city in (*_DISTRICT_HINTS, *_CITY_HINTS):
         if needle.lower() in blob:
             hits[city] = hits.get(city, 0) + 1
+    return hits
+
+
+def _ordered_regions(hits: dict[str, int]) -> list[str]:
+    ordered = [city for city in QUICK_REGION_FIXES if city in hits]
+    for city in hits:
+        if city not in ordered:
+            ordered.append(city)
+    return ordered
+
+
+def classify_regions(places: Iterable[dict] | None = None, remark: str = "") -> tuple[list[str], str]:
+    """估到嘅地區可以多過一個（連鎖店例如一蘭）。完全估唔到先係低信心。"""
+    hits = _region_hits(places, remark)
+    if not hits:
+        return [], REGION_LOW
+    return _ordered_regions(hits), REGION_CONFIDENT
+
+
+def classify_region(places: Iterable[dict] | None = None, remark: str = "") -> tuple[str, str]:
+    """只得一個明確地區先算高信心。幾個地區一齊出現就交俾 classify_regions，呢度當未鎖定單一城市。"""
+    hits = _region_hits(places, remark)
     if len(hits) == 1:
         return next(iter(hits)), REGION_CONFIDENT
     if not hits:
@@ -342,23 +366,35 @@ def infer_city(places: Iterable[dict]) -> str:
     return city
 
 
-def inbox_region_name(item: dict) -> str:
-    """行程匣項目用來分組嘅地區。低信心或者未有城市就係未分類。"""
-    city = (item.get("city") or "").strip()
+def inbox_region_names(item: dict) -> list[str]:
+    """一張截圖可以屬於幾個地區。低信心先至係未分類。"""
     confidence = item.get("region_confidence")
     if confidence == REGION_LOW:
+        return [UNSORTED_REGION]
+    regions = [str(name).strip() for name in (item.get("regions") or []) if str(name).strip()]
+    if not regions:
+        city = (item.get("city") or "").strip()
+        if city:
+            regions = [city]
+    if not regions:
+        return [UNSORTED_REGION]
+    return regions
+
+
+def inbox_region_name(item: dict) -> str:
+    """分組時用嘅第一個地區。未分類就係未分類。"""
+    names = [name for name in inbox_region_names(item) if name != UNSORTED_REGION]
+    if not names:
         return UNSORTED_REGION
-    if city:
-        return city
-    return UNSORTED_REGION
+    return names[0]
 
 
 def group_inbox(items: Iterable[dict]) -> list[tuple[str, list[dict]]]:
-    """按地區分組。已知城市先，未分類放最後。"""
+    """按地區分組。多地區嘅項目會出現喺每個區。未分類放最後。"""
     buckets: dict[str, list[dict]] = {}
     for item in items or []:
-        name = inbox_region_name(item)
-        buckets.setdefault(name, []).append(item)
+        for name in inbox_region_names(item):
+            buckets.setdefault(name, []).append(item)
 
     def sort_key(name: str) -> tuple:
         if name == UNSORTED_REGION:
@@ -371,15 +407,63 @@ def group_inbox(items: Iterable[dict]) -> list[tuple[str, list[dict]]]:
 
 
 def shared_inbox_region(items: Iterable[dict]) -> str:
-    """揀咗嘅項目如果都係同一個已分類地區，就返回嗰個地區。"""
-    names = {
-        inbox_region_name(item)
-        for item in items or []
-        if inbox_region_name(item) != UNSORTED_REGION
-    }
-    if len(names) == 1:
-        return next(iter(names))
+    """揀咗嘅項目如果交集得一個已分類地區，就跟嗰個地區，唔使再揀城市。"""
+    sets = []
+    for item in items or []:
+        names = {name for name in inbox_region_names(item) if name != UNSORTED_REGION}
+        if names:
+            sets.append(names)
+    if not sets:
+        return ""
+    common = set.intersection(*sets)
+    if len(common) == 1:
+        return next(iter(common))
     return ""
+
+
+def recognition_headline(item: dict) -> str:
+    """行程匣即時狀態：認緊、店名，或者認唔到。"""
+    if item.get("analysis") == "pending":
+        return "認緊"
+    titles = []
+    for place in item.get("places") or []:
+        title = (place.get("name_zh") or place.get("name") or "").strip()
+        if title and title not in titles:
+            titles.append(title)
+    if titles:
+        return "、".join(titles)
+    return "認唔到"
+
+
+def place_title(place: dict) -> str:
+    return (place.get("name_zh") or place.get("name") or "").strip()
+
+
+def place_is_complete(place: dict) -> bool:
+    """收費前樣本要齊：名、地址、營業時間、評分。"""
+    return bool(
+        place_title(place)
+        and (place.get("address") or "").strip()
+        and (place.get("opening_hours") or "").strip()
+        and (place.get("rating") or "").strip()
+    )
+
+
+def first_complete_place(places: Iterable[dict] | None) -> dict | None:
+    for place in places or []:
+        if place_is_complete(place):
+            return place
+    return None
+
+
+def places_needing_facts(places: Iterable[dict] | None) -> list[dict]:
+    return [place for place in places or [] if place and not place_is_complete(place)]
+
+
+def estimate_plan_seconds(places_needing_facts: int) -> int:
+    """排行程前顯示嘅預計秒數。預算，唔係 Gemini 實測。"""
+    enrich = PLAN_ENRICH_BUDGET_S if places_needing_facts else 0
+    return enrich + PLAN_ITINERARY_BUDGET_S
 
 
 def decode_clipboard_payload(payload: Any, *, max_chars: int = 12_000_000) -> tuple[str, bytes, str] | None:
@@ -695,6 +779,21 @@ def dedupe_places(places: Iterable[dict]) -> list[dict]:
             result.append(dict(place))
         else:
             result[match] = _merge(result[match], place)
+    return result
+
+
+def merge_known_places(base: Iterable[dict], incoming: Iterable[dict]) -> list[dict]:
+    """只補已有店名嘅地址、時間、評分，唔好把別張截圖嘅店併入嚟。"""
+    result = [dict(place) for place in base or []]
+    for extra in incoming or []:
+        keys = {k for k in (_norm_key(extra.get("name", "")), _norm_key(extra.get("name_zh", ""))) if k}
+        if not keys:
+            continue
+        for idx, existing in enumerate(result):
+            ekeys = {k for k in (_norm_key(existing.get("name", "")), _norm_key(existing.get("name_zh", ""))) if k}
+            if keys & ekeys:
+                result[idx] = _merge(existing, extra)
+                break
     return result
 
 

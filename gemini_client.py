@@ -148,6 +148,49 @@ PLACES_PROMPT = """你係旅行助手，幫唔想自己搜尋嘅「懶人」整�
 同一個地方只列一次，source_images 填晒所有編號。
 完全認唔到就回傳空 list。"""
 
+NAMES_SCHEMA = _S(
+    type=_T.OBJECT,
+    properties={
+        "places": _S(
+            type=_T.ARRAY,
+            items=_S(
+                type=_T.OBJECT,
+                properties={
+                    "name": _S(type=_T.STRING, description="原文名稱"),
+                    "name_zh": _S(type=_T.STRING, description="繁體中文名稱或譯名"),
+                    "category": _S(type=_T.STRING, enum=list(trip_core.CATEGORIES)),
+                    "area": _S(type=_T.STRING, description="地區／城市，例如 今泉, 福岡"),
+                    "confidence": _S(type=_T.STRING, enum=list(trip_core.CONFIDENCE_LEVELS)),
+                    "source_images": _S(type=_T.ARRAY, items=_S(type=_T.INTEGER)),
+                    "caption_index": _S(type=_T.INTEGER, description="說明編號，冇就 0"),
+                },
+                required=["name", "name_zh", "category", "area", "confidence", "source_images", "caption_index"],
+            ),
+        )
+    },
+    required=["places"],
+)
+
+NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前面有「圖片 #編號」）。
+只係快認店名，唔好搵地址、營業時間或者評分。
+目的地：{destination}
+用家備註：{remarks}
+
+如果備註要求只留某幾個編號（例如「只要圖中 1、4」「①④」），只輸出該編號。
+如果備註話唔要某幾個編號，就唔好輸出嗰幾個。
+畫面係邊個城市就照實寫，唔好硬套日本。見到博多、Hakata、今泉就寫福岡。
+連鎖店如果畫面寫咗幾個城市，area 可以用頓號寫晒，例如「福岡、東京」。
+
+每個地方只填：
+- name：原文名稱
+- name_zh：繁體中文名
+- category：restaurant / cafe / dessert / attraction / shop / other
+- area：地區同城市
+- confidence：高 / 中 / 低
+- source_images：邊幾張圖
+- caption_index：① 或 1. = 1，冇編號就 0
+完全認唔到就回傳空 list。"""
+
 ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方排成 {days} 日行程。
 目的地：{destination}
 偏好：{preferences}
@@ -321,10 +364,20 @@ def _places_prompt(n: int, trip: dict) -> str:
     )
 
 
+def _names_prompt(n: int, trip: dict) -> str:
+    return NAMES_PROMPT.format(
+        n=n,
+        destination=(trip.get("destination") or "").strip() or "日本",
+        remarks=(trip.get("remarks") or "").strip() or "（冇）",
+    )
+
+
 def _chunk_places(
     client, model: str, images: list[bytes], trip: dict, *, parse_attempts: int, retry_sleep: float,
+    names_only: bool = False,
 ) -> list[dict]:
-    contents: list = [_places_prompt(len(images), trip)]
+    prompt = _names_prompt(len(images), trip) if names_only else _places_prompt(len(images), trip)
+    contents: list = [prompt]
     for idx, data in enumerate(images, start=1):
         contents.append(f"圖片 #{idx}")
         contents.append(types.Part.from_bytes(data=data, mime_type="image/jpeg"))
@@ -332,8 +385,8 @@ def _chunk_places(
         client,
         model,
         contents,
-        PLACES_SCHEMA,
-        0.2,
+        NAMES_SCHEMA if names_only else PLACES_SCHEMA,
+        0.1 if names_only else 0.2,
         trip_core.parse_places_response,
         failure_message="AI 回覆格式有問題，請再按一次分析。",
         parse_attempts=parse_attempts,
@@ -341,10 +394,14 @@ def _chunk_places(
     )
 
 
-def _run_chunk(client, model, start: int, chunk: list[bytes], trip: dict, *, parse_attempts: int, retry_sleep: float):
+def _run_chunk(
+    client, model, start: int, chunk: list[bytes], trip: dict, *,
+    parse_attempts: int, retry_sleep: float, names_only: bool = False,
+):
     try:
         places = _chunk_places(
-            client, model, chunk, trip, parse_attempts=parse_attempts, retry_sleep=retry_sleep,
+            client, model, chunk, trip,
+            parse_attempts=parse_attempts, retry_sleep=retry_sleep, names_only=names_only,
         )
     except GeminiError as err:
         return [], str(err)
@@ -360,6 +417,65 @@ def _run_chunk(client, model, start: int, chunk: list[bytes], trip: dict, *, par
                 mapped.append(idx + start)
         place["source_images"] = mapped
     return places, None
+
+
+def _analyze_images(
+    client,
+    model: str,
+    images: list[bytes],
+    trip: dict,
+    *,
+    names_only: bool,
+    chunk_size: int,
+    max_workers: int,
+    parse_attempts: int,
+    retry_sleep: float,
+) -> AnalysisResult:
+    if not images:
+        return AnalysisResult([], [])
+    size = max(1, int(chunk_size))
+    chunks: list[tuple[int, list[bytes]]] = []
+    start = 0
+    while start < len(images):
+        chunks.append((start, images[start:start + size]))
+        start += size
+
+    ordered: list[tuple[list[dict], str | None]] = [([], None) for _ in chunks]
+    if len(chunks) == 1:
+        ordered[0] = _run_chunk(
+            client, model, chunks[0][0], chunks[0][1], trip,
+            parse_attempts=parse_attempts, retry_sleep=retry_sleep, names_only=names_only,
+        )
+    else:
+        workers = max(1, min(int(max_workers), len(chunks)))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(
+                    _run_chunk, client, model, offset, chunk, trip,
+                    parse_attempts=parse_attempts, retry_sleep=retry_sleep, names_only=names_only,
+                ): index
+                for index, (offset, chunk) in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                ordered[futures[future]] = future.result()
+
+    places: list[dict] = []
+    failures: list[str] = []
+    for found, err in ordered:
+        places.extend(found)
+        if err:
+            failures.append(err)
+    if not places and failures:
+        raise GeminiError(failures[0])
+    warnings: list[str] = []
+    if failures:
+        warnings.append(
+            f"有 {len(failures)} 組截圖分析失敗，其餘地方已列出。{failures[0]} 可以撳「再分析」補返。"
+        )
+    kept, note = trip_core.apply_caption_filter(trip_core.dedupe_places(places), trip.get("remarks") or "")
+    if note:
+        warnings.append(note)
+    return AnalysisResult(kept, warnings)
 
 
 def analyze_screenshots(
@@ -381,57 +497,51 @@ def analyze_screenshots(
     source_images 仍然係成個 list 嘅 1-based 位置，方便外面再對畫面編號。
     部分批次失敗會返回已認到嘅地方同 warnings；全部失敗就 raise GeminiError。
     """
-    if not images:
-        return AnalysisResult([], [])
     trip = {
         "remarks": remarks,
         "destination": destination,
         "preferences": preferences,
         "party": party,
     }
-    size = max(1, int(chunk_size))
-    chunks: list[tuple[int, list[bytes]]] = []
-    start = 0
-    while start < len(images):
-        chunks.append((start, images[start:start + size]))
-        start += size
+    return _analyze_images(
+        client, model, images, trip,
+        names_only=False,
+        chunk_size=chunk_size,
+        max_workers=max_workers,
+        parse_attempts=parse_attempts,
+        retry_sleep=retry_sleep,
+    )
 
-    ordered: list[tuple[list[dict], str | None]] = [([], None) for _ in chunks]
-    if len(chunks) == 1:
-        ordered[0] = _run_chunk(
-            client, model, chunks[0][0], chunks[0][1], trip,
-            parse_attempts=parse_attempts, retry_sleep=retry_sleep,
-        )
-    else:
-        workers = max(1, min(int(max_workers), len(chunks)))
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = {
-                pool.submit(
-                    _run_chunk, client, model, offset, chunk, trip,
-                    parse_attempts=parse_attempts, retry_sleep=retry_sleep,
-                ): index
-                for index, (offset, chunk) in enumerate(chunks)
-            }
-            for future in as_completed(futures):
-                ordered[futures[future]] = future.result()
 
-    places: list[dict] = []
-    failures: list[str] = []
-    for found, err in ordered:
-        places.extend(found)
-        if err:
-            failures.append(err)
-    if not places and failures:
-        raise GeminiError(failures[0])
-    warnings: list[str] = []
-    if failures:
-        warnings.append(
-            f"有 {len(failures)} 組截圖分析失敗，其餘地方已列出。{failures[0]} 可以撳「再分析」補返。"
-        )
-    kept, note = trip_core.apply_caption_filter(trip_core.dedupe_places(places), remarks)
-    if note:
-        warnings.append(note)
-    return AnalysisResult(kept, warnings)
+def recognize_names(
+    client,
+    model: str,
+    images: list[bytes],
+    *,
+    remarks: str = "",
+    destination: str = "",
+    preferences: str = "",
+    party: str = "",
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    max_workers: int = DEFAULT_MAX_WORKERS,
+    parse_attempts: int = 2,
+    retry_sleep: float = 0.4,
+) -> AnalysisResult:
+    """行程匣快路徑：只認店名同地區。地址、營業時間、評分留待排行程前先核對。"""
+    trip = {
+        "remarks": remarks,
+        "destination": destination,
+        "preferences": preferences,
+        "party": party,
+    }
+    return _analyze_images(
+        client, model, images, trip,
+        names_only=True,
+        chunk_size=chunk_size,
+        max_workers=max_workers,
+        parse_attempts=parse_attempts,
+        retry_sleep=retry_sleep,
+    )
 
 
 def enrich_places(

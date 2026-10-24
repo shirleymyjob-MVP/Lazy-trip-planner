@@ -172,6 +172,25 @@ def test_analyze_screenshots_mocked():
     assert "評分" in parts[0]
 
 
+def test_recognize_names_is_the_fast_path():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps({
+        "places": [{
+            "name": "一蘭", "name_zh": "一蘭", "category": "restaurant",
+            "area": "福岡、東京", "confidence": "高",
+            "source_images": [1], "caption_index": 0,
+        }]
+    }, ensure_ascii=False))
+    result = gemini_client.recognize_names(client, "m", [b"jpeg"], remarks="只要圖中 1、4")
+    assert result.places[0]["name_zh"] == "一蘭"
+    assert result.places[0]["address"] == ""
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs["config"].response_schema is gemini_client.NAMES_SCHEMA
+    prompt = kwargs["contents"][0]
+    assert "只係快認店名" in prompt
+    assert "只要圖中 1、4" in prompt
+
+
 def test_analyze_errors_are_friendly():
     from google.genai import errors
 
@@ -297,6 +316,8 @@ def test_attach_place_facts_onto_itinerary():
     assert "行程匣" in trip_core.HAPPY_PATH_CAPTION
     assert "開始排行程" in trip_core.HAPPY_PATH_CAPTION
     assert "未分類" in trip_core.HAPPY_PATH_CAPTION
+    assert "認緊" in trip_core.HAPPY_PATH_CAPTION
+    assert "認唔到" in trip_core.HAPPY_PATH_CAPTION
     assert "貼店名" not in trip_core.HAPPY_PATH_CAPTION
 
 
@@ -534,6 +555,34 @@ def test_classify_region_from_caption_words_and_group_inbox():
     assert trip_core.shared_inbox_region([fukuoka, unsorted]) == "福岡"
     assert trip_core.shared_inbox_region([fukuoka, tokyo]) == ""
     assert trip_core.shared_inbox_region([unsorted]) == ""
+    chain = {
+        "city": "福岡",
+        "regions": ["福岡", "東京"],
+        "region_confidence": trip_core.REGION_CONFIDENT,
+    }
+    regions, confidence = trip_core.classify_regions([
+        {"name": "一蘭", "name_zh": "一蘭", "area": "福岡、東京"},
+    ])
+    assert regions == ["福岡", "東京"]
+    assert confidence == trip_core.REGION_CONFIDENT
+    assert trip_core.recognition_headline({"analysis": "pending", "places": []}) == "認緊"
+    assert trip_core.recognition_headline({"analysis": "done", "places": []}) == "認唔到"
+    assert trip_core.recognition_headline({
+        "analysis": "done",
+        "places": [{"name_zh": "一蘭"}],
+    }) == "一蘭"
+    grouped_chain = trip_core.group_inbox([chain])
+    assert [name for name, _items in grouped_chain] == ["福岡", "東京"]
+    assert trip_core.shared_inbox_region([chain, fukuoka]) == "福岡"
+    assert trip_core.shared_inbox_region([chain]) == ""
+    assert trip_core.place_is_complete({
+        "name": "一蘭", "address": "福岡市", "opening_hours": "24小時", "rating": "4.0/5",
+    })
+    assert not trip_core.place_is_complete({"name": "一蘭"})
+    assert trip_core.estimate_plan_seconds(0) == trip_core.PLAN_ITINERARY_BUDGET_S
+    assert trip_core.estimate_plan_seconds(2) == (
+        trip_core.PLAN_ENRICH_BUDGET_S + trip_core.PLAN_ITINERARY_BUDGET_S
+    )
 
 
 def test_decode_clipboard_payload_accepts_image_and_remark():

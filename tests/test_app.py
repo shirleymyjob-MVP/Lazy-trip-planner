@@ -119,7 +119,7 @@ def test_unreadable_upload_is_skipped():
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.run()
-    with mock.patch.object(gemini_client, "analyze_screenshots", return_value=[]) as analyze:
+    with mock.patch.object(gemini_client, "recognize_names", return_value=[]) as analyze:
         at.file_uploader[0].upload("bad.png", b"not-an-image", "image/png")
         at.file_uploader[0].upload("ok.png", _png("green"), "image/png").run()
     assert not at.exception
@@ -143,7 +143,7 @@ def test_upload_maps_second_image_and_does_not_reanalyze():
         }]
     }, ensure_ascii=False))
     with mock.patch.object(
-        gemini_client, "analyze_screenshots",
+        gemini_client, "recognize_names",
         return_value=gemini_client.AnalysisResult(found, []),
     ):
         at.file_uploader[0].upload("a.png", _png("red"), "image/png")
@@ -162,7 +162,7 @@ def test_upload_maps_second_image_and_does_not_reanalyze():
     assert not any("地區" in box.label for box in at.selectbox)
     page = "\n".join(m.value for m in at.markdown)
     assert "今泉1-4-23" in page and "18:00-23:00" in page and "4.5/5" in page
-    with mock.patch.object(gemini_client, "analyze_screenshots", side_effect=AssertionError("reanalyzed")):
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("reanalyzed")):
         at.run()
     assert not at.exception
     assert [item["label"] for item in at.session_state["inbox"]] == ["截圖 1", "截圖 2"]
@@ -181,14 +181,14 @@ def test_upload_remark_is_passed_into_analysis():
         seen["images"] = len(images)
         return gemini_client.AnalysisResult([], [])
 
-    with mock.patch.object(gemini_client, "analyze_screenshots", side_effect=fake_analyze):
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=fake_analyze):
         at.file_uploader[0].upload("ig.png", _png("orange"), "image/png").run()
     assert seen["images"] == 1
     assert seen["kwargs"]["remarks"] == "只要圖中 1、4"
     assert seen["kwargs"]["destination"] == "日本"
     assert at.session_state["inbox"][0]["remark"] == "只要圖中 1、4"
     assert at.session_state["inbox"][0]["status"] == "未排程"
-    with mock.patch.object(gemini_client, "analyze_screenshots", side_effect=AssertionError("reanalyzed")):
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("reanalyzed")):
         at.run()
     assert not at.exception
 
@@ -226,7 +226,7 @@ def test_analysis_failure_does_not_spend_quota():
     at.secrets["MAX_ANALYSES_PER_SESSION"] = 2
     at.run()
     with mock.patch.object(
-        gemini_client, "analyze_screenshots", side_effect=gemini_client.GeminiError("測試失敗"),
+        gemini_client, "recognize_names", side_effect=gemini_client.GeminiError("測試失敗"),
     ):
         at.file_uploader[0].upload("ok.png", _png("red"), "image/png").run()
     assert not at.exception
@@ -296,7 +296,7 @@ def test_inbox_filter_and_optional_region_fix():
     assert "神秘小店" not in filtered
     _pill(at, "按地區睇").set_value("全部").run()
     fix = [pill for pill in at.pills if "可以一撳改（唔改都得）" in pill.proto.label][0]
-    fix.set_value("大阪").run()
+    fix.set_value(["大阪"]).run()
     assert not at.exception
     fixed = at.session_state["inbox"][1]
     assert fixed["city"] == "大阪"
@@ -313,7 +313,7 @@ def test_inbox_filter_and_optional_region_fix():
         }]
     }, ensure_ascii=False))
     with mock.patch.object(
-        gemini_client, "analyze_screenshots",
+        gemini_client, "recognize_names",
         return_value=gemini_client.AnalysisResult(tokyo, []),
     ):
         retry = [b for b in at.button if b.label == "再試一次分析"][0]
@@ -331,7 +331,7 @@ def test_failed_analysis_tags_fukuoka_from_remark():
     remark = [box for box in at.text_input if "上傳備註" in box.label][0]
     remark.input("今泉 Hakata").run()
     with mock.patch.object(
-        gemini_client, "analyze_screenshots",
+        gemini_client, "recognize_names",
         side_effect=gemini_client.GeminiError("測試失敗"),
     ):
         at.file_uploader[0].upload("ig.png", _png("orange"), "image/png").run()
@@ -348,7 +348,11 @@ def test_failed_analysis_tags_fukuoka_from_remark():
 def test_plan_follows_shared_region_until_user_picks_a_city():
     item = _with_region(
         _inbox_item(
-            {"name": "博多炉端 魚男", "name_zh": "博多爐端 魚男", "category": "restaurant"},
+            {
+                "name": "博多炉端 魚男", "name_zh": "博多爐端 魚男", "category": "restaurant",
+                "address": "福岡縣福岡市中央區今泉1-4-23",
+                "opening_hours": "18:00-23:00", "rating": "4.5/5",
+            },
             item_id="c" * 32,
             label="截圖 1",
             city="福岡",
@@ -382,3 +386,81 @@ def test_plan_button_stays_disabled_until_inbox_has_places():
     at.run()
     assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
     assert any("行程匣未有截圖" in info.value for info in at.info)
+
+
+def test_plan_waits_for_one_complete_sample_and_shows_eta():
+    item = _with_region(
+        _inbox_item(
+            {"name": "一蘭", "name_zh": "一蘭", "category": "restaurant", "area": "福岡"},
+            item_id="d" * 32,
+            label="截圖 1",
+            city="福岡",
+        ),
+        trip_core.REGION_CONFIDENT,
+    )
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["inbox"] = [item]
+    at.run()
+    assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
+    assert any("預計開始排行程" in c.value and "預算" in c.value for c in at.caption)
+    assert any("未有齊地址" in c.value for c in at.caption)
+    enriched = trip_core.parse_places_response(json.dumps({
+        "places": [{
+            "name": "一蘭", "name_zh": "一蘭", "category": "restaurant",
+            "area": "福岡", "address": "福岡市博多區",
+            "opening_hours": "24小時", "rating": "4.0/5",
+            "confidence": "高", "source_images": [],
+        }]
+    }, ensure_ascii=False))
+    with mock.patch.object(
+        gemini_client, "enrich_places",
+        return_value=gemini_client.AnalysisResult(enriched, []),
+    ) as enrich:
+        sample = [b for b in at.button if b.label == "先核對一個樣本"][0]
+        sample.click().run()
+    assert not at.exception
+    enrich.assert_called_once()
+    assert at.session_state["usage"] == 1
+    page = "\n".join(m.value for m in at.markdown)
+    assert "收費前樣本" in page
+    assert "福岡市博多區" in page
+    assert "24小時" in page
+    assert "4.0/5" in page
+    assert any(b.label == "✨ 開始排行程" and not b.disabled for b in at.button)
+
+
+def test_async_recognize_shows_pending_state_before_the_model(monkeypatch):
+    monkeypatch.setenv("LAZY_TRIP_SYNC_RECOGNIZE", "0")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("too soon")):
+        at.file_uploader[0].upload("later.png", _png("blue"), "image/png").run()
+    assert not at.exception
+    assert at.session_state["inbox"][0]["analysis"] == "pending"
+    assert "認緊" in "\n".join(m.value for m in at.markdown)
+    assert at.session_state["usage"] == 0
+
+
+def test_shared_link_keeps_who_added_the_screenshot():
+    token = "ab" * 6
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.query_params["share"] = token
+    at.session_state["display_name"] = "Ada"
+    at.run()
+    with mock.patch.object(gemini_client, "recognize_names", return_value=gemini_client.AnalysisResult([], [])):
+        at.file_uploader[0].upload("shared.png", _png("red"), "image/png").run()
+    assert at.session_state["inbox"][0]["added_by"] == "Ada"
+    other = AppTest.from_file(APP, default_timeout=30)
+    other.secrets["GEMINI_API_KEY"] = "fake"
+    other.query_params["share"] = token
+    other.session_state["display_name"] = "Bo"
+    other.run()
+    assert not other.exception
+    assert other.session_state["inbox"][0]["added_by"] == "Ada"
+    assert other.session_state["inbox"][0]["label"] == "截圖 1"
+    page = "\n".join(block.value for block in list(other.markdown) + list(other.caption))
+    assert "加入：Ada" in page
+    assert token in "\n".join(block.value for block in other.code)

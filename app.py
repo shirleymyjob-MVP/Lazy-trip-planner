@@ -7,6 +7,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import re
+import time
 import uuid
 from pathlib import Path
 
@@ -15,6 +18,7 @@ import streamlit.components.v1 as components
 
 import gemini_client
 import trip_core
+import trip_store
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("lazy_trip_planner")
@@ -99,6 +103,8 @@ def init_state():
     st.session_state.setdefault("party_other", "")
     st.session_state.setdefault("upload_remark", "")
     st.session_state.setdefault("inbox_region_filter", "全部")
+    st.session_state.setdefault("display_name", "旅人")
+    st.session_state.setdefault("members", [])
 
 
 def remaining_quota() -> int:
@@ -136,8 +142,10 @@ def _new_item(image: bytes, remark: str) -> dict:
         "analysis": "pending",
         "places": [],
         "city": "",
+        "regions": [],
         "region_confidence": trip_core.REGION_LOW,
         "warning": "",
+        "added_by": (st.session_state.get("display_name") or "旅人").strip() or "旅人",
     }
 
 
@@ -179,8 +187,9 @@ def _apply_region(item: dict) -> None:
     """用截圖文字同備註標地區。用家一撳改過嘅，分析唔好覆寫。"""
     if item.get("region_confidence") == trip_core.REGION_MANUAL:
         return
-    city, confidence = trip_core.classify_region(item.get("places") or [], item.get("remark") or "")
-    item["city"] = city
+    regions, confidence = trip_core.classify_regions(item.get("places") or [], item.get("remark") or "")
+    item["regions"] = regions
+    item["city"] = regions[0] if regions else ""
     item["region_confidence"] = confidence
 
 
@@ -210,7 +219,7 @@ def _distribute_places(items: list[dict], places: list[dict]) -> None:
         _apply_region(item)
 
 
-def _analyze_pending():
+def _recognize_pending():
     pending = [item for item in st.session_state.inbox if item.get("analysis") == "pending"]
     if not pending:
         return
@@ -233,12 +242,12 @@ def _analyze_pending():
 
     succeeded = False
     warnings: list[str] = []
-    with st.status(f"AI 睇緊行程匣入面 {len(pending)} 張新截圖…", expanded=True) as status:
-        status.write("備註會交俾分析。多過 3 張會分批，失敗會再試。")
+    with st.status(f"認緊 {len(pending)} 張新截圖嘅店名…", expanded=True) as status:
+        status.write("而家只認店名。地址、營業時間、評分會喺排行程之前先核對。")
         for remark, items in groups:
             images = [item["image"] for item in items]
             try:
-                raw = gemini_client.analyze_screenshots(
+                raw = gemini_client.recognize_names(
                     _client(),
                     MODEL,
                     images,
@@ -306,19 +315,180 @@ def _plan_notes(request: dict, items: list[dict]) -> str:
     return "；".join(bits)
 
 
+_TRIP_FIELDS = (
+    "destination_choice", "days_choice", "pref_pills", "party_pills",
+    "destination_other", "pref_other", "party_other",
+)
+
+
+def _sync_recognize() -> bool:
+    return os.environ.get("LAZY_TRIP_SYNC_RECOGNIZE") == "1"
+
+
+def _ensure_share() -> None:
+    query = st.query_params.get("share", "")
+    if isinstance(query, list):
+        query = query[0] if query else ""
+    token = st.session_state.get("share_token") or ""
+    if not re.fullmatch(r"[0-9a-f]{8,32}", token):
+        token = query if re.fullmatch(r"[0-9a-f]{8,32}", query or "") else trip_store.new_token()
+    st.session_state.share_token = token
+    if query != token:
+        st.query_params["share"] = token
+
+
+def _share_url() -> str:
+    try:
+        current = st.context.url or ""
+    except Exception:  # noqa: BLE001
+        current = ""
+    base = current.split("?", 1)[0] if current else "http://localhost:8501/"
+    return f"{base}?share={st.session_state.share_token}"
+
+
+def _apply_loaded_trip(loaded: dict) -> None:
+    st.session_state.inbox = list(loaded.get("inbox") or [])
+    st.session_state.itinerary = loaded.get("itinerary")
+    st.session_state.itinerary_places = list(loaded.get("itinerary_places") or [])
+    st.session_state.next_image_num = int(loaded.get("next_image_num") or 1)
+    st.session_state.members = list(loaded.get("members") or [])
+    for key in _TRIP_FIELDS:
+        if loaded.get(key) is not None:
+            st.session_state[key] = loaded[key]
+    picks = loaded.get("picks") or {}
+    for item in st.session_state.inbox:
+        st.session_state[f"pick_{item['id']}"] = bool(picks.get(item["id"], True))
+        st.session_state[f"remark_{item['id']}"] = item.get("remark") or ""
+        names = [name for name in trip_core.inbox_region_names(item) if name != trip_core.UNSORTED_REGION]
+        st.session_state[f"region_fix_{item['id']}"] = names
+    st.session_state.last_digest = trip_store.digest({
+        "inbox": st.session_state.inbox,
+        "itinerary": st.session_state.itinerary,
+        "itinerary_places": st.session_state.itinerary_places,
+        "next_image_num": st.session_state.next_image_num,
+        "picks": {item["id"]: bool(picks.get(item["id"], True)) for item in st.session_state.inbox},
+        "members": st.session_state.members,
+        **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
+    })
+
+
+def _load_shared_trip() -> None:
+    token = st.session_state.share_token
+    try:
+        mt = trip_store.mtime(token)
+    except ValueError:
+        return
+    if mt == st.session_state.get("seen_mtime"):
+        return
+    st.session_state.seen_mtime = mt
+    if not mt:
+        st.session_state.last_digest = ""
+        return
+    loaded = trip_store.load_trip(token)
+    if loaded:
+        _apply_loaded_trip(loaded)
+
+
+def _snapshot() -> dict:
+    inbox = []
+    picks = {}
+    for item in st.session_state.inbox:
+        remark_key = f"remark_{item['id']}"
+        if remark_key in st.session_state:
+            item["remark"] = (st.session_state.get(remark_key) or "").strip()
+        picks[item["id"]] = bool(st.session_state.get(f"pick_{item['id']}", True))
+        inbox.append(item)
+    name = (st.session_state.get("display_name") or "旅人").strip() or "旅人"
+    members = sorted({*(st.session_state.get("members") or []), name})
+    st.session_state.members = members
+    return {
+        "token": st.session_state.share_token,
+        "inbox": inbox,
+        "itinerary": st.session_state.itinerary,
+        "itinerary_places": st.session_state.itinerary_places,
+        "next_image_num": st.session_state.next_image_num,
+        "picks": picks,
+        "members": members,
+        **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
+    }
+
+
+def _persist_shared_trip() -> None:
+    snapshot = _snapshot()
+    current = trip_store.digest(snapshot)
+    if current == st.session_state.get("last_digest"):
+        return
+    try:
+        st.session_state.seen_mtime = trip_store.save_trip(snapshot)
+    except ValueError:
+        logger.exception("Could not save shared trip")
+        return
+    st.session_state.last_digest = current
+
+
+def _remember_region_fix(item_id: str) -> None:
+    choice = st.session_state.get(f"region_fix_{item_id}") or []
+    if isinstance(choice, str):
+        choice = [choice]
+    for item in st.session_state.inbox:
+        if item.get("id") == item_id:
+            item["regions"] = list(choice)
+            item["city"] = choice[0] if choice else ""
+            item["region_confidence"] = trip_core.REGION_MANUAL
+            return
+
+
+def _remember_remark(item_id: str) -> None:
+    text = (st.session_state.get(f"remark_{item_id}") or "").strip()
+    for item in st.session_state.inbox:
+        if item.get("id") == item_id:
+            item["remark"] = text
+            _apply_region(item)
+            return
+
+
+def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
+    for item in items:
+        item["places"] = trip_core.merge_known_places(item.get("places") or [], enriched)
+        _apply_region(item)
+
+
+def _enrich_places(places: list[dict]) -> list[dict]:
+    raw = gemini_client.enrich_places(_client(), MODEL, places)
+    result = raw if isinstance(raw, gemini_client.AnalysisResult) else gemini_client.AnalysisResult(list(raw), [])
+    return result.places
+
+
+@st.fragment(run_every=0.8)
+def _recognize_later() -> None:
+    if st.session_state.pop("_skip_recognize_fragment", False):
+        return
+    pending = [item for item in st.session_state.inbox if item.get("analysis") == "pending"]
+    if not pending:
+        return
+    _recognize_pending()
+    st.rerun()
+
+
 init_state()
+_ensure_share()
+_load_shared_trip()
 
 # ---------------------------------------------------------------- header
 st.title("✈️ 懶人行程規劃（原型版）")
 st.caption("先將截圖貼進行程匣，日期同偏好可以稍後先揀。唔會擷取 Instagram／YouTube／小紅書連結。")
 st.caption(trip_core.HAPPY_PATH_CAPTION)
+st.text_input("你嘅顯示名（一齊改行程時會見到）", key="display_name")
+members = "、".join(st.session_state.get("members") or []) or st.session_state.get("display_name") or "旅人"
+st.caption(f"分享連結：開咗嘅人可以一齊貼相、改備註、剔選同排行程。而家有：{members}")
+st.code(_share_url(), language=None)
 
 with st.expander("點樣用？", expanded=not st.session_state.inbox):
     st.markdown(
         f"""
-1. **行程匣**：喺 IG 見到地方就截圖，iPhone 撳「複製並刪除」，返嚟呢度貼上。桌面用 Cmd/Ctrl+V，或者撳「從剪貼簿貼上」。備註可寫「只要圖中 1、4」。貼上唔使揀地區。
-2. 已儲存嘅圖片先用下面嘅上傳（次要）。分析完會按畫面同文字自動標地區，例如福岡、博多、今泉。睇唔準就係未分類，可以之後一撳改。
-3. **開始排行程**係之後先做：日數、偏好、同行有預設。如果揀咗嘅行程匣都係同一個地區，會跟嗰個地區，唔使再揀城市。想改先用下拉。會用營業時間、距離同上面嘅選擇。
+1. **行程匣**：喺 IG 見到地方就截圖，iPhone 撳「複製並刪除」，返嚟呢度貼上。桌面用 Cmd/Ctrl+V，或者撳「從剪貼簿貼上」。相簿可以一次上載多張。備註可寫「只要圖中 1、4」。貼上唔使揀地區。
+2. 貼完先見「認緊」，之後出店名，或者「認唔到」。地區會自動標，一間店可以多過一個區。睇唔準就係未分類，可以之後一撳改。
+3. **開始排行程**係之後先做。撳之前會先見到一個齊地址、營業時間、評分嘅樣本同預計等待。如果揀咗嘅行程匣交集得一個地區，會跟嗰個地區。
 
 _原型版：每個 session 最多 {MAX_ANALYSES} 次成功嘅 AI 動作（失敗同自動重試唔計）。截圖只會用嚟即時分析。_
 """
@@ -329,8 +499,8 @@ if not API_KEY:
 
 # ---------------------------------------------------------------- inbox first
 st.subheader("1. 行程匣")
-st.caption("貼上同上傳都唔使揀地區。分析完會按畫面同文字自動標，例如福岡、博多、今泉。睇唔準就係未分類，可以之後一撳改。")
-st.caption("未填目的地、日期、偏好都可以收截圖。貼上係主要入口；上傳只係已經儲存咗檔案先用。")
+st.caption("貼上同批量上載都唔使揀地區。認完會標地區，例如福岡、博多、今泉；連鎖店可以同時屬幾個區。睇唔準就係未分類，可以之後一撳改。")
+st.caption("未填目的地、日期、偏好都可以收截圖。貼上係主要入口；相簿上載可以一次多張。")
 
 pasted = _PASTE(key=f"inbox_paste_{st.session_state.batch}", default=None)
 decoded_paste = trip_core.decode_clipboard_payload(pasted)
@@ -347,7 +517,7 @@ st.text_input(
     placeholder="例如：只要圖中 1、4",
 )
 uploaded = st.file_uploader(
-    "或者上傳已儲存嘅圖片（次要。貼上唔使先儲存相簿）",
+    "批量上載相簿圖片（可多張。貼上唔使先儲存相簿）",
     type=["png", "jpg", "jpeg", "webp"],
     accept_multiple_files=True,
     key=f"uploader_{st.session_state.batch}",
@@ -379,7 +549,7 @@ if st.session_state.inbox and st.button("清空行程匣", key=f"clear_{st.sessi
     clear_inbox()
     st.rerun()
 
-_analyze_pending()
+_recognize_pending() if _sync_recognize() or not API_KEY or remaining_quota() <= 0 else None
 failed = [item for item in st.session_state.inbox if item.get("analysis") == "failed"]
 if failed and API_KEY and remaining_quota() > 0:
     if st.button("再試一次分析", type="primary", key=f"retry_{st.session_state.batch}"):
@@ -387,18 +557,9 @@ if failed and API_KEY and remaining_quota() > 0:
             item["analysis"] = "pending"
             item["warning"] = ""
         st.session_state.notice = None
-        _analyze_pending()
+        if _sync_recognize():
+            _recognize_pending()
 _render_notice()
-
-def _remember_region_fix(item_id: str) -> None:
-    choice = st.session_state.get(f"region_fix_{item_id}")
-    if not choice:
-        return
-    for item in st.session_state.inbox:
-        if item.get("id") == item_id:
-            item["city"] = choice
-            item["region_confidence"] = trip_core.REGION_MANUAL
-            return
 
 
 def _render_inbox_card(item: dict) -> None:
@@ -409,28 +570,48 @@ def _render_inbox_card(item: dict) -> None:
         st.checkbox(f"排行程時包括 {item['label']}", key=pick_key)
         left, right = st.columns([1, 2])
         with left:
-            st.image(item["image"], caption=item["label"], width="stretch")
+            if item.get("image"):
+                st.image(item["image"], caption=item["label"], width="stretch")
+            else:
+                st.caption(item["label"])
         with right:
-            region = trip_core.inbox_region_name(item)
+            names = [name for name in trip_core.inbox_region_names(item) if name != trip_core.UNSORTED_REGION]
+            region_text = "、".join(trip_core.inbox_region_names(item))
             st.markdown(f"**{item['label']}** · 狀態：{item['status']}")
-            st.markdown(f"地區：{region}")
-            st.markdown(f"備註：{item['remark'] or '（冇）'}")
-            fix_label = "可以一撳改（唔改都得）" if region == trip_core.UNSORTED_REGION else "唔岩可以一撳改"
+            st.markdown(f"**{trip_core.recognition_headline(item)}**")
+            st.markdown(f"地區：{region_text}")
+            st.caption(f"加入：{item.get('added_by') or '未記名'}")
+            st.markdown(f"備註：{item.get('remark') or '（冇）'}")
+            remark_key = f"remark_{item['id']}"
+            if remark_key not in st.session_state:
+                st.session_state[remark_key] = item.get("remark") or ""
+            st.text_input(
+                f"改 {item['label']} 備註",
+                key=remark_key,
+                on_change=_remember_remark,
+                args=(item["id"],),
+                label_visibility="collapsed",
+            )
+            fix_key = f"region_fix_{item['id']}"
+            if fix_key not in st.session_state:
+                st.session_state[fix_key] = names
+            elif item.get("region_confidence") != trip_core.REGION_MANUAL and list(st.session_state.get(fix_key) or []) != names:
+                st.session_state[fix_key] = names
+            fix_label = "可以一撳改（唔改都得）" if not names else "唔岩可以一撳改（可多過一個）"
             st.pills(
                 fix_label,
                 list(trip_core.QUICK_REGION_FIXES),
-                key=f"region_fix_{item['id']}",
+                selection_mode="multi",
+                key=fix_key,
                 on_change=_remember_region_fix,
                 args=(item["id"],),
                 wrap=True,
             )
-            if item.get("analysis") == "pending":
-                st.caption("分析中")
-            elif item.get("analysis") == "failed":
-                st.caption(item.get("warning") or "分析失敗")
-            elif not item.get("places"):
-                st.caption(item.get("warning") or "未認到地方")
-            else:
+            if item.get("analysis") == "failed":
+                st.caption(item.get("warning") or "認唔到")
+            elif item.get("analysis") != "pending" and not item.get("places"):
+                st.caption(item.get("warning") or "認唔到")
+            elif item.get("places"):
                 if item.get("warning"):
                     st.caption(item["warning"])
                 for place in item["places"]:
@@ -464,10 +645,24 @@ else:
     visible = groups if not picked or picked == "全部" else [
         (name, grouped) for name, grouped in groups if name == picked
     ]
+    shown_ids: set[str] = set()
     for name, grouped in visible:
         st.markdown(f"**{name}** · {len(grouped)} 張")
+        fresh = []
         for item in grouped:
+            if item["id"] in shown_ids:
+                continue
+            shown_ids.add(item["id"])
+            fresh.append(item)
+        if not fresh:
+            st.caption("呢張相已經喺上面另一個地區顯示。")
+            continue
+        for item in fresh:
             _render_inbox_card(item)
+if not _sync_recognize():
+    if any(item.get("analysis") == "pending" for item in st.session_state.inbox):
+        st.session_state._skip_recognize_fragment = True
+    _recognize_later()
 
 # ---------------------------------------------------------------- plan later
 st.subheader("2. 開始排行程")
@@ -502,9 +697,42 @@ selected_places = trip_core.dedupe_places(
 )
 plan_request = _trip_request()
 plan_destination = _plan_destination(plan_request, selected_items)
-can_plan = bool(API_KEY) and bool(selected_places) and remaining_quota() > 0
+sample = trip_core.first_complete_place(selected_places)
+missing_facts = trip_core.places_needing_facts(selected_places)
+eta = trip_core.estimate_plan_seconds(len(missing_facts))
+if selected_places:
+    st.caption(
+        f"預計開始排行程大約 {eta} 秒"
+        f"（核對 {len(missing_facts)} 個未齊地址／時間／評分嘅地方，再排日程）。"
+        "呢個係預算，未有真實 Gemini 時延實測。"
+    )
+if sample:
+    st.markdown("**收費前樣本**")
+    st.markdown(f"**{trip_core.place_title(sample)}**")
+    st.markdown("\n\n".join(trip_core.place_fact_lines(sample)))
+elif selected_places and API_KEY and remaining_quota() > 0 and missing_facts:
+    if st.button("先核對一個樣本", key=f"sample_{st.session_state.batch}"):
+        try:
+            started = time.perf_counter()
+            enriched = _enrich_places(missing_facts[:1])
+            _overlay_enriched(selected_items, enriched)
+            st.session_state.usage += 1
+            st.session_state.last_plan_timing = {
+                "sample_s": round(time.perf_counter() - started, 3),
+                "source": "sample",
+            }
+            st.session_state.notice = None
+            st.rerun()
+        except gemini_client.GeminiError as err:
+            st.error(str(err))
+        except Exception:  # noqa: BLE001
+            logger.exception("Sample enrich failed")
+            st.error("核對樣本失敗，請再試一次。")
+can_plan = bool(API_KEY) and bool(sample) and remaining_quota() > 0
 if not selected_places:
     st.caption("行程匣未有可排嘅地方，所以下面個掣未撳得。")
+elif not sample:
+    st.caption("未有齊地址、營業時間同評分嘅樣本，所以未可以開始排行程。")
 elif not API_KEY:
     st.caption("AI 未設定，未可以排行程。")
 elif remaining_quota() <= 0:
@@ -525,8 +753,19 @@ if submitted:
         st.warning("今個 session 嘅免費次數用完喇 🙏 之後會推出登入／付費版本。")
     else:
         with st.status("AI 排緊行程…", expanded=True) as status:
-            status.write(f"會用目的地{plan_destination}、日數、偏好、同行，再按營業時間同距離排。")
+            status.write(f"會先核對未齊嘅地址、時間、評分，再用目的地{plan_destination}、日數、偏好、同行排。")
             try:
+                started = time.perf_counter()
+                enrich_s = 0.0
+                if missing_facts:
+                    status.write("核對緊地址、營業時間、評分。")
+                    enriched = _enrich_places(missing_facts)
+                    _overlay_enriched(selected_items, enriched)
+                    selected_places = trip_core.dedupe_places(
+                        place for item in selected_items for place in (item.get("places") or [])
+                    )
+                    enrich_s = time.perf_counter() - started
+                planned_at = time.perf_counter()
                 itinerary = gemini_client.generate_itinerary(
                     _client(),
                     MODEL,
@@ -537,6 +776,7 @@ if submitted:
                     preferences=request["preferences"],
                     party=request["party"],
                 )
+                finished = time.perf_counter()
             except gemini_client.GeminiError as err:
                 status.update(label="排行程失敗", state="error")
                 st.session_state.notice = ("error", str(err))
@@ -549,6 +789,12 @@ if submitted:
                 st.session_state.usage += 1
                 st.session_state.itinerary = itinerary
                 st.session_state.itinerary_places = selected_places
+                st.session_state.last_plan_timing = {
+                    "enrich_s": round(enrich_s, 3),
+                    "itinerary_s": round(finished - planned_at, 3),
+                    "total_s": round(finished - started, 3),
+                    "source": "plan",
+                }
                 for item in selected_items:
                     if item.get("places"):
                         item["status"] = "已排程"
@@ -608,5 +854,12 @@ if itinerary:
     )
     st.caption("地址、營業時間、評分來自截圖同 AI 有把握先填嘅資料，基本核對唔使離開呢版。Maps 只係想導航或睇街景先開。")
 
+timing = st.session_state.get("last_plan_timing") or {}
+if timing.get("source") == "plan":
+    st.caption(
+        f"今次核對 {timing.get('enrich_s', 0)} 秒，排日程 {timing.get('itinerary_s', 0)} 秒。"
+        "呢個係呢次呼叫嘅秒數，未當收費過關實測。"
+    )
 st.divider()
 st.caption(f"原型版本 | 行程匣 MVP | 今個 session 仲有 {remaining_quota()}/{MAX_ANALYSES} 次")
+_persist_shared_trip()
