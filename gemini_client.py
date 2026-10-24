@@ -19,10 +19,16 @@ import trip_core
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "gemini-3.8-flash"
-# 單次請求上限。截圖分批之後，一批通常幾秒到幾十秒；掛死就唔好等到無限。
-# app.py 啟動時用 getattr 後備 90_000，避免舊模組未有呢個常數就崩潰。
-DEFAULT_TIMEOUT_MS = 90_000
+# 行程匣只認店名。lite 預設思考少，避免 vision+JSON 拖過逾時。
+# 核對地址同排日程仍然用 DEFAULT_MODEL。測試傳入嘅 model 會覆蓋呢個預設。
+DEFAULT_NAMES_MODEL = "gemini-3.5-flash-lite"
+# 單次請求上限（毫秒）。Gemini 3 即使用 low thinking，視覺 JSON 都可以近一分鐘。
+# app.py 啟動時用 getattr 後備 120_000，避免舊模組未有呢個常數就崩潰。
+# Streamlit secret GEMINI_TIMEOUT_MS 如果設咗，會覆蓋呢個預設。
+DEFAULT_TIMEOUT_MS = 120_000
 # 包含第一次。2 = 失敗再試一次（429／5xx／逾時／連線中斷）。
+# 呢個係共用 client 嘅 HTTP 重試，認店名、核對、排日程都用。
+# secret GEMINI_RETRY_ATTEMPTS 仍然生效。認店名嘅 JSON 再解析次數係另外嘅 parse_attempts=1。
 DEFAULT_RETRY_ATTEMPTS = 2
 DEFAULT_CHUNK_SIZE = 3
 DEFAULT_MAX_WORKERS = 2
@@ -276,10 +282,13 @@ def _is_timeout(exc: Exception) -> bool:
 
 
 def _generate_text(client, model: str, contents, schema: types.Schema, temperature: float) -> str:
+    # Gemini 3 預設 thinking 係 medium，視覺 JSON 會超過逾時。
+    # 只用 thinking_level；thinking_budget 喺 Gemini 3 會 400。
     config = types.GenerateContentConfig(
         response_mime_type="application/json",
         response_schema=schema,
         temperature=temperature,
+        thinking_config=types.ThinkingConfig(thinking_level="low"),
     )
     try:
         response = client.models.generate_content(model=model, contents=contents, config=config)
@@ -516,7 +525,7 @@ def analyze_screenshots(
 
 def recognize_names(
     client,
-    model: str,
+    model: str | None,
     images: list[bytes],
     *,
     remarks: str = "",
@@ -525,10 +534,16 @@ def recognize_names(
     party: str = "",
     chunk_size: int = DEFAULT_CHUNK_SIZE,
     max_workers: int = DEFAULT_MAX_WORKERS,
-    parse_attempts: int = 2,
+    parse_attempts: int = 1,
     retry_sleep: float = 0.4,
 ) -> AnalysisResult:
-    """行程匣快路徑：只認店名同地區。地址、營業時間、評分留待排行程前先核對。"""
+    """行程匣快路徑：只認店名同地區。地址、營業時間、評分留待排行程前先核對。
+
+    未傳 model（空字串或 None）就用 DEFAULT_NAMES_MODEL。測試可以傳別嘅 id。
+    parse_attempts 預設 1，避免壞 JSON 再等多一次長請求。
+    HTTP 重試仍然跟 client 嘅 retry_attempts（預設 2，secret GEMINI_RETRY_ATTEMPTS 會覆蓋）。
+    """
+    chosen = (model or "").strip() or DEFAULT_NAMES_MODEL
     trip = {
         "remarks": remarks,
         "destination": destination,
@@ -536,7 +551,7 @@ def recognize_names(
         "party": party,
     }
     return _analyze_images(
-        client, model, images, trip,
+        client, chosen, images, trip,
         names_only=True,
         chunk_size=chunk_size,
         max_workers=max_workers,

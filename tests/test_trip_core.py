@@ -165,6 +165,8 @@ def test_analyze_screenshots_mocked():
     assert kwargs["model"] == "m"
     assert kwargs["config"].response_mime_type == "application/json"
     assert kwargs["config"].response_schema is gemini_client.PLACES_SCHEMA
+    assert kwargs["config"].thinking_config.thinking_level == "LOW"
+    assert kwargs["config"].thinking_config.thinking_budget is None
     parts = kwargs["contents"]
     assert parts[1] == "圖片 #1" and parts[3] == "圖片 #2"
     assert parts[2].inline_data.mime_type == "image/jpeg"
@@ -185,10 +187,32 @@ def test_recognize_names_is_the_fast_path():
     assert result.places[0]["name_zh"] == "一蘭"
     assert result.places[0]["address"] == ""
     kwargs = client.models.generate_content.call_args.kwargs
-    assert kwargs["config"].response_schema is gemini_client.NAMES_SCHEMA
+    assert kwargs["model"] == "m"
+    config = kwargs["config"]
+    assert config.response_schema is gemini_client.NAMES_SCHEMA
+    assert config.thinking_config.thinking_level == "LOW"
+    assert config.thinking_config.thinking_budget is None
     prompt = kwargs["contents"][0]
     assert "只係快認店名" in prompt
     assert "只要圖中 1、4" in prompt
+
+
+def test_recognize_names_defaults_to_lite_model_once():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp("not json")
+    try:
+        gemini_client.recognize_names(client, None, [b"jpeg"], retry_sleep=0)
+        assert False
+    except gemini_client.GeminiError as err:
+        assert "格式" in str(err)
+    assert client.models.generate_content.call_count == 1
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs["model"] == "gemini-3.5-flash-lite"
+    assert kwargs["model"] == gemini_client.DEFAULT_NAMES_MODEL
+    assert gemini_client.DEFAULT_MODEL == "gemini-3.8-flash"
+    assert gemini_client.DEFAULT_TIMEOUT_MS == 120_000
+    assert kwargs["config"].thinking_config.thinking_level == "LOW"
+    assert kwargs["config"].thinking_config.thinking_budget is None
 
 
 def test_analyze_errors_are_friendly():

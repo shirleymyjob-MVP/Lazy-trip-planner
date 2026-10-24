@@ -60,10 +60,12 @@ MODEL = get_secret("GEMINI_MODEL", _DEFAULT_MODEL) or _DEFAULT_MODEL
 # 失敗、SDK 重試、同一輪入面幾張圖唔另計。
 MAX_ANALYSES = get_int_secret("MAX_ANALYSES_PER_SESSION", 10)
 TIMEOUT_MS = _clamp_int(
-    get_int_secret("GEMINI_TIMEOUT_MS", getattr(gemini_client, "DEFAULT_TIMEOUT_MS", 90_000)),
+    get_int_secret("GEMINI_TIMEOUT_MS", getattr(gemini_client, "DEFAULT_TIMEOUT_MS", 120_000)),
     10_000,
     180_000,
 )
+# 認店名唔跟 GEMINI_MODEL。核對同排日程先用 MODEL。
+NAMES_MODEL = getattr(gemini_client, "DEFAULT_NAMES_MODEL", "gemini-3.5-flash-lite")
 RETRY_ATTEMPTS = _clamp_int(
     get_int_secret("GEMINI_RETRY_ATTEMPTS", getattr(gemini_client, "DEFAULT_RETRY_ATTEMPTS", 2)),
     1,
@@ -250,7 +252,7 @@ def _recognize_pending():
             try:
                 raw = gemini_client.recognize_names(
                     _client(),
-                    MODEL,
+                    NAMES_MODEL,
                     images,
                     remarks=remark,
                     destination="日本",

@@ -68,10 +68,10 @@ MVP 只收**截圖**。真實用法係：見到地方就截圖，iPhone 撳「�
 | Key | 必填 | 預設 | 用途 |
 |---|---|---|---|
 | `GEMINI_API_KEY` | ✅ | – | Gemini API key |
-| `GEMINI_MODEL` | | `gemini-3.8-flash` | 用邊個 Gemini 模型 |
+| `GEMINI_MODEL` | | `gemini-3.8-flash` | 核對地址同排日程用嘅模型。認店名固定用 `gemini-3.5-flash-lite`，唔跟呢個 secret |
 | `MAX_ANALYSES_PER_SESSION` | | `10` | 每個 session 最多幾多次**成功** AI 動作 |
-| `GEMINI_TIMEOUT_MS` | | `90000` | 單次 Gemini HTTP 逾時（毫秒） |
-| `GEMINI_RETRY_ATTEMPTS` | | `2` | HTTP 嘗試次數（包含第一次；2 = 逾時／429／5xx 再試一次） |
+| `GEMINI_TIMEOUT_MS` | | `120000` | 單次 Gemini HTTP 逾時（毫秒）。設咗就會覆蓋程式預設 |
+| `GEMINI_RETRY_ATTEMPTS` | | `2` | HTTP 嘗試次數（包含第一次；2 = 逾時／429／5xx 再試一次）。認店名、核對、排日程共用。認店名壞 JSON 唔會再解析第二次 |
 
 ## 本地開發
 ```bash
