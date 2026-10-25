@@ -217,6 +217,10 @@ NAMES_SCHEMA = _S(
                     "name_zh": _S(type=_T.STRING, description="繁體中文名稱或譯名"),
                     "category": _S(type=_T.STRING, enum=list(trip_core.CATEGORIES)),
                     "area": _S(type=_T.STRING, description="地區／城市，例如 今泉, 福岡"),
+                    "address_on_image": _S(
+                        type=_T.STRING,
+                        description="畫面印住嘅地址原句，例如 1-12-8 セシオ大名5階。冇就空字串",
+                    ),
                     "confidence": _S(type=_T.STRING, enum=list(trip_core.CONFIDENCE_LEVELS)),
                     "source_images": _S(type=_T.ARRAY, items=_S(type=_T.INTEGER)),
                     "caption_index": _S(type=_T.INTEGER, description="說明編號，冇就 0"),
@@ -229,7 +233,8 @@ NAMES_SCHEMA = _S(
 )
 
 NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前面有「圖片 #編號」）。
-只係快認店名，唔好搵地址、營業時間或者評分。
+只係快認店名，唔好上網搵地址、營業時間或者評分。
+畫面本身印住嘅地址要原句抄入 address_on_image（例如 1-12-8 セシオ大名5階），唔好改成你記得嘅另一個門牌。冇印住就空字串。
 目的地：{destination}
 用家備註：{remarks}
 
@@ -245,6 +250,7 @@ NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前
 美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 福岡大名的 kchiara／キアラ／奇阿拉／きあら 是美容室，category 用 salon，唔好用 shop。
 - area：地區同城市
+- address_on_image：畫面印住嘅地址原句，包括樓層。冇就空字串
 - confidence：高 / 中 / 低
 - source_images：邊幾張圖
 - caption_index：① 或 1. = 1，冇編號就 0
@@ -276,6 +282,7 @@ ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方�
 - 風格（其他要求入面會寫明）。平衡型：每日最多 4 餐，1 至 2 個景點，餐廳停留約 1 至 1.5 小時，唔好成日冇食，亦唔好全日只去餐廳。網紅打卡型：多打卡、節奏快。Chill 型：少站、停留長。美食優先：以餐廳為主，仍然要有非用餐休息
 - 美容室、美髮、理髮、美甲唔好當成購物。activity 要寫做髮型或美容，唔好寫參觀選物店、購物或逛街
 - kchiara／キアラ／奇阿拉是美容室。標題同 activity 唔好寫購物、選物店、尋寶或購物之旅。步行就寫步行，唔好寫成地鐵
+- 每一日只放該日的地點，唔好把第一日的清單複製到 Day 2、Day 3
 - 其他要求如果話只可以排清單入面的地方，就唔好加新店。如果話可以加入 AI 建議，先可以加清單以外的地方
 - maps_query：原文名 + 地址或地區，方便 Google Maps
 - tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實營業時間"""
