@@ -567,6 +567,48 @@ def test_kchiara_text_enrich_keeps_facts_when_model_rewrites_the_name():
     assert "kchiara" in prompt and "福岡" in prompt and "一定要三項都填" in prompt
 
 
+def test_batch_text_enrich_matches_a_name_with_a_suffix():
+    client = mock.MagicMock()
+    client.models.generate_content.return_value = _Resp(json.dumps({
+        "places": [
+            {
+                "name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction",
+                "area": "福岡", "address": "福岡県太宰府市宰府4-7-1",
+                "opening_hours": "6:00-19:00", "rating": "4.5/5",
+                "confidence": "高", "source_images": [],
+            },
+            {
+                "name": "寶滿宮竈門神社", "name_zh": "寶滿宮竈門神社", "category": "attraction",
+                "area": "福岡", "address": "福岡県太宰府市大字内山883",
+                "opening_hours": "8:30-16:30", "rating": "4.3/5",
+                "confidence": "高", "source_images": [],
+            },
+            {
+                "name": "秋月城跡（福岡）", "name_zh": "", "category": "attraction",
+                "area": "福岡", "address": "福岡県朝倉市秋月野鳥",
+                "opening_hours": "9:00-17:00", "rating": "4.1/5",
+                "confidence": "高", "source_images": [],
+            },
+        ]
+    }, ensure_ascii=False))
+    seeds = [
+        trip_core.seed_place("太宰府天滿宮", area="福岡"),
+        trip_core.seed_place("寶滿宮竈門神社", area="福岡"),
+        trip_core.seed_place("秋月城跡", area="福岡"),
+    ]
+    result = gemini_client.enrich_places(client, "m", seeds, retry_sleep=0)
+    assert client.models.generate_content.call_count == 1
+    assert result.warnings == []
+    cards = trip_core.merge_known_places(seeds, result.places)
+    assert [place["name"] for place in cards] == ["太宰府天滿宮", "寶滿宮竈門神社", "秋月城跡"]
+    assert all(trip_core.place_is_complete(place) for place in cards)
+    assert all("未有" not in "\n".join(trip_core.place_fact_lines(place)) for place in cards)
+    assert cards[2]["address"] == "福岡県朝倉市秋月野鳥"
+    kwargs = client.models.generate_content.call_args.kwargs
+    assert kwargs.get("tools") is None
+    assert "太宰府天滿宮" in kwargs["contents"] and "秋月城跡" in kwargs["contents"]
+
+
 def test_enrich_warns_when_maps_facts_stay_empty():
     client = mock.MagicMock()
     client.models.generate_content.return_value = _Resp(json.dumps({

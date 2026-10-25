@@ -27,6 +27,8 @@ logger = logging.getLogger("lazy_trip_planner")
 st.set_page_config(page_title="懶人行程規劃 (原型)", page_icon="✈️", layout="centered")
 
 MAX_IMAGES_PER_UPLOAD = 10
+# 認完店名之後一次過搵公開資料。多過呢個數就留待下一輪，避免一次 prompt 太長。
+AUTO_ENRICH_CAP = 12
 _PASTE = components.declare_component(
     "inbox_paste",
     path=str(Path(__file__).parent / "components" / "inbox_paste"),
@@ -224,6 +226,7 @@ def _distribute_places(items: list[dict], places: list[dict]) -> None:
         item["places"] = trip_core.dedupe_places(found)
         item["analysis"] = "done"
         _apply_region(item)
+    _queue_fact_lookup(items)
 
 
 def _recognize_pending():
@@ -250,7 +253,7 @@ def _recognize_pending():
     succeeded = False
     warnings: list[str] = []
     with st.status(f"認緊 {len(pending)} 張新截圖嘅店名…", expanded=True) as status:
-        status.write("而家只認店名。地址、營業時間、評分會喺排行程之前先核對。")
+        status.write("認完店名，會再搵公開地址、營業時間、評分。")
         for remark, items in groups:
             images = [item["image"] for item in items]
             try:
@@ -460,6 +463,116 @@ def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
         _apply_region(item)
 
 
+def _place_keys(place: dict) -> set[str]:
+    return {
+        key for key in (
+            trip_core._norm_key(place.get("name", "")),
+            trip_core._norm_key(place.get("name_zh", "")),
+        ) if key
+    }
+
+
+def _queue_fact_lookup(items: list[dict]) -> None:
+    """店名已經出咗。未齊地址／時間／評分嘅，下一輪先一次過搵，唔好阻住個名出現。"""
+    for item in items:
+        if trip_core.places_needing_facts(item.get("places") or []):
+            item["facts"] = "pending"
+        else:
+            item["facts"] = "done"
+
+
+def _items_touching(items: list[dict], keys: set[str]) -> list[dict]:
+    touched = []
+    for item in items:
+        for place in trip_core.places_needing_facts(item.get("places") or []):
+            if _place_keys(place) & keys:
+                touched.append(item)
+                break
+    return touched
+
+
+def _settle_fact_state(items: list[dict], batch_keys: set[str]) -> None:
+    for item in items:
+        waiting = [
+            place for place in trip_core.places_needing_facts(item.get("places") or [])
+            if not (_place_keys(place) & batch_keys)
+        ]
+        item["facts"] = "pending" if waiting else "done"
+
+
+def _note_fact_failure(message: str) -> None:
+    if message == gemini_client.CROWD_RATE_LIMIT_MESSAGE:
+        st.session_state.notice = ("error", message)
+        return
+    bits = [gemini_client.ENRICH_INCOMPLETE_WARNING]
+    if not USE_MAPS:
+        bits.append(gemini_client.MAPS_UNAVAILABLE_WARNING)
+    if message and message not in bits and gemini_client.CROWD_RATE_LIMIT_MESSAGE not in message:
+        bits.append(message)
+    st.session_state.notice = ("warning", " ".join(bits))
+
+
+def _enrich_inbox_facts() -> None:
+    """認完名之後一次過文字核對。唔另計 session 次數；Maps 仍然跟 GEMINI_USE_MAPS。"""
+    pending_items = [
+        item for item in st.session_state.inbox
+        if item.get("facts") == "pending" and item.get("analysis") == "done"
+    ]
+    if not pending_items:
+        return
+    if not API_KEY:
+        for item in pending_items:
+            item["facts"] = "failed"
+        return
+    seeds = trip_core.places_needing_facts(trip_core.dedupe_places(
+        place for item in pending_items for place in (item.get("places") or [])
+    ))
+    batch = seeds[:AUTO_ENRICH_CAP]
+    if not batch:
+        for item in pending_items:
+            item["facts"] = "done"
+        return
+    batch_keys: set[str] = set()
+    for place in batch:
+        batch_keys |= _place_keys(place)
+    targeted = _items_touching(pending_items, batch_keys)
+    if not targeted:
+        for item in pending_items:
+            item["facts"] = "done"
+        return
+    try:
+        with st.status("認緊資料…", expanded=True) as status:
+            status.write("用店名搵公開地址、營業時間、評分。")
+            result = _enrich_result(batch)
+            _overlay_enriched(targeted, result.places)
+            _settle_fact_state(targeted, batch_keys)
+            status.update(label="資料更新咗", state="complete")
+    except gemini_client.GeminiError as err:
+        logger.info("Inbox fact lookup failed: %s", err)
+        for item in targeted:
+            item["facts"] = "failed"
+        _note_fact_failure(str(err))
+        return
+    except Exception:  # noqa: BLE001
+        logger.exception("Inbox fact lookup failed")
+        for item in targeted:
+            item["facts"] = "failed"
+        st.session_state.notice = ("warning", "認資料失敗，請再試一次。")
+        return
+    filled = any(
+        trip_core.place_is_complete(place)
+        for item in targeted
+        for place in (item.get("places") or [])
+        if _place_keys(place) & batch_keys
+    )
+    if result.warnings and not filled:
+        bits = []
+        for warning in result.warnings:
+            if warning and warning not in bits:
+                bits.append(warning)
+        st.session_state.notice = ("warning", " ".join(bits))
+
+
 def _build_sha() -> str:
     """俾 UAT 對住頁尾 build: 確認 Streamlit 載緊邊個 commit。"""
     try:
@@ -489,11 +602,12 @@ def _enrich_places(places: list[dict]) -> list[dict]:
 def _recognize_later() -> None:
     if st.session_state.pop("_skip_recognize_fragment", False):
         return
-    pending = [item for item in st.session_state.inbox if item.get("analysis") == "pending"]
-    if not pending:
-        return
-    _recognize_pending()
-    st.rerun()
+    if any(item.get("analysis") == "pending" for item in st.session_state.inbox):
+        _recognize_pending()
+        st.rerun()
+    if any(item.get("facts") == "pending" for item in st.session_state.inbox):
+        _enrich_inbox_facts()
+        st.rerun()
 
 
 init_state()
@@ -513,8 +627,8 @@ with st.expander("點樣用？", expanded=not st.session_state.inbox):
     st.markdown(
         f"""
 1. **行程匣**：喺 IG 見到地方就截圖，iPhone 撳「複製並刪除」，返嚟呢度貼上。桌面用 Cmd/Ctrl+V，或者撳「從剪貼簿貼上」。相簿可以一次上載多張。備註可寫「只要圖中 1、4」。貼上唔使揀地區。
-2. 貼完先見「認緊」，之後出店名，或者「認唔到」。地區會自動標，一間店可以多過一個區。睇唔準就係未分類，可以之後一撳改。
-3. **開始排行程**係之後先做。撳之前會先見到一個齊地址、營業時間、評分嘅樣本同預計等待。如果揀咗嘅行程匣交集得一個地區，會跟嗰個地區。
+2. 貼完先見「認緊」，之後出店名，或者「認唔到」。認到名會再顯示「認緊資料」，用公開資料填地址、營業時間、評分。地區會自動標，一間店可以多過一個區。睇唔準就係未分類，可以之後一撳改。
+3. **開始排行程**係之後先做。至少要有一個齊地址、營業時間、評分嘅地方，同預計等待。模型未填到先再撳「先核對一個樣本」。如果揀咗嘅行程匣交集得一個地區，會跟嗰個地區。
 
 _原型版：每個 session 最多 {MAX_ANALYSES} 次成功嘅 AI 動作（失敗同自動重試唔計）。截圖只會用嚟即時分析。_
 """
@@ -576,6 +690,8 @@ if st.session_state.inbox and st.button("清空行程匣", key=f"clear_{st.sessi
     st.rerun()
 
 _recognize_pending() if _sync_recognize() or not API_KEY or remaining_quota() <= 0 else None
+if _sync_recognize():
+    _enrich_inbox_facts()
 failed = [item for item in st.session_state.inbox if item.get("analysis") == "failed"]
 if failed and API_KEY and remaining_quota() > 0:
     if st.button("再試一次分析", type="primary", key=f"retry_{st.session_state.batch}"):
@@ -585,6 +701,7 @@ if failed and API_KEY and remaining_quota() > 0:
         st.session_state.notice = None
         if _sync_recognize():
             _recognize_pending()
+            _enrich_inbox_facts()
 _render_notice()
 
 
@@ -638,6 +755,10 @@ def _render_inbox_card(item: dict) -> None:
             elif item.get("analysis") != "pending" and not item.get("places"):
                 st.caption(item.get("warning") or "認唔到")
             elif item.get("places"):
+                if item.get("facts") == "pending":
+                    st.caption("認緊資料…")
+                elif item.get("facts") == "failed" and trip_core.places_needing_facts(item.get("places") or []):
+                    st.caption("未有自動填到地址、營業時間、評分。可以再核對樣本。")
                 if item.get("warning"):
                     st.caption(item["warning"])
                 for place in item["places"]:
@@ -647,7 +768,10 @@ def _render_inbox_card(item: dict) -> None:
                     st.markdown(f"**{title}**")
                     if place.get("name_zh") and place.get("name") and place["name"] != place["name_zh"]:
                         st.caption(place["name"])
-                    st.markdown("\n\n".join(trip_core.place_fact_lines(place)))
+                    lines = trip_core.place_fact_lines(place)
+                    if item.get("facts") == "pending" and not trip_core.place_is_complete(place):
+                        lines = [line.replace("未有", "認緊資料…") for line in lines]
+                    st.markdown("\n\n".join(lines))
 
 
 if not st.session_state.inbox:
@@ -686,7 +810,10 @@ else:
         for item in fresh:
             _render_inbox_card(item)
 if not _sync_recognize():
-    if any(item.get("analysis") == "pending" for item in st.session_state.inbox):
+    if any(
+        item.get("analysis") == "pending" or item.get("facts") == "pending"
+        for item in st.session_state.inbox
+    ):
         st.session_state._skip_recognize_fragment = True
     _recognize_later()
 

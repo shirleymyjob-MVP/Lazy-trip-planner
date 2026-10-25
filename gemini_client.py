@@ -768,22 +768,86 @@ def _place_keys(place: dict) -> set[str]:
     return {k for k in (trip_core._norm_key(place.get("name", "")), trip_core._norm_key(place.get("name_zh", ""))) if k}
 
 
+def _copy_seed_name(seed: dict, extra: dict) -> dict:
+    copied = dict(extra)
+    original_name = (copied.get("name") or "").strip()
+    original_zh = (copied.get("name_zh") or "").strip()
+    if seed.get("name"):
+        copied["name"] = seed["name"]
+    if seed.get("name_zh"):
+        copied["name_zh"] = seed["name_zh"]
+    elif original_name and original_name != (copied.get("name") or ""):
+        copied["name_zh"] = original_zh or original_name
+    return copied
+
+
+def _keys_overlap_loosely(left: set[str], right: set[str]) -> bool:
+    """店名加咗後綴（例如秋月城跡（福岡））仍然算同一間。短過 4 個字唔好估。"""
+    for a in left:
+        for b in right:
+            short, long_ = (a, b) if len(a) <= len(b) else (b, a)
+            if len(short) >= 4 and short in long_:
+                return True
+    return False
+
+
 def _align_single_seed_name(seeds: list[dict], found: list[dict]) -> list[dict]:
     """模型把 kchiara 改寫成 キアラ 時，地址會對唔返原卡。只有一對一先改回原名。"""
     if len(seeds) != 1 or len(found) != 1:
         return found
-    seed, extra = seeds[0], dict(found[0])
+    seed, extra = seeds[0], found[0]
     if _place_keys(seed) & _place_keys(extra):
         return found
-    original_name = (extra.get("name") or "").strip()
-    original_zh = (extra.get("name_zh") or "").strip()
-    if seed.get("name"):
-        extra["name"] = seed["name"]
-    if seed.get("name_zh"):
-        extra["name_zh"] = seed["name_zh"]
-    elif original_name and original_name != (extra.get("name") or ""):
-        extra["name_zh"] = original_zh or original_name
-    return [extra]
+    return [_copy_seed_name(seed, extra)]
+
+
+def _align_unique_names(seeds: list[dict], found: list[dict]) -> list[dict]:
+    """多間店一次過核對時，只喺店名唯一對得上先抄回原名，避免把地址貼錯卡。"""
+    seed_keys = [_place_keys(seed) for seed in seeds]
+    claimed: set[int] = set()
+    passthrough: list[dict] = []
+    pending: list[dict] = []
+    for extra in found:
+        exact = [i for i, keys in enumerate(seed_keys) if _place_keys(extra) & keys]
+        if len(exact) == 1:
+            claimed.add(exact[0])
+            passthrough.append(extra)
+        elif exact:
+            passthrough.append(extra)
+        else:
+            pending.append(extra)
+    claims: list[tuple[int, int]] = []
+    for found_index, extra in enumerate(pending):
+        keys = _place_keys(extra)
+        if not keys:
+            continue
+        hits = [
+            index for index, seed_key in enumerate(seed_keys)
+            if index not in claimed and seed_key and _keys_overlap_loosely(keys, seed_key)
+        ]
+        if len(hits) == 1:
+            claims.append((found_index, hits[0]))
+    seed_hits: dict[int, int] = {}
+    for _found_index, seed_index in claims:
+        seed_hits[seed_index] = seed_hits.get(seed_index, 0) + 1
+    assigned: dict[int, int] = {}
+    for found_index, seed_index in claims:
+        if seed_hits[seed_index] == 1:
+            assigned[found_index] = seed_index
+    aligned: list[dict] = []
+    for found_index, extra in enumerate(pending):
+        seed_index = assigned.get(found_index)
+        if seed_index is None:
+            aligned.append(extra)
+        else:
+            aligned.append(_copy_seed_name(seeds[seed_index], extra))
+    return passthrough + aligned
+
+
+def _align_seed_names(seeds: list[dict], found: list[dict]) -> list[dict]:
+    if len(seeds) == 1 and len(found) == 1:
+        return _align_single_seed_name(seeds, found)
+    return _align_unique_names(seeds, found)
 
 
 def _seeds_still_incomplete(seeds: list[dict], merged: list[dict]) -> bool:
@@ -892,7 +956,7 @@ def enrich_places(
     if not found:
         warnings.append("AI 未有補到資料，已先用你貼上嘅名稱。")
         found = []
-    found = _align_single_seed_name(seeds, found)
+    found = _align_seed_names(seeds, found)
     merged = trip_core.dedupe_places(list(seeds) + found)
     if _seeds_still_incomplete(seeds, merged):
         warnings.append(ENRICH_INCOMPLETE_WARNING)

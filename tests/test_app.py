@@ -335,9 +335,20 @@ def test_inbox_filter_and_optional_region_fix():
             "confidence": "高", "source_images": [1],
         }]
     }, ensure_ascii=False))
+    enriched = trip_core.parse_places_response(json.dumps({
+        "places": [{
+            "name": "渋谷店", "name_zh": "澀谷店", "category": "cafe",
+            "area": "澀谷, 東京", "address": "東京都渋谷區",
+            "opening_hours": "10:00-19:00", "rating": "4.0/5",
+            "confidence": "高", "source_images": [1],
+        }]
+    }, ensure_ascii=False))
     with mock.patch.object(
         gemini_client, "recognize_names",
         return_value=gemini_client.AnalysisResult(tokyo, []),
+    ), mock.patch.object(
+        gemini_client, "enrich_places",
+        return_value=gemini_client.AnalysisResult(enriched, []),
     ):
         retry = [b for b in at.button if b.label == "再試一次分析"][0]
         retry.click().run()
@@ -553,3 +564,170 @@ def test_shared_link_keeps_who_added_the_screenshot():
     page = "\n".join(block.value for block in list(other.markdown) + list(other.caption))
     assert "加入：Ada" in page
     assert token in "\n".join(block.value for block in other.code)
+
+
+def _fukuoka_names():
+    return trip_core.parse_places_response(json.dumps({
+        "places": [
+            {"name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction", "area": "福岡", "confidence": "高", "source_images": [1]},
+            {"name": "寶滿宮竈門神社", "name_zh": "寶滿宮竈門神社", "category": "attraction", "area": "福岡", "confidence": "高", "source_images": [1]},
+            {"name": "秋月城跡", "name_zh": "秋月城跡", "category": "attraction", "area": "福岡", "confidence": "高", "source_images": [1]},
+        ]
+    }, ensure_ascii=False))
+
+
+def _fukuoka_facts():
+    return trip_core.parse_places_response(json.dumps({
+        "places": [
+            {
+                "name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction",
+                "area": "福岡", "address": "福岡県太宰府市宰府4-7-1",
+                "opening_hours": "6:00-19:00", "rating": "4.5/5",
+                "confidence": "高", "source_images": [1],
+            },
+            {
+                "name": "寶滿宮竈門神社", "name_zh": "寶滿宮竈門神社", "category": "attraction",
+                "area": "福岡", "address": "福岡県太宰府市大字内山883",
+                "opening_hours": "8:30-16:30", "rating": "4.3/5",
+                "confidence": "高", "source_images": [1],
+            },
+            {
+                "name": "秋月城跡", "name_zh": "秋月城跡", "category": "attraction",
+                "area": "福岡", "address": "福岡県朝倉市秋月野鳥",
+                "opening_hours": "9:00-17:00", "rating": "4.1/5",
+                "confidence": "高", "source_images": [1],
+            },
+        ]
+    }, ensure_ascii=False))
+
+
+def test_upload_fills_address_hours_and_rating_without_the_sample_button():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    with mock.patch.object(
+        gemini_client, "recognize_names",
+        return_value=gemini_client.AnalysisResult(_fukuoka_names(), []),
+    ), mock.patch.object(
+        gemini_client, "enrich_places",
+        return_value=gemini_client.AnalysisResult(_fukuoka_facts(), []),
+    ) as enrich:
+        at.file_uploader[0].upload("fukuoka.png", _png("red"), "image/png").run()
+    assert not at.exception
+    enrich.assert_called_once()
+    assert enrich.call_args.kwargs.get("use_maps") is False
+    assert enrich.call_args.args[1] == "gemini-3.5-flash-lite"
+    sent = [place["name"] for place in enrich.call_args.args[2]]
+    assert sent == ["太宰府天滿宮", "寶滿宮竈門神社", "秋月城跡"]
+    assert at.session_state["usage"] == 1
+    assert at.session_state["inbox"][0]["facts"] == "done"
+    page = "\n".join(m.value for m in at.markdown)
+    assert "宰府4-7-1" in page
+    assert "大字内山883" in page
+    assert "秋月野鳥" in page
+    assert "6:00-19:00" in page and "8:30-16:30" in page and "9:00-17:00" in page
+    assert "4.5/5" in page and "4.3/5" in page and "4.1/5" in page
+    assert "地址：未有" not in page
+    assert "營業時間：未有" not in page
+    assert "評分：未有" not in page
+    assert "收費前樣本" in page
+    assert not any(b.label == "先核對一個樣本" for b in at.button)
+    assert any(b.label == "✨ 開始排行程" and not b.disabled for b in at.button)
+    with mock.patch.object(gemini_client, "enrich_places", side_effect=AssertionError("enriched again")):
+        at.run()
+    assert not at.exception
+
+
+def test_auto_enrich_keeps_names_and_the_sample_gate_when_facts_stay_empty():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    empty = trip_core.parse_places_response(json.dumps({
+        "places": [{
+            "name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction",
+            "area": "福岡", "address": "", "opening_hours": "", "rating": "",
+            "confidence": "低", "source_images": [1],
+        }]
+    }, ensure_ascii=False))
+    with mock.patch.object(
+        gemini_client, "recognize_names",
+        return_value=gemini_client.AnalysisResult(empty, []),
+    ), mock.patch.object(
+        gemini_client, "enrich_places",
+        return_value=gemini_client.AnalysisResult(empty, [gemini_client.ENRICH_INCOMPLETE_WARNING]),
+    ) as enrich:
+        at.file_uploader[0].upload("shrine.png", _png("blue"), "image/png").run()
+        assert enrich.call_count == 1
+        at.run()
+        assert enrich.call_count == 1
+    assert not at.exception
+    assert at.session_state["usage"] == 1
+    assert at.session_state["inbox"][0]["facts"] == "done"
+    page = "\n".join(m.value for m in at.markdown)
+    assert "太宰府天滿宮" in page
+    assert "未有" in page
+    assert any(gemini_client.ENRICH_INCOMPLETE_WARNING in w.value for w in at.warning)
+    assert any(b.label == "先核對一個樣本" for b in at.button)
+    assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
+
+
+def test_auto_enrich_failure_does_not_spend_another_turn():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    names = trip_core.parse_places_response(json.dumps({
+        "places": [{
+            "name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction",
+            "area": "福岡", "confidence": "高", "source_images": [1],
+        }]
+    }, ensure_ascii=False))
+    with mock.patch.object(
+        gemini_client, "recognize_names",
+        return_value=gemini_client.AnalysisResult(names, []),
+    ), mock.patch.object(
+        gemini_client, "enrich_places",
+        side_effect=gemini_client.GeminiError("AI 服務暫時唔穩定，請過一陣再試。"),
+    ) as enrich:
+        at.file_uploader[0].upload("shrine.png", _png("green"), "image/png").run()
+        assert enrich.call_count == 1
+        at.run()
+        assert enrich.call_count == 1
+    assert not at.exception
+    assert at.session_state["usage"] == 1
+    assert at.session_state["inbox"][0]["facts"] == "failed"
+    page = "\n".join(block.value for block in list(at.markdown) + list(at.caption))
+    assert "太宰府天滿宮" in page
+    assert "可以再核對樣本" in page
+    shown = "\n".join(block.value for block in list(at.warning) + list(at.error))
+    assert "AI 服務暫時唔穩定" in shown
+    assert gemini_client.CROWD_RATE_LIMIT_MESSAGE not in shown
+    assert any(b.label == "先核對一個樣本" for b in at.button)
+    assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
+
+
+def test_pending_facts_say_looking_up_before_the_model_returns(monkeypatch):
+    monkeypatch.setenv("LAZY_TRIP_SYNC_RECOGNIZE", "0")
+    item = _with_region(
+        _inbox_item(
+            {"name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction", "area": "福岡"},
+            item_id="a" * 32,
+            label="截圖 1",
+            city="福岡",
+        ),
+        trip_core.REGION_CONFIDENT,
+    )
+    item["facts"] = "pending"
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["inbox"] = [item]
+    with mock.patch.object(gemini_client, "enrich_places", side_effect=AssertionError("too soon")):
+        at.run()
+    assert not at.exception
+    page = "\n".join(block.value for block in list(at.markdown) + list(at.caption))
+    assert "太宰府天滿宮" in page
+    assert "地址：認緊資料…" in page
+    assert "營業時間：認緊資料…" in page
+    assert "評分：認緊資料…" in page
+    assert "地址：未有" not in page
+    assert at.session_state["usage"] == 0
+    assert any(b.label == "✨ 開始排行程" and b.disabled for b in at.button)
