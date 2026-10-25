@@ -368,6 +368,9 @@ def test_collect_page_has_helper_and_no_clipboard_button():
     assert 'content: "從相簿或相機加入"' in source
     assert "stFileUploaderDropzoneInstructions" in source
     assert 'label_visibility="collapsed"' in source
+    assert "mini-thumb-wrap" in source
+    assert "grid-template-columns: 56px minmax(0, 1fr)" in source
+    assert "max-height: 80px" not in source
 
 
 def test_same_screenshot_publishes_one_favourite():
