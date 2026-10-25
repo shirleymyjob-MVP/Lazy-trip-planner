@@ -192,7 +192,8 @@ PLACES_PROMPT = """你係旅行助手，幫唔想自己搜尋嘅「懶人」整�
 每個地方：
 - name：原文名稱（日本地方盡量保留日文）
 - name_zh：繁體中文名；冇正式譯名就音譯
-- category：restaurant / cafe / dessert / attraction / shop / other
+- category：restaurant / cafe / dessert / attraction / shop / salon / other
+美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 - area：地區同城市。日本例子：「博多, 福岡」「今泉, 福岡」「澀谷, 東京」。見到博多、Hakata、今泉就寫福岡。其他國家就寫實際城市
 - address：畫面有就照抄。畫面冇、但你對呢間店嘅公開地址有把握先填；否則空字串。唔好作門牌
 - opening_hours：畫面有就照抄。否則只係你有把握先填，唔肯定就空字串
@@ -240,7 +241,8 @@ NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前
 每個地方只填：
 - name：原文名稱
 - name_zh：繁體中文名
-- category：restaurant / cafe / dessert / attraction / shop / other
+- category：restaurant / cafe / dessert / attraction / shop / salon / other
+美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 - area：地區同城市
 - confidence：高 / 中 / 低
 - source_images：邊幾張圖
@@ -271,6 +273,7 @@ ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方�
 - place_name 用繁體中文（可附原文），activity 用一句說明停留大約幾耐
 - 每個地點填 transit：由上一個地點過嚟的交通同大約時間（例如「地鐵 約 15 分鐘」）。當日第一個留空字串
 - 風格（其他要求入面會寫明）。平衡型：每日最多 4 餐，1 至 2 個景點，餐廳停留約 1 至 1.5 小時，唔好成日冇食，亦唔好全日只去餐廳。網紅打卡型：多打卡、節奏快。Chill 型：少站、停留長。美食優先：以餐廳為主，仍然要有非用餐休息
+- 美容室、美髮、理髮、美甲唔好當成購物。activity 要寫做髮型或美容，唔好寫參觀選物店、購物或逛街
 - 其他要求如果話只可以排清單入面的地方，就唔好加新店。如果話可以加入 AI 建議，先可以加清單以外的地方
 - maps_query：原文名 + 地址或地區，方便 Google Maps
 - tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實營業時間"""
@@ -284,7 +287,8 @@ ENRICH_PROMPT = """你係旅行助手。用 Google Maps 核對下面每個地方
 每個地方都要用 Google Maps 查。店存在就一定要填到：
 - name 必須沿用輸入嘅名稱，唔好改到對唔返
 - name_zh：繁體中文
-- category：restaurant / cafe / dessert / attraction / shop / other
+- category：restaurant / cafe / dessert / attraction / shop / salon / other
+美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 - area：沿用輸入地區
 - address：Maps 上嘅地址
 - opening_hours：Maps 上嘅營業時間
@@ -310,7 +314,8 @@ ENRICH_TEXT_PROMPT = """你係日本旅行資料編輯。下面每個地方已�
 每個地方：
 - name 必須沿用輸入嘅名稱，一個字都唔好改，否則對唔返
 - name_zh：可以補日文或中文，但唔好取代 name
-- category：restaurant / cafe / dessert / attraction / shop / other
+- category：restaurant / cafe / dessert / attraction / shop / salon / other
+美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 - area：沿用輸入地區
 - address：公開街道地址，包含城市
 - opening_hours：公開營業時間，例如 11:00-22:00

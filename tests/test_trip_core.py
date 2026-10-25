@@ -900,6 +900,50 @@ def test_collection_attribution_and_itinerary_sources():
     assert "平衡型" in note and "4 餐" in note and "唔好加入新店" in note
 
 
+def test_salon_is_not_labelled_as_shopping():
+    place = trip_core.normalize_place({
+        "name": "kchiara",
+        "name_zh": "奇阿拉美容室",
+        "category": "shop",
+        "area": "福岡",
+        "notes": "參觀選物店",
+    })
+    assert place["category"] == "salon"
+    assert trip_core.favourite_category(place) == "美容"
+    assert trip_core.model_category(place) == "salon"
+    activity = trip_core.rewrite_activity("奇阿拉美容室", "參觀選物店，約 1 小時。", "shop")
+    assert "選物" not in activity
+    assert "美容" in activity
+    shop = trip_core.normalize_place({"name": "無印良品", "name_zh": "無印良品", "category": "shop"})
+    assert shop["category"] == "shop"
+    assert trip_core.favourite_category(shop) == "購物"
+    assert "選物" in trip_core.rewrite_activity("無印良品", "參觀選物店。", "shop")
+
+
+def test_near_duplicate_addresses_are_the_same_favourite():
+    first = {
+        "name": "kchiara",
+        "name_zh": "キアラ",
+        "address": "福岡市中央區大名1-10-15",
+        "image_shas": ["same-photo"],
+    }
+    second = {
+        "name": "キアラ",
+        "address": "福岡縣福岡市中央區大名1-10-14",
+        "image_shas": ["same-photo"],
+    }
+    assert trip_core.addresses_near(first["address"], second["address"])
+    assert trip_core.same_favourite(first, second)
+    assert trip_core.same_favourite(
+        {"name": "太宰府天滿宮", "address": "宰府4-7-1"},
+        {"name": "太宰府天滿宮", "address": "宰府4-7-2"},
+    )
+    assert not trip_core.same_favourite(
+        {"name": "一蘭", "address": "福岡市博多區中洲1-1-1", "image_shas": ["same-photo"]},
+        {"name": "太宰府天滿宮", "address": "太宰府市宰府4-7-1", "image_shas": ["same-photo"]},
+    )
+
+
 def test_infer_city_fukuoka_from_caption_address():
     places = [{
         "name": "博多炉端 魚男",
@@ -990,15 +1034,17 @@ def test_decode_clipboard_payload_accepts_image_and_remark():
     assert trip_core.decode_clipboard_payload(None) is None
 
 
-def test_paste_component_offers_clipboard_and_paste_target():
+def test_paste_component_is_drop_zone_without_clipboard_button():
     html = open(
         os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "components", "inbox_paste", "index.html"),
         encoding="utf-8",
     ).read()
-    assert "從剪貼簿貼上" in html
+    assert "將 IG／小紅書／YouTube 截圖拖入或貼上" in html
+    assert "從剪貼簿貼上" not in html
+    assert "貼上截圖" not in html
+    assert "clipboard.read" not in html
     assert "paste" in html
-    assert "clipboard.read" in html
+    assert "drop" in html
     assert "streamlit:setComponentValue" in html
-    assert "只要圖中 1、4" in html
     assert "<select" not in html.lower()
     assert "目的地" not in html
