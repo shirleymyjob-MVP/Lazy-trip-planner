@@ -3,57 +3,61 @@
 <head>
 <meta charset="utf-8" />
 <style>
+  html, body { margin: 0; background: transparent; }
   body {
-    margin: 0;
     font-family: "PingFang TC", "Noto Sans TC", "Source Sans Pro", sans-serif;
     color: #5A5A5A;
   }
   .zone {
     border: 2px dashed #FF9A90;
-    border-radius: 16px;
-    min-height: 148px;
-    padding: 22px 16px;
+    border-radius: 14px;
+    min-height: 72px;
+    max-height: 92px;
+    padding: 8px 12px;
     background: #FFF5F2;
     outline: none;
-    cursor: pointer;
+    cursor: text;
     display: flex;
     flex-direction: column;
     align-items: center;
     justify-content: center;
     text-align: center;
-    gap: 8px;
+    gap: 4px;
+    overflow: hidden;
+    -webkit-user-select: text;
+    user-select: text;
+    touch-action: manipulation;
   }
   .zone:focus, .zone.hot {
     border-color: #FF7A6E;
     box-shadow: 0 0 0 3px rgba(255, 122, 110, 0.25);
   }
-  .illus { width: 72px; height: 52px; }
-  .zone p {
-    margin: 0;
-    font-size: 15px;
-    line-height: 1.45;
-    color: #5A5A5A;
-  }
+  .keep { pointer-events: none; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+  .illus { width: 36px; height: 28px; }
+  .zone p { margin: 0; font-size: 13px; line-height: 1.3; color: #5A5A5A; }
   #status {
-    min-height: 1.1em;
-    margin: 8px 0 0;
-    font-size: 13px;
+    min-height: 0;
+    margin: 4px 0 0;
+    font-size: 12px;
+    line-height: 1.3;
     text-align: center;
     color: #8A8A8A;
   }
 </style>
 </head>
 <body>
-  <div id="zone" class="zone" tabindex="0" role="button" aria-label="將 IG／小紅書／YouTube 截圖拖入或貼上">
-    <svg class="illus" viewBox="0 0 80 56" fill="none" aria-hidden="true">
-      <rect x="12" y="8" width="40" height="40" rx="8" stroke="#FF9A90" stroke-width="2" stroke-dasharray="4 3" fill="#FFF5F2"/>
-      <path d="M28 36l6-8 5 6 4-5 7 7" stroke="#FF7A6E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      <circle cx="24" cy="22" r="3" fill="#FF9A90"/>
-      <path d="M56 20h12M62 14v12" stroke="#FF7A6E" stroke-width="2.5" stroke-linecap="round"/>
-    </svg>
-    <p>將 IG／小紅書／YouTube 截圖拖入或貼上</p>
+  <div id="zone" class="zone" contenteditable="true" tabindex="0" role="textbox" aria-label="將 IG／小紅書／YouTube 截圖拖入或貼上">
+    <div class="keep" contenteditable="false">
+      <svg class="illus" viewBox="0 0 80 56" fill="none" aria-hidden="true">
+        <rect x="12" y="8" width="40" height="40" rx="8" stroke="#FF9A90" stroke-width="2" stroke-dasharray="4 3" fill="#FFF5F2"/>
+        <path d="M28 36l6-8 5 6 4-5 7 7" stroke="#FF7A6E" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="24" cy="22" r="3" fill="#FF9A90"/>
+        <path d="M56 20h12M62 14v12" stroke="#FF7A6E" stroke-width="2.5" stroke-linecap="round"/>
+      </svg>
+      <p>將 IG／小紅書／YouTube 截圖拖入或貼上</p>
+    </div>
   </div>
-  <p id="status" role="status"></p>
+  <p id="status" role="status">手機請點一下這個框，再長按選擇貼上。</p>
   <script>
     const zone = document.getElementById("zone");
     const statusEl = document.getElementById("status");
@@ -67,23 +71,29 @@
 
     function sendHeight() {
       const height = Math.ceil(document.documentElement.scrollHeight);
-      post("streamlit:setFrameHeight", { height: height });
+      post("streamlit:setFrameHeight", { height: Math.max(height, 96) });
+    }
+
+    function imageFileFromList(list) {
+      const files = list ? Array.from(list) : [];
+      for (const file of files) {
+        const type = (file && file.type) || "";
+        if (type.indexOf("image/") === 0) return file;
+      }
+      return null;
     }
 
     function imageFileFromData(data) {
       if (!data) return null;
       const items = data.items ? Array.from(data.items) : [];
       for (const item of items) {
-        if (item.type && item.type.indexOf("image/") === 0 && item.getAsFile) {
+        const type = item.type || "";
+        if (type.indexOf("image/") === 0 && item.getAsFile) {
           const file = item.getAsFile();
           if (file) return file;
         }
       }
-      const files = data.files ? Array.from(data.files) : [];
-      for (const file of files) {
-        if (file.type && file.type.indexOf("image/") === 0) return file;
-      }
-      return null;
+      return imageFileFromList(data.files);
     }
 
     function bytesToBase64(bytes) {
@@ -121,9 +131,17 @@
       }).join("");
     }
 
+    function cleanupPastedNodes() {
+      Array.from(zone.childNodes).forEach(function (node) {
+        if (node.nodeType === 1 && node.classList && node.classList.contains("keep")) return;
+        node.remove();
+      });
+    }
+
     async function ingest(file) {
+      cleanupPastedNodes();
       if (!file) {
-        setStatus("沒有讀到圖片。請把截圖拖進來，或在這個框貼上。");
+        setStatus("沒有讀到圖片。請再長按這個框選擇貼上。");
         sendHeight();
         return;
       }
@@ -142,14 +160,53 @@
       }
     }
 
-    function onPaste(event) {
-      const file = imageFileFromData(event.clipboardData);
-      if (!file) return;
-      event.preventDefault();
-      ingest(file);
+    async function fileFromInsertedImage() {
+      const img = zone.querySelector("img");
+      if (!img || !img.src) return null;
+      const response = await fetch(img.src);
+      const blob = await response.blob();
+      if (!blob || !blob.size) return null;
+      const type = blob.type && blob.type.indexOf("image/") === 0 ? blob.type : "image/png";
+      return new File([blob], "paste", { type: type });
     }
 
-    zone.addEventListener("paste", onPaste);
+    async function onPaste(event) {
+      const data = event.clipboardData;
+      const direct = imageFileFromData(data);
+      if (direct) {
+        event.preventDefault();
+        ingest(direct);
+        return;
+      }
+      // iOS「複製並刪除」有時唔把 file 放進 clipboardData，而係插入 <img>。
+      setTimeout(async function () {
+        try {
+          const file = await fileFromInsertedImage();
+          if (file) ingest(file);
+          else cleanupPastedNodes();
+        } catch (err) {
+          cleanupPastedNodes();
+          setStatus("沒有讀到圖片。請再長按這個框選擇貼上。");
+          sendHeight();
+        }
+      }, 60);
+    }
+
+    zone.addEventListener("paste", function (event) {
+      event.stopPropagation();
+      onPaste(event);
+    });
+    document.addEventListener("paste", function (event) {
+      if (event.target === zone || zone.contains(event.target)) return;
+      onPaste(event);
+    });
+    zone.addEventListener("beforeinput", function (event) {
+      if (event.inputType && event.inputType.indexOf("insert") === 0 && event.inputType !== "insertFromPaste") {
+        event.preventDefault();
+      }
+    });
+    zone.addEventListener("click", function () { zone.focus(); });
+    zone.addEventListener("touchend", function () { zone.focus(); });
     zone.addEventListener("dragover", function (event) {
       event.preventDefault();
       zone.classList.add("hot");
@@ -163,15 +220,6 @@
       ingest(file);
       if (extra > 1) setStatus("一次放入一張。多張請用下面的批量上傳。");
     });
-    try {
-      if (window.parent.__lazyTripPaste) {
-        window.parent.document.removeEventListener("paste", window.parent.__lazyTripPaste, true);
-      }
-      window.parent.__lazyTripPaste = onPaste;
-      window.parent.document.addEventListener("paste", onPaste, true);
-    } catch (err) {
-      /* 跨來源就只靠這個框 */
-    }
 
     window.addEventListener("message", function (event) {
       const data = event.data || {};

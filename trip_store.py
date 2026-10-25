@@ -12,7 +12,7 @@ _TOKEN = re.compile(r"[0-9a-f]{8,32}")
 _ITEM = re.compile(r"[0-9a-f]{8,64}")
 _ITEM_FIELDS = (
     "id", "label", "remark", "status", "analysis", "places", "city", "regions",
-    "region_confidence", "warning", "added_by", "facts", "batch",
+    "region_confidence", "warning", "added_by", "facts", "batch", "added_at",
 )
 
 

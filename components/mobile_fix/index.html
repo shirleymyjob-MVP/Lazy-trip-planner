@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<body>
+<script>
+  function post(type, extra) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, extra || {}), "*");
+  }
+  post("streamlit:componentReady", { apiVersion: 1 });
+  post("streamlit:setFrameHeight", { height: 0 });
+
+  const doc = window.parent.document;
+  if (!doc || doc.documentElement.dataset.lazyZoom === "1") {
+    /* already installed */
+  } else {
+    doc.documentElement.dataset.lazyZoom = "1";
+    function zoomed(img) {
+      let node = img.parentElement;
+      const view = doc.defaultView;
+      while (node && node !== doc.body) {
+        if (view.getComputedStyle(node).position === "fixed") return true;
+        node = node.parentElement;
+      }
+      return false;
+    }
+    function fit(img, on) {
+      if (on) {
+        img.style.setProperty("width", "auto", "important");
+        img.style.setProperty("height", "auto", "important");
+        img.style.setProperty("max-width", "92vw", "important");
+        img.style.setProperty("max-height", "86vh", "important");
+        img.style.setProperty("object-fit", "contain", "important");
+      } else {
+        ["width", "height", "max-width", "max-height", "object-fit"].forEach(function (prop) {
+          img.style.removeProperty(prop);
+        });
+      }
+    }
+    function scan() {
+      doc.querySelectorAll('[data-testid="stImage"] img').forEach(function (img) {
+        fit(img, zoomed(img));
+      });
+    }
+    new MutationObserver(scan).observe(doc.body, {
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "style"],
+    });
+    doc.addEventListener("click", function () { setTimeout(scan, 40); }, true);
+    scan();
+  }
+</script>
+</body>
+</html>

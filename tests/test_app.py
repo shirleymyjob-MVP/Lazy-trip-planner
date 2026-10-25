@@ -227,7 +227,7 @@ def test_collection_card_colors_me_and_friend_then_edits_region():
     assert "#4A90D9" in page and ">我<" in page
     assert "#8A8A8A" in page and "小美" in page
     assert "运河城 Hakata" in page and "太宰府天滿宮" in page
-    _button(at, "✎ 編輯").click().run()
+    _button(at, "✎").click().run()
     region = [pill for pill in at.pills if "地區" in pill.proto.label][0]
     region.set_value(["太宰府", "福岡"]).run()
     _select(at, "類別").set_value("文化體驗").run()
@@ -237,7 +237,7 @@ def test_collection_card_colors_me_and_friend_then_edits_region():
     assert saved["edited"] is True
     assert saved["category"] == "文化體驗"
     assert "福岡" in saved["regions"] and "太宰府" in saved["regions"]
-    _button(at, "✎ 編輯").click().run()
+    _button(at, "✎").click().run()
     remove = [button for button in at.button if button.label == "移除"][0]
     remove.click().run()
     assert not any(fav["id"] == "mine" for fav in at.session_state["favourites"])
@@ -296,6 +296,13 @@ def test_plan_requires_a_start_date_and_labels_collection_versus_ai():
     assert at.session_state["usage"] == 1
     assert at.session_state["screen"] == "E"
     assert not at.download_button
+    from urllib.parse import unquote
+
+    maps = [button for button in at.link_button if button.value == "喺 Google 睇行程"]
+    assert maps, "results page should link to Google Maps"
+    assert maps[0].proto.url.startswith("https://www.google.com/maps/dir/")
+    decoded = unquote(maps[0].proto.url)
+    assert "太宰府天滿宮" in decoded and "大濠公園" in decoded
 
 
 def test_plan_failure_does_not_spend_a_turn():
@@ -896,3 +903,73 @@ def test_cloned_day_does_not_repeat_day_one():
     assert "這一天未有安排" in page
     assert "博多站" not in page
     assert "一蘭" not in page
+
+
+def test_nav_is_small_step_chips_not_a_full_width_button():
+    at = AppTest.from_file(APP, default_timeout=30).run()
+    assert not at.exception
+    nav = [pill for pill in at.pills if pill.label == "步驟"]
+    assert nav, "step chips should be st.pills"
+    assert nav[0].options == ["開場", "收集", "收藏", "排程", "結果"]
+    assert not any(button.label == "開場" for button in at.button)
+    nav[0].set_value("收集").run()
+    assert at.session_state["screen"] == "B"
+    assert "待分析" in _page(at) and "已處理" in _page(at)
+
+
+def test_done_cards_put_the_newest_on_top_and_zoom_opens():
+    image = _png("red")
+
+    def done(item_id, name, stamp):
+        return {
+            "id": item_id,
+            "image": image,
+            "analysis": "done",
+            "facts": "done",
+            "places": [{
+                "name": name,
+                "name_zh": name,
+                "category": "restaurant",
+                "area": "福岡",
+                "address": "福岡市",
+                "opening_hours": "11:00-20:00",
+                "rating": "4.0/5",
+            }],
+            "added_by": "旅人",
+            "remark": "",
+            "batch": False,
+            "added_at": stamp,
+        }
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "B"
+    at.session_state["inbox"] = [
+        done("old", "舊店一蘭", 10),
+        done("new", "新店鐵板燒", 99),
+    ]
+    at.run()
+    assert not at.exception
+    page = _page(at)
+    assert page.index("新店鐵板燒") < page.index("舊店一蘭")
+    assert any(button.label == "⤢" for button in at.button)
+    assert not any(button.label == "✎ 編輯" for button in at.button)
+    _button(at, "⤢").click().run()
+    assert not at.exception
+    assert any(button.label == "關閉" for button in at.button)
+
+
+def test_favourites_keep_unstamped_order_and_pencil_stays_a_button():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "C"
+    at.session_state["favourites"] = [
+        _fav(id="first", name="先加入"),
+        _fav(id="second", name="後加入"),
+    ]
+    at.run()
+    assert not at.exception
+    page = _page(at)
+    assert page.index("先加入") < page.index("後加入")
+    assert any(button.label == "✎" for button in at.button)
+    assert not any("編輯" == button.label for button in at.button)
