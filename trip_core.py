@@ -958,6 +958,39 @@ def garbled_place_name(name: str) -> bool:
     return bool(_GARBLED_SCRIPT_RE.search(name or ""))
 
 
+# IG Reels 標題句。中央大字店名（博多もつ將）有假名，唔好當標題丟掉。
+_LISTICLE_TITLE_RE = re.compile(r"不吃會後悔|不吃会后悔|必吃|必去|攻略|合集|的美食|老闆$|老板$")
+_COUNT_TITLE_RE = re.compile(r"\d+\s*間")
+_KANA_RE = re.compile(r"[ぁ-んァ-ヶ]")
+
+
+def is_listicle_title(name: str) -> bool:
+    """「福岡5間」「不吃會後悔的美食」係系列標題，唔係店名。"""
+    text = _clean_str(name)
+    if not text:
+        return True
+    if _KANA_RE.search(text):
+        return False
+    if _LISTICLE_TITLE_RE.search(text):
+        return True
+    return bool(_COUNT_TITLE_RE.search(text) and len(text) <= 16)
+
+
+def place_is_listicle_title(place: dict) -> bool:
+    labels = [_clean_str(place.get("name")), _clean_str(place.get("name_zh"))]
+    labels = [label for label in labels if label]
+    if not labels:
+        return True
+    return all(is_listicle_title(label) for label in labels)
+
+
+def keep_shop_names(places: Iterable[dict]) -> list[dict]:
+    """有真正店名時丟掉系列標題。全部都係標題就原樣交還，等下一輪再讀大字。"""
+    rows = [dict(place) for place in places or [] if isinstance(place, dict)]
+    shops = [place for place in rows if not place_is_listicle_title(place)]
+    return shops or rows
+
+
 def normalize_place(raw: dict) -> dict | None:
     """將一個模型回傳嘅 place 整理成固定 schema；冇名就回傳 None。"""
     if not isinstance(raw, dict):

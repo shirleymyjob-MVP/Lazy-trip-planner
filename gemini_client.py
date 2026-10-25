@@ -203,7 +203,10 @@ PLACES_PROMPT = """你係旅行助手，幫唔想自己搜尋嘅「懶人」整�
 - source_images：出現喺邊幾張圖（用上面嘅編號）
 - caption_index：截圖說明入面嘅編號。① 或 1. 對應 1，② 對應 2。例如「①鉄板焼 日和」係 1，「④ GRASS FED／GELATERIA SAKURA」係 4。冇編號就填 0
 同一個地方只列一次，source_images 填晒所有編號。
-完全認唔到就回傳空 list。"""
+IG Reels、限動、YouTube、小紅書：畫面中央或上方嘅大字、白字、描邊字就係店名。食物特寫、夜景、人像都要抽出，唔好當風景或模糊。
+系列標題（例如「福岡5間」「不吃會後悔的美食」「超會烤牛腸老闆」）唔係店名。店名照抄畫面中央最大嘅店舖原文，包括「將」。
+例子：中央白字「博多もつ將」就要輸出 name「博多もつ將」，category restaurant，area「博多, 福岡」。
+完全冇店名、地名先至回傳空 list。"""
 
 NAMES_SCHEMA = _S(
     type=_T.OBJECT,
@@ -266,7 +269,21 @@ NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前
 - confidence：高 / 中 / 低
 - source_images：邊幾張圖
 - caption_index：① 或 1. = 1，冇編號就 0
-完全認唔到就回傳空 list。"""
+IG Reels、限動、YouTube、小紅書：畫面中央或上方嘅大字、白字、描邊字就係店名。食物特寫都要抽出，唔好當風景或模糊而回傳空 list。
+系列標題（「福岡5間」「不吃會後悔的美食」「超會烤牛腸老闆」）唔係店名。店名照抄中央最大嘅店舖原文。
+例子：中央白字「博多もつ將」→ name「博多もつ將」，category restaurant，area「博多, 福岡」。
+完全冇店名、地名先至回傳空 list。"""
+
+OVERLAY_NAMES_PROMPT = """你係讀圖員。以下係 {n} 張旅遊截圖（每張前面有「圖片 #編號」）。
+上一輪冇抽出店名。呢次只讀畫面上面嘅大字。
+IG Reels／限動／YouTube／小紅書中間或上方嘅白字、描邊大字就係店名。背景係食物特寫都唔好當風景或模糊。
+系列標題唔好輸出：例如「福岡5間」「不吃會後悔的美食」「超會烤牛腸老闆」。
+店名照抄，一個字都唔好改。中央白字如果係「博多もつ將」，name 必須係「博多もつ將」，category 用 restaurant，area 用「博多, 福岡」。
+目的地：{destination}
+用家備註：{remarks}
+如果備註要求只留某幾個編號，只輸出該編號。
+每個地方填 name、name_zh、category、area、address_on_image、hours_on_image、rating_on_image、confidence、source_images、caption_index。
+畫面真係完全冇店名先至回傳空 list。"""
 
 ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方排成 {days} 日行程。
 目的地：{destination}
@@ -562,7 +579,8 @@ def _places_prompt(n: int, trip: dict) -> str:
 
 
 def _names_prompt(n: int, trip: dict) -> str:
-    return NAMES_PROMPT.format(
+    template = OVERLAY_NAMES_PROMPT if trip.get("overlay") else NAMES_PROMPT
+    return template.format(
         n=n,
         destination=(trip.get("destination") or "").strip() or "日本",
         remarks=(trip.get("remarks") or "").strip() or "（冇）",
@@ -737,14 +755,29 @@ def recognize_names(
         "preferences": preferences,
         "party": party,
     }
-    return _analyze_images(
-        client, chosen, images, trip,
+    kwargs = dict(
         names_only=True,
         chunk_size=chunk_size,
         max_workers=max_workers,
         parse_attempts=parse_attempts,
         retry_sleep=retry_sleep,
     )
+    result = _analyze_images(client, chosen, images, trip, **kwargs)
+    if not images or any(not trip_core.place_is_listicle_title(place) for place in result.places):
+        result.places = trip_core.keep_shop_names(result.places)
+        return result
+    # 食物特寫加中央大字（博多もつ將）第一輪經常交空 list。再讀一次大字，唔好當風景。
+    overlay_trip = dict(trip)
+    overlay_trip["overlay"] = True
+    try:
+        overlay = _analyze_images(client, chosen, images, overlay_trip, **kwargs)
+    except GeminiError:
+        logger.info("Overlay name pass failed; keeping the first result")
+        return result
+    if any(not trip_core.place_is_listicle_title(place) for place in overlay.places):
+        overlay.places = trip_core.keep_shop_names(overlay.places)
+        return overlay
+    return result
 
 
 def _is_unstable(err: BaseException) -> bool:

@@ -204,6 +204,56 @@ def test_recognize_names_is_the_fast_path():
     prompt = kwargs["contents"][0]
     assert "只係快認店名" in prompt
     assert "只要圖中 1、4" in prompt
+    assert "博多もつ將" in prompt
+    assert client.models.generate_content.call_count == 1
+
+
+def test_center_overlay_shop_name_survives_an_empty_first_pass():
+    """食物特寫加中央大字：第一輪交空 list 或系列標題時，再讀一次大字。"""
+    fixture_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "fixtures", "hakata_motsu_overlay.json",
+    )
+    with open(fixture_path, encoding="utf-8") as handle:
+        fixture = json.load(handle)
+    for line in fixture["visible_text"]:
+        if line == fixture["expected_name"]:
+            assert not trip_core.is_listicle_title(line)
+        else:
+            assert trip_core.is_listicle_title(line)
+    assert trip_core.keep_shop_names([
+        {"name": "福岡5間", "name_zh": "福岡5間"},
+        {"name": fixture["expected_name"], "name_zh": fixture["expected_name"]},
+    ])[0]["name"] == fixture["expected_name"]
+
+    client = mock.MagicMock()
+    client.models.generate_content.side_effect = [
+        _Resp(json.dumps({"places": []}, ensure_ascii=False)),
+        _Resp(json.dumps({"places": [{
+            "name": "福岡5間",
+            "name_zh": "福岡5間",
+            "category": "other",
+            "area": "福岡",
+            "confidence": "低",
+            "source_images": [1],
+            "caption_index": 0,
+        }, {
+            "name": fixture["expected_name"],
+            "name_zh": fixture["expected_name"],
+            "category": fixture["expected_category"],
+            "area": fixture["expected_area"],
+            "confidence": "高",
+            "source_images": [1],
+            "caption_index": 0,
+        }]}, ensure_ascii=False)),
+    ]
+    result = gemini_client.recognize_names(client, "m", [b"jpeg"], retry_sleep=0)
+    assert [place["name"] for place in result.places] == [fixture["expected_name"]]
+    assert result.places[0]["area"] == fixture["expected_area"]
+    assert client.models.generate_content.call_count == 2
+    overlay_prompt = client.models.generate_content.call_args_list[1].kwargs["contents"][0]
+    assert "博多もつ將" in overlay_prompt
+    assert "上一輪冇抽出店名" in overlay_prompt
+    assert "風景" in overlay_prompt
 
 
 def test_recognize_names_defaults_to_lite_model_once():
