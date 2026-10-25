@@ -12,7 +12,7 @@ _TOKEN = re.compile(r"[0-9a-f]{8,32}")
 _ITEM = re.compile(r"[0-9a-f]{8,64}")
 _ITEM_FIELDS = (
     "id", "label", "remark", "status", "analysis", "places", "city", "regions",
-    "region_confidence", "warning", "added_by",
+    "region_confidence", "warning", "added_by", "facts", "batch",
 )
 
 
@@ -72,6 +72,11 @@ def digest(snapshot: dict) -> str:
         "destination_other": snapshot.get("destination_other") or "",
         "pref_other": snapshot.get("pref_other") or "",
         "party_other": snapshot.get("party_other") or "",
+        "favourites": snapshot.get("favourites") or [],
+        "removed_fav_ids": sorted(snapshot.get("removed_fav_ids") or []),
+        "trip_style": snapshot.get("trip_style") or "",
+        "allow_ai": bool(snapshot.get("allow_ai")),
+        "day_count": snapshot.get("day_count") or 3,
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -121,6 +126,11 @@ def save_trip(snapshot: dict) -> float:
         "destination_other": snapshot.get("destination_other") or "",
         "pref_other": snapshot.get("pref_other") or "",
         "party_other": snapshot.get("party_other") or "",
+        "favourites": snapshot.get("favourites") or [],
+        "removed_fav_ids": sorted(snapshot.get("removed_fav_ids") or []),
+        "trip_style": snapshot.get("trip_style") or "",
+        "allow_ai": bool(snapshot.get("allow_ai")),
+        "day_count": snapshot.get("day_count") or 3,
     }
     raw = json.dumps(payload, ensure_ascii=False, indent=1)
     target = folder / "trip.json"

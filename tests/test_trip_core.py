@@ -351,11 +351,11 @@ def test_attach_place_facts_onto_itinerary():
     assert "評分：4.2/5" in md
     assert trip_core.CAPTURE_TO_INBOX_TAPS == 1
     assert trip_core.PLAN_FROM_INBOX_TAPS == 1
-    assert "行程匣" in trip_core.HAPPY_PATH_CAPTION
-    assert "開始排行程" in trip_core.HAPPY_PATH_CAPTION
-    assert "未分類" in trip_core.HAPPY_PATH_CAPTION
-    assert "認緊" in trip_core.HAPPY_PATH_CAPTION
-    assert "認唔到" in trip_core.HAPPY_PATH_CAPTION
+    assert trip_core.HAPPY_PATH_CAPTION == trip_core.HERO_LINE
+    assert trip_core.OPENING_STEPS[0] == "收集想去的地方"
+    assert trip_core.OPENING_STEPS[2] == "一鍵排行程"
+    assert "邀請朋友" in trip_core.OPENING_STEPS[3]
+    assert trip_core.PAYWALL_NOTE == "收費：待定"
     assert "貼店名" not in trip_core.HAPPY_PATH_CAPTION
 
 
@@ -857,6 +857,47 @@ def test_itinerary_prompt_uses_preferences_party_and_hours():
     assert "出發日期：2026-11-01" in prompt
     assert "opening_hours" in prompt
     assert "距離" in prompt
+
+
+def test_collection_attribution_and_itinerary_sources():
+    assert trip_core.collect_status({"analysis": "idle"}) == "尚未分析"
+    assert trip_core.collect_status({"analysis": "pending"}) == "分析中…"
+    assert trip_core.collect_status({"analysis": "failed"}) == "無法辨識"
+    assert trip_core.collect_status({
+        "analysis": "done",
+        "facts": "pending",
+        "places": [{"name": "太宰府天滿宮"}],
+    }) == "資料核實中…"
+    assert trip_core.collect_status({
+        "analysis": "done",
+        "facts": "done",
+        "places": [{"name": "太宰府天滿宮"}],
+    }) == "已完成"
+    me_html = trip_core.attribution_html("旅人", "旅人")
+    friend_html = trip_core.attribution_html("小美", "旅人")
+    assert "who-self" in me_html and "#4A90D9" in me_html and ">我<" in me_html
+    assert "who-friend" in friend_html and "#8A8A8A" in friend_html and ">小美<" in friend_html
+    favs = [{
+        "name": "太宰府天滿宮",
+        "name_original": "太宰府天滿宮",
+        "added_by": "小美",
+        "opening_hours": "06:00-19:00",
+        "rating": "4.5/5",
+    }]
+    shown = trip_core.present_itinerary({
+        "title": "福岡3日遊",
+        "days": [{"day": 1, "items": [
+            {"time": "09:00", "place_name": "太宰府天滿宮", "activity": "參拜", "transit": ""},
+            {"time": "12:00", "place_name": "大濠公園", "activity": "散步", "transit": "電車 約 25 分鐘"},
+        ]}],
+    }, favs, allow_ai=False)
+    own, extra = shown["days"][0]["items"]
+    assert own["ai"] is False and own["hidden"] is False and own["added_by"] == "小美"
+    assert own["opening_hours"] == "06:00-19:00" and own["rating"] == "4.5/5"
+    assert extra["ai"] is True and extra["hidden"] is True
+    assert extra["opening_hours"] == trip_core.UNVERIFIED
+    note = trip_core.style_planning_note("平衡型", allow_ai=False)
+    assert "平衡型" in note and "4 餐" in note and "唔好加入新店" in note
 
 
 def test_infer_city_fukuoka_from_caption_address():
