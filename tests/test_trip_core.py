@@ -1160,8 +1160,10 @@ def test_copy_link_component_uses_in_page_fallback():
     assert "execCommand" in html
     assert "writeText" in html
     assert "width: 100%" in html
-    assert "#FFF5F2" in html
+    assert "#FFE3DE" in html
     assert "flex-direction: row" in html
+    assert "flex-wrap: nowrap" in html
+    assert "white-space: nowrap" in html
     assert "已複製" in html
     assert "請長按上面的連結再複製" in html
     assert "font-size: 16px" in html

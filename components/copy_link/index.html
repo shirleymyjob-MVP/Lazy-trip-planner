@@ -16,19 +16,26 @@
   }
   .row.invite {
     flex-direction: row;
+    flex-wrap: nowrap;
     align-items: center;
     gap: 8px;
-    background: #FFF5F2;
-    border-radius: 12px;
-    padding: 8px 10px;
+    background: #FFE3DE;
+    border: 1px solid #FFD0C8;
+    border-radius: 16px;
+    padding: 6px 6px 6px 14px;
+    overflow: hidden;
   }
   .invite-copy {
     flex: 1 1 auto;
     min-width: 0;
     margin: 0;
-    font-size: 13px;
-    line-height: 1.35;
-    color: #5A5A5A;
+    font-size: 15px;
+    font-weight: 700;
+    line-height: 1.3;
+    color: #E85D52;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
   input {
     width: 100%;
@@ -41,14 +48,34 @@
     color: #2C2C2C;
     background: #FFFFFF;
   }
-  .row.invite input.offscreen {
+  /* 邀請列入面嘅連結唔佔位，避免「已複製」被擠出粉紅 bar。 */
+  .row.invite input {
     position: absolute;
     left: 0;
     top: 0;
-    width: 1px;
+    width: 100%;
     height: 1px;
+    margin: 0;
     padding: 0;
+    border: 0;
     opacity: 0;
+    pointer-events: none;
+  }
+  .row.invite.show-link {
+    flex-wrap: wrap;
+  }
+  .row.invite.show-link input {
+    position: static;
+    z-index: auto;
+    opacity: 1;
+    pointer-events: auto;
+    width: 100%;
+    height: auto;
+    flex: 1 0 100%;
+    order: 4;
+    padding: 8px 10px;
+    border: 1px solid #F0E8E6;
+    font-size: 16px;
   }
   button {
     width: 100%;
@@ -62,9 +89,18 @@
     font-size: 14px;
     white-space: nowrap;
   }
+  .row input { order: 1; }
+  .row button { order: 2; }
+  .row #status { order: 3; }
+  .row.invite .invite-copy { order: 1; }
+  .row.invite #status { order: 2; }
   .row.invite button {
+    order: 3;
     width: auto;
     flex: 0 0 auto;
+    margin-left: auto;
+    border-radius: 12px;
+    padding: 8px 14px;
   }
   #status {
     margin: 0;
@@ -73,15 +109,33 @@
     text-align: center;
     color: #5A5A5A;
   }
-  .row.invite #status:empty { display: none; }
+  #status:empty { display: none; }
+  .row.invite #status {
+    flex: 0 0 auto;
+    font-size: 13px;
+    font-weight: 700;
+    line-height: 1.2;
+    color: #E85D52;
+    text-align: right;
+    white-space: nowrap;
+  }
+  .row.invite #status:not(:empty) { margin-left: auto; }
+  .row.invite #status:not(:empty) + button { margin-left: 8px; }
+  .row.invite.show-link #status {
+    flex: 1 0 100%;
+    order: 5;
+    margin-left: 0;
+    text-align: left;
+    white-space: normal;
+  }
 </style>
 </head>
 <body>
   <div class="row" id="row">
     <p class="invite-copy" id="invite" hidden></p>
     <input id="url" readonly aria-label="分享連結" />
-    <button id="copy" type="button">複製連結</button>
     <p id="status" role="status"></p>
+    <button id="copy" type="button">複製連結</button>
   </div>
   <script>
     const row = document.getElementById("row");
@@ -115,7 +169,7 @@
     }
 
     function fallbackCopy(text) {
-      input.classList.remove("offscreen");
+      if (!inviteLabel) input.classList.remove("offscreen");
       input.focus();
       input.select();
       input.setSelectionRange(0, text.length);
@@ -125,7 +179,7 @@
       } catch (err) {
         ok = false;
       }
-      if (ok && inviteLabel) input.classList.add("offscreen");
+      if (inviteLabel) input.classList.add("offscreen");
       return ok;
     }
 
@@ -141,9 +195,13 @@
 
     button.addEventListener("click", function () {
       copyText(current).then(function (ok) {
-        if (ok) setStatus("已複製");
-        else {
+        if (ok) {
+          row.classList.remove("show-link");
+          if (inviteLabel) input.classList.add("offscreen");
+          setStatus("已複製");
+        } else {
           input.classList.remove("offscreen");
+          if (inviteLabel) row.classList.add("show-link");
           setStatus("請長按上面的連結再複製");
         }
       });
