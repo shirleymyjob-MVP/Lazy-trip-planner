@@ -445,14 +445,41 @@ st.markdown(
         margin-top: 0 !important;
         margin-bottom: 0 !important;
       }
+      [data-testid="stFileUploader"] [data-testid="stWidgetLabel"] {
+        display: none !important;
+      }
       [data-testid="stFileUploader"] section {
         border: 1.5px solid #FF7A6E !important;
         background: #FFF5F2 !important;
         border-radius: 12px !important;
-        padding: 0.35rem 0.7rem !important;
+        padding: 0.15rem 0.85rem !important;
         min-height: 0 !important;
       }
-      [data-testid="stFileUploader"] button {
+      [data-testid="stFileUploaderDropzoneInstructions"],
+      [data-testid="stFileUploader"] small {
+        display: none !important;
+      }
+      [data-testid="stFileUploaderDropzone"] button {
+        background: transparent !important;
+        border: none !important;
+        box-shadow: none !important;
+        color: transparent !important;
+        font-size: 0 !important;
+        line-height: 0 !important;
+        min-height: 0 !important;
+        height: auto !important;
+        width: 100% !important;
+        padding: 0.55rem 0 !important;
+      }
+      [data-testid="stFileUploaderDropzone"] button * {
+        display: none !important;
+      }
+      [data-testid="stFileUploaderDropzone"] button::after {
+        content: "從相簿或相機加入";
+        display: block;
+        font-size: 15px !important;
+        font-weight: 700;
+        line-height: 1.4;
         color: #E85D52;
       }
     </style>
@@ -1570,7 +1597,7 @@ def _render_copy_link(key: str, *, label: str = "") -> None:
 def _render_invite() -> None:
     _render_copy_link(
         "copy_invite_link",
-        label="朋友打開後可加入同一收藏清單，一起貼上截圖並修改。",
+        label="邀請朋友一起收集",
     )
 
 
@@ -1728,6 +1755,7 @@ def _ingest_collect_inputs() -> None:
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
         help="iPhone 最穩。IG 選「複製並刪除」之後，點這裡從相簿或相機揀圖。可以一次選多張。",
+        label_visibility="collapsed",
         key=f"uploader_{st.session_state.batch}",
     )
     uploaded = list(uploaded or [])

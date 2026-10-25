@@ -362,6 +362,12 @@ def test_collect_page_has_helper_and_no_clipboard_button():
     assert "貼上截圖" not in [button.label for button in at.button]
     assert at.file_uploader[0].label == "從相簿或相機加入"
     assert "相簿或相機" in (at.file_uploader[0].help or "")
+    source = open(APP, encoding="utf-8").read()
+    assert 'label="邀請朋友一起收集"' in source
+    assert "朋友打開後可加入同一收藏清單" not in source
+    assert 'content: "從相簿或相機加入"' in source
+    assert "stFileUploaderDropzoneInstructions" in source
+    assert 'label_visibility="collapsed"' in source
 
 
 def test_same_screenshot_publishes_one_favourite():
