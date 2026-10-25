@@ -12,6 +12,7 @@ import os
 import re
 import subprocess
 import time
+import unicodedata
 import uuid
 from pathlib import Path
 
@@ -701,6 +702,13 @@ def _remember_remark(item_id: str) -> None:
 def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
     for item in items:
         item["places"] = trip_core.merge_known_places(item.get("places") or [], enriched)
+        visible = getattr(trip_core, "apply_visible_address", None)
+        if callable(visible):
+            for place in item.get("places") or []:
+                try:
+                    visible(place)
+                except Exception:
+                    logger.exception("apply_visible_address failed")
         _apply_region(item)
 
 
@@ -832,11 +840,11 @@ def _recognize_later() -> None:
     if any(item.get("analysis") == "pending" for item in st.session_state.inbox):
         _recognize_pending()
         _publish_favourites()
-        st.rerun()
+        st.rerun(scope="app")
     if any(item.get("facts") == "pending" for item in st.session_state.inbox):
         _enrich_inbox_facts()
         _publish_favourites()
-        st.rerun()
+        st.rerun(scope="app")
 
 
 def _ensure_fav_id(place: dict) -> str:
@@ -848,7 +856,7 @@ def _ensure_fav_id(place: dict) -> str:
 def _favourite_record(place: dict, item: dict) -> dict:
     name = (place.get("name_zh") or place.get("name") or "").strip()
     original = (place.get("name") or name).strip()
-    return {
+    record = {
         "id": _ensure_fav_id(place),
         "source_item": item.get("id") or "",
         "name": name or original,
@@ -862,7 +870,13 @@ def _favourite_record(place: dict, item: dict) -> dict:
         "rating": place.get("rating") or "",
         "added_by": (item.get("added_by") or "").strip() or "旅人",
         "edited": False,
+        "address_on_image": (place.get("address_on_image") or "").strip(),
     }
+    if _kchiara_family(place) or _kchiara_family(record):
+        record["category"] = "美容"
+        record["model_category"] = "salon"
+    _prefer_printed_address(record, place.get("notes") or "", place.get("address") or "")
+    return record
 
 
 def _image_sha(item: dict) -> str:
@@ -870,6 +884,126 @@ def _image_sha(item: dict) -> str:
     if not data:
         return ""
     return hashlib.sha256(data).hexdigest()[:16]
+
+
+_KCHIARA_RE = re.compile(r"kchiara|キアラ|きあら|奇阿拉|奇アラ", re.IGNORECASE)
+_SHOP_COPY_RE = re.compile(r"選物|購物|逛街|血拼|尋寶|特色商品|店舖|店铺")
+_GARBLED_RE = re.compile(r"[\u0E00-\u0E7F\u0600-\u06FF\u0590-\u05FF]")
+_PRINTED_ADDR_RE = re.compile(
+    r"\d{1,4}(?:[-－]\d{1,4}){1,3}\s*[0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]{0,24}(?:階|ビル|セシオ|大廈|大厦)"
+)
+
+
+def _kchiara_family(record: dict | None) -> bool:
+    """店名判斷放喺 app.py。舊 trip_core 唔識 kchiara，唔好再靠佢先至肯標美容。"""
+    if not isinstance(record, dict):
+        return False
+    blob = " ".join(
+        str(record.get(key) or "")
+        for key in ("name", "name_zh", "name_original", "notes", "place_name")
+    )
+    return bool(_KCHIARA_RE.search(blob))
+
+
+def _norm_loose(value: str) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).lower()
+    return re.sub(r"[\s\-_·・'\"’`.,，。()（）\[\]【】「」]", "", text)
+
+
+def _primary_name_key(record: dict) -> str:
+    """只看畫面上的名字。name_zh 留著舊值時，不能把兩間不同的店併成一張。"""
+    return _norm_loose(record.get("name") or record.get("name_zh") or record.get("name_original") or "")
+
+
+def _fingerprints(record: dict) -> set[str]:
+    raw: list[str] = []
+    for key in ("image_shas", "image_sha"):
+        value = record.get(key)
+        if isinstance(value, str):
+            raw.append(value)
+        elif isinstance(value, (list, tuple)):
+            raw.extend(str(item) for item in value if item)
+    return {item[:16] for item in raw if item}
+
+
+def _inline_addresses_near(left: str, right: str) -> bool:
+    fn = getattr(trip_core, "addresses_near", None)
+    if callable(fn):
+        try:
+            if fn(left or "", right or ""):
+                return True
+        except Exception:
+            logger.exception("addresses_near failed")
+
+    def parts(address: str) -> tuple[str, list[int]]:
+        text = unicodedata.normalize("NFKC", address or "").replace("縣", "県").replace("區", "区")
+        text = re.sub(r"[\s　]", "", text)
+        nums = [int(n) for n in re.findall(r"\d+", text)]
+        stem = re.sub(r"[\d\-－ー−‐]+", "", text)
+        return stem, nums
+
+    stem_a, nums_a = parts(left)
+    stem_b, nums_b = parts(right)
+    if not stem_a or not stem_b:
+        return False
+    same_street = stem_a == stem_b or stem_a.endswith(stem_b) or stem_b.endswith(stem_a)
+    if not same_street:
+        return False
+    if not nums_a or not nums_b:
+        return True
+    if len(nums_a) != len(nums_b) or nums_a[:-1] != nums_b[:-1]:
+        return False
+    return abs(nums_a[-1] - nums_b[-1]) <= 1
+
+
+def _local_same_favourite(left: dict, right: dict) -> bool:
+    if _kchiara_family(left) and _kchiara_family(right):
+        return True
+    key_a, key_b = _primary_name_key(left), _primary_name_key(right)
+    if key_a and key_b:
+        if key_a == key_b:
+            return True
+        short, long = (key_a, key_b) if len(key_a) <= len(key_b) else (key_b, key_a)
+        if len(short) >= 4 and short in long:
+            return True
+    shared = _fingerprints(left) & _fingerprints(right)
+    if shared and _inline_addresses_near(left.get("address") or "", right.get("address") or ""):
+        return True
+    return bool(shared and left.get("sole_image") and right.get("sole_image"))
+
+
+def _prefer_printed_address(record: dict, *extra: str) -> None:
+    """畫面印住嘅樓層地址（例如 1-12-8 セシオ大名5階）蓋過估出嚟的鄰近門牌。"""
+    if not isinstance(record, dict):
+        return
+    visible = str(record.get("address_on_image") or "").strip()
+    if not visible:
+        for text in (record.get("notes"), record.get("address"), *extra):
+            match = _PRINTED_ADDR_RE.search(str(text or ""))
+            if match:
+                visible = match.group(0).strip()
+                break
+    if not visible:
+        return
+    record["address_on_image"] = visible
+    if _address_rank(visible) > _address_rank(str(record.get("address") or "")):
+        record["address"] = visible
+
+
+def _address_rank(address: str) -> tuple[int, int, int]:
+    fn = getattr(trip_core, "address_specificity", None)
+    if callable(fn):
+        try:
+            rank = tuple(fn(address))
+            building = int(rank[0]) if len(rank) > 0 else 0
+            digits = int(rank[1]) if len(rank) > 1 else 0
+            length = int(rank[2]) if len(rank) > 2 else 0
+            return (building, digits, length)
+        except Exception:
+            logger.exception("address_specificity failed")
+    text = address or ""
+    building = 1 if re.search(r"階|ビル|セシオ|大廈|大厦", text) else 0
+    return (building, len(re.findall(r"\d+", text)), len(text.strip()) if building else 0)
 
 
 def _address_digits(address: str) -> int:
@@ -888,8 +1022,11 @@ def _merge_fav(prev: dict, fresh: dict) -> dict:
         ):
             merged["category"] = fresh.get("category") or "美容"
             merged["model_category"] = fresh.get("model_category") or "salon"
+        fresh_visible = (fresh.get("address_on_image") or "").strip()
+        if fresh_visible and _address_rank(fresh_visible) >= _address_rank(str(merged.get("address_on_image") or "")):
+            merged["address_on_image"] = fresh_visible
         fresh_address = (fresh.get("address") or "").strip()
-        if fresh_address and _address_digits(fresh_address) > _address_digits(str(merged.get("address") or "")):
+        if fresh_address and _address_rank(fresh_address) > _address_rank(str(merged.get("address") or "")):
             merged["address"] = fresh_address
     for field in ("opening_hours", "rating"):
         if not (str(merged.get(field) or "")).strip() and (str(fresh.get(field) or "")).strip():
@@ -910,18 +1047,22 @@ def _merge_fav(prev: dict, fresh: dict) -> dict:
 
 
 def _retag_salon(fav: dict) -> dict:
-    """未手動改過的 kchiara／美容室，不要一直停在購物。"""
-    if not isinstance(fav, dict) or fav.get("edited"):
-        return fav
-    if not _call_trip_core("looks_like_salon", fav, default=False):
+    """未手動改過的 kchiara／美容室，不要一直停在購物。舊 trip_core 唔識呢個名都要改。"""
+    if not isinstance(fav, dict):
         return fav
     updated = dict(fav)
-    updated["category"] = "美容"
-    updated["model_category"] = "salon"
+    if not fav.get("edited"):
+        salon = _kchiara_family(fav) or bool(_call_trip_core("looks_like_salon", fav, default=False))
+        if salon:
+            updated["category"] = "美容"
+            updated["model_category"] = "salon"
+    _prefer_printed_address(updated)
     return updated
 
 
 def _same_favourite(left: dict, right: dict) -> bool:
+    if _local_same_favourite(left, right):
+        return True
     same = getattr(trip_core, "same_favourite", None)
     if not callable(same):
         return False
@@ -930,6 +1071,23 @@ def _same_favourite(left: dict, right: dict) -> bool:
     except Exception:
         logger.exception("same_favourite failed")
         return False
+
+
+def _stamp_fingerprints(favs: list[dict]) -> None:
+    by_source: dict[str, str] = {}
+    for item in st.session_state.get("inbox") or []:
+        sha = _image_sha(item)
+        if item.get("id") and sha:
+            by_source[str(item["id"])] = sha
+    for fav in favs:
+        sha = by_source.get(str(fav.get("source_item") or ""))
+        if not sha:
+            continue
+        found = [str(item) for item in (fav.get("image_shas") or []) if item]
+        if sha not in found:
+            found.append(sha)
+        fav["image_shas"] = found
+        fav["image_sha"] = sha
 
 
 def _collapse_favourites(favs: list[dict]) -> tuple[list[dict], dict[str, str]]:
@@ -956,6 +1114,7 @@ def _collapse_favourites(favs: list[dict]) -> tuple[list[dict], dict[str, str]]:
 def _publish_favourites() -> None:
     removed = set(st.session_state.get("removed_fav_ids") or [])
     previous = [dict(fav) for fav in st.session_state.get("favourites") or [] if fav.get("id") not in removed]
+    _stamp_fingerprints(previous)
     collapsed, id_map = _collapse_favourites(previous)
     by_id = {fav["id"]: fav for fav in collapsed if fav.get("id")}
     order = [fav["id"] for fav in collapsed if fav.get("id")]
@@ -1604,6 +1763,71 @@ def _render_timeline(stops: list[dict]) -> None:
     st.markdown("".join(chunks), unsafe_allow_html=True)
 
 
+def _garbled_name(name: str) -> bool:
+    if _GARBLED_RE.search(name or ""):
+        return True
+    fn = getattr(trip_core, "garbled_place_name", None)
+    if not callable(fn):
+        return False
+    try:
+        return bool(fn(name))
+    except Exception:
+        logger.exception("garbled_place_name failed")
+        return False
+
+
+def _force_salon_itinerary(shown: dict, favs: list[dict]) -> dict:
+    """結果頁再寫一次。present_itinerary 若嚟自舊 trip_core，購物之旅同選物店會原封顯示。"""
+    salon = False
+    real_shop = False
+    for fav in favs:
+        if _kchiara_family(fav):
+            salon = True
+            continue
+        if fav.get("category") == "美容" or fav.get("model_category") == "salon":
+            salon = True
+            continue
+        if fav.get("category") == "購物" or fav.get("model_category") == "shop":
+            real_shop = True
+    title = shown.get("title") or ""
+    if salon and not real_shop and "購物" in title:
+        title = title.replace("與購物", "").replace("和購物", "")
+        title = title.replace("購物之旅", "之旅").replace("購物", "")
+        title = re.sub(r"[與和]之旅", "之旅", title)
+        title = re.sub(r"\s{2,}", " ", title).strip(" 、，,") or (shown.get("title") or "")
+    days = []
+    for day in shown.get("days") or []:
+        items = []
+        for stop in day.get("items") or []:
+            name = stop.get("place_name") or ""
+            if _garbled_name(name) and stop.get("ai", True):
+                continue
+            activity = stop.get("activity") or ""
+            if _kchiara_family({"name": name}) and (not activity or _SHOP_COPY_RE.search(activity)):
+                stop = {**stop, "activity": "預留時間做髮型或美容。"}
+            items.append(stop)
+        days.append({**day, "items": items})
+    return {**shown, "title": title, "days": _isolate_cloned_days(days)}
+
+
+def _isolate_cloned_days(days: list[dict]) -> list[dict]:
+    """模型把同一清單複製到每一日時，後面的日子不要再顯示第一日。"""
+    seen: list[tuple[str, ...]] = []
+    isolated = []
+    for day in days or []:
+        signature = tuple(
+            key for key in (_norm_loose(item.get("place_name") or "") for item in day.get("items") or [])
+            if key
+        )
+        if signature and signature in seen:
+            isolated.append({**day, "items": []})
+            continue
+        if signature:
+            seen.append(signature)
+        isolated.append(day)
+    return isolated
+
+
 def _render_results() -> None:
     itinerary = st.session_state.get("itinerary")
     style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
@@ -1613,20 +1837,27 @@ def _render_results() -> None:
         if st.button("前往排行程", key="back_to_plan"):
             _go("D")
         return
-    shown = trip_core.present_itinerary(
-        itinerary,
-        st.session_state.get("favourites") or [],
-        allow_ai=bool(st.session_state.get("planned_allow_ai", True)),
+    shown = _force_salon_itinerary(
+        trip_core.present_itinerary(
+            itinerary,
+            st.session_state.get("favourites") or [],
+            allow_ai=bool(st.session_state.get("planned_allow_ai", True)),
+        ),
+        list(st.session_state.get("favourites") or []),
     )
     st.subheader(shown.get("title") or "行程結果")
     st.markdown(f'<div class="style-banner">已按「{style}」安排</div>', unsafe_allow_html=True)
     days = shown.get("days") or []
-    labels = [f"Day {day.get('day')}" for day in days]
+    labels = [f"Day {index}" for index, _day in enumerate(days, start=1)]
     if labels:
         if st.session_state.get("day_tab") not in labels:
             st.session_state["day_tab"] = labels[0]
-        picked = st.pills("行程日", labels, key="day_tab") or labels[0]
-        day = next((item for item in days if f"Day {item.get('day')}" == picked), days[0])
+        picked = st.pills("行程日", labels, key="day_tab", required=True)
+        if picked not in labels:
+            picked = st.session_state.get("day_tab")
+        if picked not in labels:
+            picked = labels[0]
+        day = days[labels.index(picked)]
         visible = [stop for stop in day.get("items") or [] if not stop.get("hidden")]
         own = [stop for stop in visible if not stop.get("ai")]
         if not own and any(stop.get("hidden") for stop in day.get("items") or []):
@@ -1635,7 +1866,10 @@ def _render_results() -> None:
                 st.session_state.allow_ai = True
                 st.session_state.planned_allow_ai = True
                 st.rerun()
-        _render_timeline(visible)
+        if not visible:
+            st.caption("這一天未有安排。")
+        else:
+            _render_timeline(visible)
     st.markdown("**分享行程**")
     st.code(_share_url(), language=None)
     st.caption("連結可供朋友瀏覽；編輯權限與收藏收件匣分開。")
@@ -1691,4 +1925,6 @@ st.divider()
 st.caption(
     f"原型版本 | 今次還可使用 {remaining_quota()}/{MAX_ANALYSES} 次 | build: {_build_sha()}"
 )
+# 開始分析喺 fragment 入面先寫完第二張卡。儲存前再收一次，避免分享檔留低兩個 kchiara。
+_publish_favourites()
 _persist_shared_trip()

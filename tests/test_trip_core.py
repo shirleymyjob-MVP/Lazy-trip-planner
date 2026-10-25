@@ -1097,3 +1097,48 @@ def test_paste_component_is_drop_zone_without_clipboard_button():
     assert "streamlit:setComponentValue" in html
     assert "<select" not in html.lower()
     assert "目的地" not in html
+
+
+def test_printed_address_beats_a_nearby_guess_and_ties_keep_the_first():
+    guessed = "福岡県福岡市中央区大名1-10-15"
+    other = "福岡県福岡市中央区大名1-10-14"
+    visible = "1-12-8 セシオ大名5階"
+    assert trip_core.prefer_visible_address(guessed, visible) == visible
+    assert trip_core.prefer_visible_address(guessed, other) == guessed
+    place = trip_core.normalize_place({
+        "name": "Café Delu",
+        "name_zh": "Café Delu",
+        "category": "cafe",
+        "area": "福岡",
+        "address": guessed,
+        "address_on_image": visible,
+        "notes": "畫面寫住 1-12-8 セシオ大名5階",
+    })
+    assert place["address"] == visible
+    assert "セシオ" in place["address_on_image"]
+
+
+def test_garbled_ai_stop_is_dropped_and_cloned_days_go_blank():
+    assert trip_core.garbled_place_name("Café Del ม")
+    assert not trip_core.garbled_place_name("kchiara")
+    assert not trip_core.garbled_place_name("太宰府天滿宮")
+    shown = trip_core.present_itinerary({
+        "title": "福岡 2 日遊",
+        "days": [
+            {"day": 1, "items": [
+                {"time": "10:00", "place_name": "博多站", "activity": "集合", "transit": ""},
+                {"time": "16:00", "place_name": "Café Del ม", "activity": "咖啡", "transit": ""},
+            ]},
+            {"day": 2, "items": [
+                {"time": "10:00", "place_name": "博多站", "activity": "集合", "transit": ""},
+                {"time": "16:00", "place_name": "Café Del ม", "activity": "咖啡", "transit": ""},
+            ]},
+            {"day": 3, "items": [
+                {"time": "11:00", "place_name": "太宰府天滿宮", "activity": "參拜", "transit": ""},
+            ]},
+        ],
+    }, [], allow_ai=True)
+    assert [stop["place_name"] for stop in shown["days"][0]["items"]] == ["博多站"]
+    assert shown["days"][1]["items"] == []
+    assert [stop["place_name"] for stop in shown["days"][2]["items"]] == ["太宰府天滿宮"]
+    assert trip_core.isolate_cloned_days(shown["days"])[2]["items"]

@@ -877,6 +877,57 @@ def apply_caption_filter(places: Iterable[dict], remarks: str | None) -> tuple[l
     return filtered, f"已按備註拿走路圖中 {marks}。"
 
 
+_BUILDING_RE = re.compile(r"階|ビル|セシオ|大廈|大厦", re.IGNORECASE)
+_VISIBLE_ADDR_RE = re.compile(
+    r"\d{1,4}(?:[-－]\d{1,4}){1,3}\s*[0-9A-Za-z\u3040-\u30ff\u4e00-\u9fff]{0,24}(?:階|ビル|セシオ)"
+)
+_GARBLED_SCRIPT_RE = re.compile(r"[\u0E00-\u0E7F\u0600-\u06FF\u0590-\u05FF]")
+
+
+def address_specificity(address: str) -> tuple[int, int, int]:
+    """樓層／大廈名優先，其次先至係門牌數字。縣名較長唔算更具體。"""
+    text = _clean_str(address)
+    building = 1 if _BUILDING_RE.search(text) else 0
+    return (building, len(re.findall(r"\d+", text)), len(text) if building else 0)
+
+
+def prefer_visible_address(guessed: str, visible: str) -> str:
+    """畫面印住嘅地址（例如 1-12-8 セシオ大名5階）唔好輸俾估出嚟嘅鄰近門牌。"""
+    guessed = _clean_str(guessed)
+    visible = _clean_str(visible)
+    if not visible:
+        return guessed
+    if not guessed or address_specificity(visible) > address_specificity(guessed):
+        return visible
+    return guessed
+
+
+def extract_visible_address(*texts: str) -> str:
+    for text in texts:
+        match = _VISIBLE_ADDR_RE.search(_clean_str(text))
+        if match:
+            return match.group(0).strip()
+    return ""
+
+
+def apply_visible_address(place: dict) -> dict:
+    if not isinstance(place, dict):
+        return place
+    visible = _clean_str(place.get("address_on_image")) or extract_visible_address(
+        place.get("notes") or "",
+        place.get("address") or "",
+    )
+    if visible:
+        place["address_on_image"] = visible
+        place["address"] = prefer_visible_address(place.get("address") or "", visible)
+    return place
+
+
+def garbled_place_name(name: str) -> bool:
+    """泰文、阿拉伯文等夾喺店名入面，係模型亂碼，唔係日本店名。"""
+    return bool(_GARBLED_SCRIPT_RE.search(name or ""))
+
+
 def normalize_place(raw: dict) -> dict | None:
     """將一個模型回傳嘅 place 整理成固定 schema；冇名就回傳 None。"""
     if not isinstance(raw, dict):
@@ -899,7 +950,9 @@ def normalize_place(raw: dict) -> dict | None:
         "confidence": normalize_confidence(raw.get("confidence")),
         "source_images": _to_int_list(src),
         "caption_index": normalize_caption_index(raw.get("caption_index")),
+        "address_on_image": _clean_str(raw.get("address_on_image")),
     }
+    apply_visible_address(place)
     if looks_like_salon(place):
         place["category"] = "salon"
     return place
@@ -926,9 +979,11 @@ def _norm_key(s: str) -> str:
 
 def _merge(a: dict, b: dict) -> dict:
     merged = dict(a)
-    for key in ("name_zh", "area", "address", "opening_hours", "rating"):
+    for key in ("name_zh", "area", "opening_hours", "rating", "address_on_image"):
         if not merged.get(key) and b.get(key):
             merged[key] = b[key]
+    merged["address"] = prefer_visible_address(merged.get("address") or "", b.get("address") or "")
+    apply_visible_address(merged)
     if b.get("notes") and b["notes"] not in merged.get("notes", ""):
         merged["notes"] = "；".join(x for x in (merged.get("notes"), b["notes"]) if x)
     if looks_like_salon(merged) or looks_like_salon(b) or b.get("category") == "salon":
@@ -945,14 +1000,12 @@ def _merge(a: dict, b: dict) -> dict:
 
 
 def dedupe_places(places: Iterable[dict]) -> list[dict]:
-    """用原文名或中文名（正規化後）去重，合併資料。保留首次出現次序。"""
+    """同名、或 kchiara／キアラ 呢類別名，合併成一間。保留首次出現次序。"""
     result: list[dict] = []
     for place in places:
-        keys = {k for k in (_norm_key(place.get("name", "")), _norm_key(place.get("name_zh", ""))) if k}
         match = None
         for idx, existing in enumerate(result):
-            ekeys = {k for k in (_norm_key(existing.get("name", "")), _norm_key(existing.get("name_zh", ""))) if k}
-            if keys & ekeys:
+            if names_match(existing, place):
                 match = idx
                 break
         if match is None:
@@ -971,7 +1024,7 @@ def merge_known_places(base: Iterable[dict], incoming: Iterable[dict]) -> list[d
             continue
         for idx, existing in enumerate(result):
             ekeys = {k for k in (_norm_key(existing.get("name", "")), _norm_key(existing.get("name_zh", ""))) if k}
-            if keys & ekeys:
+            if keys & ekeys or names_match(existing, extra):
                 result[idx] = _merge(existing, extra)
                 break
     return result
@@ -1468,6 +1521,8 @@ def present_itinerary(itinerary: dict, favourites: Iterable[dict] | None, *, all
             fav = match_favourite(stop.get("place_name") or "", favourites)
             ai = fav is None
             category = (fav or {}).get("category") or (fav or {}).get("model_category") or ""
+            if garbled_place_name(stop.get("place_name") or "") and ai:
+                continue
             items.append({
                 **stop,
                 "ai": ai,
@@ -1481,8 +1536,27 @@ def present_itinerary(itinerary: dict, favourites: Iterable[dict] | None, *, all
     return {
         **itinerary,
         "title": rewrite_trip_title(itinerary.get("title") or "", favourites),
-        "days": days,
+        "days": isolate_cloned_days(days),
     }
+
+
+def isolate_cloned_days(days: list[dict]) -> list[dict]:
+    """模型把同一清單複製到每一日時，後面的日子不要再顯示第一日的內容。"""
+    seen: list[tuple[str, ...]] = []
+    isolated = []
+    for day in days or []:
+        signature = tuple(
+            _norm_key(item.get("place_name") or "")
+            for item in day.get("items") or []
+            if _norm_key(item.get("place_name") or "")
+        )
+        if signature and signature in seen:
+            isolated.append({**day, "items": []})
+            continue
+        if signature:
+            seen.append(signature)
+        isolated.append(day)
+    return isolated
 
 
 def fallback_trip_title(region: str, days: int) -> str:

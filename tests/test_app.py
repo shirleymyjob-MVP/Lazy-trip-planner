@@ -1,4 +1,5 @@
 """Streamlit AppTest：新流程用 mock 代替真 Gemini。"""
+import hashlib
 import io
 import json
 import os
@@ -577,3 +578,321 @@ def test_missing_trip_style_constant_still_opens_and_shows_build(monkeypatch):
     assert "收集想去的地方" in page
     _button(at, "開始收集想去的地方")
     assert "懶人出行" in page
+
+
+ADDR_15 = "福岡県福岡市中央区大名1-10-15"
+ADDR_14 = "福岡県福岡市中央区大名1-10-14"
+
+
+def test_one_digit_address_drift_collapses_even_when_trip_core_refuses(monkeypatch):
+    """同一張 kchiara.png：大名1-10-15 同 1-10-14、同一圖片指紋，載入後只能剩一張美容卡。
+
+    6b92 把 same_favourite / looks_like_salon 放喺 trip_core。Cloud 若只換到新 app.py，
+    舊模組會當兩張卡唔同、類別保持購物。呢條路徑必須由 app.py 自己收埋。
+    """
+    monkeypatch.setattr(trip_core, "same_favourite", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(trip_core, "looks_like_salon", lambda *_args, **_kwargs: False)
+    image = _png("red")
+    fingerprint = hashlib.sha256(image).hexdigest()[:16]
+
+    def card(card_id: str, address: str) -> dict:
+        return {
+            "id": card_id,
+            "source_item": card_id,
+            "name": "kchiara",
+            "name_zh": "kchiara",
+            "name_original": "kchiara",
+            "category": "購物",
+            "model_category": "shop",
+            "address": address,
+            "opening_hours": "12:00-19:00",
+            "rating": "4.2/5",
+            "added_by": "旅人",
+            "regions": ["福岡", "大名"],
+            "image_sha": fingerprint,
+            "image_shas": [fingerprint],
+            "sole_image": True,
+            "edited": False,
+        }
+
+    def item(item_id: str, address: str) -> dict:
+        return {
+            "id": item_id,
+            "image": image,
+            "analysis": "done",
+            "facts": "done",
+            "places": [{
+                "fav_id": item_id,
+                "name": "kchiara",
+                "name_zh": "kchiara",
+                "category": "shop",
+                "area": "福岡",
+                "address": address,
+                "opening_hours": "12:00-19:00",
+                "rating": "4.2/5",
+            }],
+            "added_by": "旅人",
+            "remark": "",
+            "batch": False,
+        }
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "C"
+    at.session_state["favourites"] = [card("card-15", ADDR_15), card("card-14", ADDR_14)]
+    at.session_state["inbox"] = [item("card-15", ADDR_15), item("card-14", ADDR_14)]
+    at.run()
+    assert not at.exception
+    favs = at.session_state["favourites"]
+    assert len(favs) == 1
+    assert favs[0]["category"] == "美容"
+    assert favs[0]["model_category"] == "salon"
+    assert favs[0]["address"] == ADDR_15
+    assert favs[0]["opening_hours"] == "12:00-19:00"
+    assert fingerprint in (favs[0].get("image_shas") or [])
+    page = _page(at)
+    assert page.count("kchiara") == 1
+    assert "美容" in page
+    assert "購物" not in page
+
+
+def test_clicking_analyze_twice_on_the_same_photo_publishes_one_salon(monkeypatch):
+    """開始分析兩次先至係守門員的路徑。舊 trip_core 拒絕合併時，第二次仍要收成一張美容卡。"""
+    monkeypatch.setattr(trip_core, "same_favourite", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(trip_core, "looks_like_salon", lambda *_args, **_kwargs: False)
+    image = _png("pink")
+    addresses = [ADDR_15, ADDR_14]
+    calls = {"n": 0}
+
+    def recognize(*_args, **_kwargs):
+        places = trip_core.parse_places_response(json.dumps({"places": [{
+            "name": "kchiara",
+            "name_zh": "kchiara",
+            "category": "shop",
+            "area": "福岡",
+            "confidence": "高",
+            "source_images": [1],
+            "caption_index": 0,
+        }]}, ensure_ascii=False))
+        return gemini_client.AnalysisResult(places, [])
+
+    def enrich(_client, _model, places, **_kwargs):
+        address = addresses[min(calls["n"], len(addresses) - 1)]
+        calls["n"] += 1
+        seed = dict(places[0])
+        seed.update({
+            "address": address,
+            "opening_hours": "12:00-19:00",
+            "rating": "4.2/5",
+            "category": "shop",
+        })
+        return gemini_client.AnalysisResult([seed], [])
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "B"
+    at.session_state["inbox"] = [
+        {
+            "id": "shot-a",
+            "label": "截圖 1",
+            "image": image,
+            "remark": "",
+            "analysis": "idle",
+            "facts": "",
+            "batch": False,
+            "places": [],
+            "city": "",
+            "regions": [],
+            "region_confidence": "低",
+            "warning": "",
+            "added_by": "旅人",
+        },
+        {
+            "id": "shot-b",
+            "label": "截圖 2",
+            "image": image,
+            "remark": "",
+            "analysis": "idle",
+            "facts": "",
+            "batch": False,
+            "places": [],
+            "city": "",
+            "regions": [],
+            "region_confidence": "低",
+            "warning": "",
+            "added_by": "旅人",
+        },
+    ]
+    at.run()
+    assert not at.exception
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=recognize), \
+         mock.patch.object(gemini_client, "enrich_places", side_effect=enrich):
+        _button(at, "開始分析").click().run()
+        assert len(at.session_state["favourites"]) == 1
+        _button(at, "開始分析").click().run()
+    assert not at.exception
+    favs = at.session_state["favourites"]
+    assert len(favs) == 1
+    assert favs[0]["category"] == "美容"
+    assert favs[0]["opening_hours"] == "12:00-19:00"
+    assert favs[0]["address"] in {ADDR_15, ADDR_14}
+    assert calls["n"] == 2
+
+
+def test_kchiara_shopping_blurb_normalizes_to_salon_unless_a_real_shop_remains(monkeypatch):
+    """收藏係購物、標題係購物之旅、文案係特色選物店。正規化後要變美容，除非仲有真商店。"""
+    monkeypatch.setattr(trip_core, "looks_like_salon", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(trip_core, "garbled_place_name", lambda *_args, **_kwargs: False)
+    monkeypatch.setattr(trip_core, "rewrite_trip_title", lambda title, favourites=None: title)
+    monkeypatch.setattr(trip_core, "rewrite_activity", lambda _name, activity, category="": activity)
+
+    salon = {
+        "id": "kchiara",
+        "name": "kchiara",
+        "name_original": "kchiara",
+        "category": "購物",
+        "model_category": "shop",
+        "address": ADDR_15,
+        "opening_hours": "12:00-19:00",
+        "rating": "4.2/5",
+        "added_by": "旅人",
+        "regions": ["福岡"],
+        "edited": False,
+    }
+    edited = _fav(
+        id="edited",
+        name="太宰府天滿宮",
+        name_zh="太宰府天滿宮",
+        name_original="太宰府天滿宮",
+        category="文化體驗",
+        edited=True,
+    )
+    itinerary = {
+        "title": "福岡 3 日平衡美食購物之旅",
+        "days": [{"day": 1, "items": [
+            {
+                "time": "14:00",
+                "place_name": "kchiara",
+                "activity": "探索大名區特色選物店，停留約 1.5 小時",
+                "transit": "",
+            },
+            {
+                "time": "16:00",
+                "place_name": "Café Del ม",
+                "activity": "下午茶",
+                "transit": "步行約 5 分鐘",
+            },
+        ]}],
+    }
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "E"
+    at.session_state["favourites"] = [salon, edited]
+    at.session_state["itinerary"] = itinerary
+    at.run()
+    assert not at.exception
+    by_id = {fav["id"]: fav for fav in at.session_state["favourites"]}
+    assert by_id["kchiara"]["category"] == "美容"
+    assert by_id["edited"]["category"] == "文化體驗"
+    page = _page(at)
+    title = " ".join(block.value for block in at.subheader)
+    assert "美容" in page
+    assert "預留時間做髮型或美容" in page
+    assert "選物" not in page
+    assert "購物" not in title
+    assert "美食" in title
+    assert "Café Del" not in page
+    assert "ม" not in page
+
+    shop = _fav(
+        id="muji",
+        name="無印良品",
+        name_zh="無印良品",
+        name_original="無印良品",
+        category="購物",
+        model_category="shop",
+        address="福岡市博多區",
+    )
+    at.session_state["favourites"] = [salon, shop]
+    at.session_state["itinerary"] = {
+        "title": "福岡 3 日平衡美食購物之旅",
+        "days": [{"day": 1, "items": [
+            {
+                "time": "14:00",
+                "place_name": "kchiara",
+                "activity": "探索大名區特色選物店，停留約 1.5 小時",
+                "transit": "",
+            },
+            {
+                "time": "16:00",
+                "place_name": "無印良品",
+                "activity": "參觀特色選物店",
+                "transit": "",
+            },
+        ]}],
+    }
+    at.run()
+    assert not at.exception
+    page = _page(at)
+    title = " ".join(block.value for block in at.subheader)
+    assert "購物" in title
+    assert "選物" in page
+    assert "預留時間做髮型或美容" in page
+    saved = {fav["id"]: fav for fav in at.session_state["favourites"]}
+    assert saved["kchiara"]["category"] == "美容"
+    assert saved["muji"]["category"] == "購物"
+
+
+def test_day_tabs_show_only_the_selected_day_even_if_day_numbers_repeat():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "E"
+    at.session_state["favourites"] = [
+        _fav(id="hakata", name="博多站", name_zh="博多站", name_original="博多站", address="博多站"),
+        _fav(id="dazaifu", name="太宰府天滿宮", name_zh="太宰府天滿宮", name_original="太宰府天滿宮"),
+    ]
+    at.session_state["itinerary"] = {
+        "title": "福岡 2 日遊",
+        "days": [
+            {"day": 1, "items": [{"time": "10:00", "place_name": "博多站", "activity": "集合", "transit": ""}]},
+            {"day": 1, "items": [{"time": "11:00", "place_name": "太宰府天滿宮", "activity": "參拜", "transit": ""}]},
+        ],
+    }
+    at.run()
+    assert not at.exception
+    page = _page(at)
+    assert "博多站" in page
+    assert "太宰府天滿宮" not in page
+    day_pills = [pill for pill in at.pills if "行程日" in pill.proto.label]
+    assert day_pills and list(day_pills[0].options) == ["Day 1", "Day 2"]
+    day_pills[0].set_value("Day 2").run()
+    assert not at.exception
+    page = _page(at)
+    assert "太宰府天滿宮" in page
+    assert "博多站" not in page
+
+
+def test_cloned_day_does_not_repeat_day_one():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "E"
+    stops = [
+        {"time": "10:00", "place_name": "博多站", "activity": "集合", "transit": ""},
+        {"time": "12:00", "place_name": "一蘭", "activity": "午餐", "transit": "步行約 8 分鐘"},
+    ]
+    at.session_state["favourites"] = [
+        _fav(id="hakata", name="博多站", name_zh="博多站", name_original="博多站", address="博多"),
+        _fav(id="ichiran", name="一蘭", name_zh="一蘭", name_original="一蘭", address="中洲", category="美食"),
+    ]
+    at.session_state["itinerary"] = {
+        "title": "福岡 2 日遊",
+        "days": [
+            {"day": 1, "items": [dict(stop) for stop in stops]},
+            {"day": 2, "items": [dict(stop) for stop in stops]},
+        ],
+    }
+    at.run()
+    assert not at.exception
+    assert "博多站" in _page(at)
+    day_pills = [pill for pill in at.pills if "行程日" in pill.proto.label][0]
+    day_pills.set_value("Day 2").run()
+    page = _page(at)
+    assert "這一天未有安排" in page
+    assert "博多站" not in page
+    assert "一蘭" not in page
