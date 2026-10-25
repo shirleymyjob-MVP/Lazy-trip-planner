@@ -24,7 +24,86 @@ import trip_store
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("lazy_trip_planner")
 
+# Cloud 有時新 app.py 對住舊 trip_core。新流程先有嘅常數缺咗就用畫面預設，唔好整頁爆。
+DEFAULT_TRIP_STYLE = getattr(trip_core, "DEFAULT_TRIP_STYLE", "平衡型")
+HERO_LINE = getattr(
+    trip_core,
+    "HERO_LINE",
+    "貼上你想去的地方，系統會幫你整理清單並安排每日行程，完成後可分享給朋友一起修改。",
+)
+OPENING_STEPS = getattr(
+    trip_core,
+    "OPENING_STEPS",
+    (
+        "收集想去的地方",
+        "查看／整理我的收藏",
+        "一鍵排行程",
+        "收集後可邀請朋友一起修改",
+    ),
+)
+PAYWALL_NOTE = getattr(trip_core, "PAYWALL_NOTE", "收費：待定")
+UNVERIFIED = getattr(trip_core, "UNVERIFIED", "未核實")
+SPARSE_COLLECTION_MIN = getattr(trip_core, "SPARSE_COLLECTION_MIN", 3)
+FAVOURITE_CATEGORIES = getattr(
+    trip_core,
+    "FAVOURITE_CATEGORIES",
+    ("美食", "景點", "購物", "文化體驗", "自然／戶外", "其他"),
+)
+PLAN_PREF_OPTIONS = getattr(
+    trip_core,
+    "PLAN_PREF_OPTIONS",
+    ("美食", "景點", "購物", "文化體驗", "自然／戶外"),
+)
+TRIP_STYLES = getattr(
+    trip_core,
+    "TRIP_STYLES",
+    (
+        ("平衡型", "正常節奏，食與玩均衡"),
+        ("網紅打卡型", "多打卡點，節奏快"),
+        ("Chill 型", "慢活，長時間享用"),
+        ("美食優先", "以餐廳為主"),
+    ),
+)
+COLLECT_STATUS_IDLE = getattr(trip_core, "COLLECT_STATUS_IDLE", "尚未分析")
+COLLECT_STATUS_RUNNING = getattr(trip_core, "COLLECT_STATUS_RUNNING", "分析中…")
+COLLECT_STATUS_VERIFYING = getattr(trip_core, "COLLECT_STATUS_VERIFYING", "資料核實中…")
+COLLECT_STATUS_DONE = getattr(trip_core, "COLLECT_STATUS_DONE", "已完成")
+COLLECT_STATUS_FAIL = getattr(trip_core, "COLLECT_STATUS_FAIL", "無法辨識")
+
+
+def _build_sha() -> str:
+    """俾 UAT 對住 build: 確認 Streamlit 載緊邊個 commit。"""
+    try:
+        sha = subprocess.check_output(
+            ["git", "rev-parse", "--short=12", "HEAD"],
+            cwd=str(Path(__file__).parent),
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        sha = ""
+    return sha or "unknown"
+
+
+def _collect_status(item: dict) -> str:
+    """舊 trip_core 冇 collect_status 時當尚未分析，唔好整頁爆。"""
+    fn = getattr(trip_core, "collect_status", None)
+    if not callable(fn):
+        return COLLECT_STATUS_IDLE
+    return fn(item)
+
+
+def _call_trip_core(name: str, *args, default):
+    """舊 trip_core 冇新 helper 時用 default，避免 init 期間整頁爆。"""
+    fn = getattr(trip_core, name, None)
+    if not callable(fn):
+        return default
+    return fn(*args)
+
+
 st.set_page_config(page_title="懶人出行 ✈️", page_icon="✈️", layout="centered")
+# init 之後先畫頁尾的話，AttributeError 會令 UAT 睇唔到 SHA。
+st.caption(f"build: {_build_sha()}")
 st.markdown(
     """
     <style>
@@ -141,7 +220,7 @@ def init_state():
     st.session_state.setdefault("screen", "A")
     st.session_state.setdefault("favourites", [])
     st.session_state.setdefault("removed_fav_ids", [])
-    st.session_state.setdefault("trip_style", trip_core.DEFAULT_TRIP_STYLE)
+    st.session_state.setdefault("trip_style", DEFAULT_TRIP_STYLE)
     st.session_state.setdefault("allow_ai", True)
     st.session_state.setdefault("day_count", 3)
     st.session_state.setdefault("show_invite", False)
@@ -466,7 +545,7 @@ def _snapshot() -> dict:
         "members": members,
         "favourites": list(st.session_state.get("favourites") or []),
         "removed_fav_ids": list(st.session_state.get("removed_fav_ids") or []),
-        "trip_style": st.session_state.get("trip_style") or trip_core.DEFAULT_TRIP_STYLE,
+        "trip_style": st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE,
         "allow_ai": bool(st.session_state.get("allow_ai")),
         "day_count": int(st.session_state.get("day_count") or 3),
         **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
@@ -623,20 +702,6 @@ def _enrich_inbox_facts() -> None:
         st.session_state.notice = ("warning", " ".join(bits))
 
 
-def _build_sha() -> str:
-    """俾 UAT 對住頁尾 build: 確認 Streamlit 載緊邊個 commit。"""
-    try:
-        sha = subprocess.check_output(
-            ["git", "rev-parse", "--short=12", "HEAD"],
-            cwd=str(Path(__file__).parent),
-            text=True,
-            stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        sha = ""
-    return sha or "unknown"
-
-
 def _enrich_result(places: list[dict]) -> gemini_client.AnalysisResult:
     raw = gemini_client.enrich_places(_client(), ENRICH_MODEL, places, use_maps=USE_MAPS)
     if isinstance(raw, gemini_client.AnalysisResult):
@@ -677,9 +742,9 @@ def _favourite_record(place: dict, item: dict) -> dict:
         "name": name or original,
         "name_zh": place.get("name_zh") or "",
         "name_original": original,
-        "category": trip_core.favourite_category(place),
+        "category": _call_trip_core("favourite_category", place, default="其他"),
         "model_category": place.get("category") or "other",
-        "regions": trip_core.place_regions(place, item),
+        "regions": _call_trip_core("place_regions", place, item, default=[]),
         "address": (place.get("address") or "").strip(),
         "opening_hours": (place.get("opening_hours") or "").strip(),
         "rating": place.get("rating") or "",
@@ -693,7 +758,7 @@ def _publish_favourites() -> None:
     previous = [dict(fav) for fav in st.session_state.get("favourites") or [] if fav.get("id") not in removed]
     by_id = {fav["id"]: fav for fav in previous}
     for item in st.session_state.inbox:
-        if trip_core.collect_status(item) != trip_core.COLLECT_STATUS_DONE:
+        if _collect_status(item) != COLLECT_STATUS_DONE:
             continue
         for place in item.get("places") or []:
             fid = _ensure_fav_id(place)
@@ -813,7 +878,7 @@ def _favourite_destination(favs: list[dict]) -> str:
 
 
 def _allow_ai_suggestions(favs: list[dict]) -> bool:
-    if len(favs) >= trip_core.SPARSE_COLLECTION_MIN:
+    if len(favs) >= SPARSE_COLLECTION_MIN:
         return False
     return bool(st.session_state.get("allow_ai", True))
 
@@ -901,7 +966,7 @@ def _ingest_collect_inputs() -> None:
 
 
 def _render_collect_card(item: dict) -> None:
-    status = trip_core.collect_status(item)
+    status = _collect_status(item)
     with st.container(border=True):
         left, right = st.columns([1, 2])
         with left:
@@ -909,25 +974,25 @@ def _render_collect_card(item: dict) -> None:
         with right:
             st.markdown(f"**{status}**")
             st.caption(f"加入：{item.get('added_by') or '未記名'}")
-            if status == trip_core.COLLECT_STATUS_IDLE and not item.get("batch"):
+            if status == COLLECT_STATUS_IDLE and not item.get("batch"):
                 remark_key = f"remark_{item['id']}"
                 if remark_key not in st.session_state:
                     st.session_state[remark_key] = item.get("remark") or ""
                 st.text_input("備註（可選）", key=remark_key, placeholder="例如：想吃晚餐、需要訂位…")
                 if st.button("開始分析", key=f"analyze_{item['id']}", type="primary"):
                     _mark_for_analysis({item["id"]})
-            elif status == trip_core.COLLECT_STATUS_IDLE and item.get("batch"):
+            elif status == COLLECT_STATUS_IDLE and item.get("batch"):
                 st.caption("批量項目：不設個別備註")
-            elif status == trip_core.COLLECT_STATUS_RUNNING:
+            elif status == COLLECT_STATUS_RUNNING:
                 st.caption("正在識別截圖…")
-            elif status == trip_core.COLLECT_STATUS_VERIFYING:
+            elif status == COLLECT_STATUS_VERIFYING:
                 for place in item.get("places") or []:
                     title = place.get("name_zh") or place.get("name")
                     st.markdown(f"**{title}**")
                     regions = "、".join(trip_core.place_regions(place, item))
                     st.caption(regions)
                 st.caption("資料核實中…（地址／營業時間／評分）")
-            elif status == trip_core.COLLECT_STATUS_FAIL:
+            elif status == COLLECT_STATUS_FAIL:
                 st.markdown("**無法辨識這張圖片**")
                 st.caption(item.get("warning") or "可能是風景或截圖過於模糊。")
                 if st.button("重試", key=f"retry_{item['id']}"):
@@ -980,8 +1045,8 @@ def _render_collect() -> None:
     st.caption("將 IG／小紅書／YouTube 截圖貼上或批量上傳。")
     _ingest_collect_inputs()
     _kick_analysis()
-    pending = [item for item in st.session_state.inbox if trip_core.collect_status(item) != trip_core.COLLECT_STATUS_DONE]
-    done = [item for item in st.session_state.inbox if trip_core.collect_status(item) == trip_core.COLLECT_STATUS_DONE]
+    pending = [item for item in st.session_state.inbox if _collect_status(item) != COLLECT_STATUS_DONE]
+    done = [item for item in st.session_state.inbox if _collect_status(item) == COLLECT_STATUS_DONE]
     st.markdown(f"**待分析 {len(pending)}**")
     if not pending:
         st.caption("尚未有待分析項目。")
@@ -1056,7 +1121,7 @@ def _render_favourite(fav: dict) -> None:
                 cat_key = f"edit_cat_{fav['id']}"
                 if cat_key not in st.session_state:
                     st.session_state[cat_key] = fav.get("category") or "其他"
-                st.selectbox("類別", list(trip_core.FAVOURITE_CATEGORIES), key=cat_key)
+                st.selectbox("類別", list(FAVOURITE_CATEGORIES), key=cat_key)
                 save_col, remove_col = st.columns(2)
                 with save_col:
                     if st.button("儲存", key=f"save_{fav['id']}", type="primary"):
@@ -1096,7 +1161,7 @@ def _render_collection() -> None:
             _render_favourite(fav)
     if st.button("一鍵排行程 →", type="primary", key="to_plan"):
         _go("D")
-    st.caption(trip_core.PAYWALL_NOTE)
+    st.caption(PAYWALL_NOTE)
 
 
 def _render_plan() -> None:
@@ -1109,26 +1174,26 @@ def _render_plan() -> None:
     with count_col:
         st.number_input("日數", min_value=1, max_value=14, step=1, key="day_count")
     raw_prefs = list(st.session_state.get("pref_pills") or [])
-    clean_prefs = [item for item in raw_prefs if item in trip_core.PLAN_PREF_OPTIONS]
+    clean_prefs = [item for item in raw_prefs if item in PLAN_PREF_OPTIONS]
     if clean_prefs != raw_prefs:
         st.session_state.pref_pills = clean_prefs or ["美食", "景點"]
     st.pills(
         "你想去哪些類型的地方？（可多選）",
-        list(trip_core.PLAN_PREF_OPTIONS),
+        list(PLAN_PREF_OPTIONS),
         selection_mode="multi",
         key="pref_pills",
     )
-    style_labels = [name for name, _blurb in trip_core.TRIP_STYLES]
+    style_labels = [name for name, _blurb in TRIP_STYLES]
     if st.session_state.get("trip_style") not in style_labels:
-        st.session_state.trip_style = trip_core.DEFAULT_TRIP_STYLE
+        st.session_state.trip_style = DEFAULT_TRIP_STYLE
     st.radio(
         "行程風格（單選）",
         style_labels,
-        captions=[blurb for _name, blurb in trip_core.TRIP_STYLES],
+        captions=[blurb for _name, blurb in TRIP_STYLES],
         key="trip_style",
     )
     allow_ai = _allow_ai_suggestions(favs)
-    if len(favs) < trip_core.SPARSE_COLLECTION_MIN:
+    if len(favs) < SPARSE_COLLECTION_MIN:
         st.markdown("**目前收藏的地方較少，是否需要 AI 協助建議其他地點？**")
         yes_col, no_col = st.columns(2)
         with yes_col:
@@ -1157,7 +1222,7 @@ def _render_plan() -> None:
     submitted = st.button("開始排行程", type="primary", disabled=not can_plan, key="plan_go")
     if not submitted:
         return
-    style = st.session_state.get("trip_style") or trip_core.DEFAULT_TRIP_STYLE
+    style = st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
     request = trip_core.compose_trip_request(
         trip_core.DESTINATION_DEFAULT,
         days=st.session_state.get("day_count") or 3,
@@ -1227,7 +1292,7 @@ def _render_plan() -> None:
 
 def _render_results() -> None:
     itinerary = st.session_state.get("itinerary")
-    style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or trip_core.DEFAULT_TRIP_STYLE
+    style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
     if not itinerary:
         st.subheader("行程結果")
         st.caption("尚未安排行程。")
@@ -1277,8 +1342,8 @@ def _render_results() -> None:
                 if stop.get("activity"):
                     st.caption(stop["activity"])
                 st.caption(
-                    f"🕒 {stop.get('opening_hours') or trip_core.UNVERIFIED} · "
-                    f"⭐ {stop.get('rating') or trip_core.UNVERIFIED}"
+                    f"🕒 {stop.get('opening_hours') or UNVERIFIED} · "
+                    f"⭐ {stop.get('rating') or UNVERIFIED}"
                 )
     st.markdown("**分享行程**")
     st.code(_share_url(), language=None)
@@ -1287,8 +1352,8 @@ def _render_results() -> None:
 
 def _render_opening() -> None:
     st.title("懶人出行 ✈️")
-    st.markdown(trip_core.HERO_LINE)
-    steps = "\n".join(f"{index}. {label}" for index, label in enumerate(trip_core.OPENING_STEPS, start=1))
+    st.markdown(HERO_LINE)
+    steps = "\n".join(f"{index}. {label}" for index, label in enumerate(OPENING_STEPS, start=1))
     st.markdown(steps)
     st.text_input("你的顯示名", key="display_name")
     members = "、".join(st.session_state.get("members") or []) or _viewer_name()

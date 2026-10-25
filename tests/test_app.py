@@ -337,3 +337,40 @@ def test_shared_inbox_keeps_who_added_the_screenshot():
     assert not other.exception
     assert other.session_state["inbox"][0]["added_by"] == "Ada"
     assert "加入：Ada" in _page(other)
+
+
+def test_missing_trip_style_constant_still_opens_and_shows_build(monkeypatch):
+    """舊 trip_core 冇新常數時，開場唔可以 AttributeError，而且 build 要先畫出嚟。"""
+    for name in (
+        "DEFAULT_TRIP_STYLE",
+        "HERO_LINE",
+        "OPENING_STEPS",
+        "COLLECT_STATUS_IDLE",
+        "COLLECT_STATUS_DONE",
+        "PAYWALL_NOTE",
+        "SPARSE_COLLECTION_MIN",
+    ):
+        monkeypatch.delattr(trip_core, name, raising=False)
+    monkeypatch.delattr(trip_core, "collect_status", raising=False)
+    monkeypatch.delattr(trip_core, "favourite_category", raising=False)
+    monkeypatch.delattr(trip_core, "place_regions", raising=False)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["inbox"] = [{
+        "id": "stale",
+        "analysis": "done",
+        "facts": "done",
+        "places": [{"name": "太宰府天滿宮", "name_zh": "太宰府天滿宮"}],
+        "remark": "",
+        "batch": False,
+        "added_by": "旅人",
+    }]
+    at.run()
+    assert not at.exception
+    assert at.caption
+    assert at.caption[0].value.startswith("build:")
+    assert at.session_state["trip_style"] == "平衡型"
+    page = _page(at)
+    assert "貼上你想去的地方" in page
+    assert "收集想去的地方" in page
+    _button(at, "開始收集想去的地方")
+    assert "懶人出行" in page
