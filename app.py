@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import hashlib
+import html
 import logging
 import os
 import re
@@ -194,6 +195,38 @@ st.markdown(
         color: #E85D52;
         border: 1.5px solid #FF7A6E;
       }
+      .itinerary { position: relative; padding-left: 20px; margin-top: 8px; }
+      .itinerary::before {
+        content: '';
+        position: absolute;
+        left: 6px; top: 8px; bottom: 8px;
+        width: 2px;
+        background: #FFE8E5;
+      }
+      .stop { position: relative; margin-bottom: 16px; }
+      .stop::before {
+        content: '';
+        position: absolute;
+        left: -17px; top: 6px;
+        width: 10px; height: 10px;
+        background: #FF7A6E;
+        border-radius: 50%;
+        border: 2px solid #FFFFFF;
+        box-shadow: 0 0 0 1px #FF7A6E;
+      }
+      .stop.ai-sug::before { background: #C4A35A; box-shadow: 0 0 0 1px #C4A35A; }
+      .stop-time { font-size: 12px; color: #E85D52; font-weight: 700; margin-bottom: 4px; }
+      .stop-card {
+        background: #FFFFFF;
+        border: 1px solid #F0E8E6;
+        border-radius: 12px;
+        padding: 12px;
+        box-shadow: 0 2px 12px rgba(255, 122, 110, 0.12);
+      }
+      .stop-card .name { font-size: 16px; font-weight: 700; margin-bottom: 4px; color: #2C2C2C; }
+      .stop-card .source-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 4px; }
+      .stop-card .blurb, .stop-card .meta-line { font-size: 13px; color: #5A5A5A; line-height: 1.45; }
+      .transit { font-size: 12px; color: #8A8A8A; padding: 6px 0 6px 4px; }
       [data-testid="stFileUploader"] section {
         border: 1.5px solid #FF7A6E !important;
         background: #FFFFFF !important;
@@ -839,8 +872,12 @@ def _image_sha(item: dict) -> str:
     return hashlib.sha256(data).hexdigest()[:16]
 
 
+def _address_digits(address: str) -> int:
+    return len(re.findall(r"\d+", address or ""))
+
+
 def _merge_fav(prev: dict, fresh: dict) -> dict:
-    """再分析同一地方時留低第一張卡。地址唔好被差一號嘅新結果換走。"""
+    """再分析同一地方時留低第一張卡。有門牌的地址取代只有街名的結果。"""
     merged = dict(prev)
     if not prev.get("edited"):
         for field in ("name", "name_zh", "name_original", "regions"):
@@ -851,6 +888,9 @@ def _merge_fav(prev: dict, fresh: dict) -> dict:
         ):
             merged["category"] = fresh.get("category") or "美容"
             merged["model_category"] = fresh.get("model_category") or "salon"
+        fresh_address = (fresh.get("address") or "").strip()
+        if fresh_address and _address_digits(fresh_address) > _address_digits(str(merged.get("address") or "")):
+            merged["address"] = fresh_address
     for field in ("opening_hours", "rating"):
         if not (str(merged.get(field) or "")).strip() and (str(fresh.get(field) or "")).strip():
             merged[field] = fresh[field]
@@ -862,43 +902,103 @@ def _merge_fav(prev: dict, fresh: dict) -> dict:
             if sha and sha not in shas:
                 shas.append(sha)
     merged["image_shas"] = shas
+    merged["sole_image"] = bool(prev.get("sole_image") or fresh.get("sole_image"))
     merged["id"] = prev["id"]
     merged["edited"] = bool(prev.get("edited"))
     merged["added_by"] = prev.get("added_by") or fresh.get("added_by")
     return merged
 
 
+def _retag_salon(fav: dict) -> dict:
+    """未手動改過的 kchiara／美容室，不要一直停在購物。"""
+    if not isinstance(fav, dict) or fav.get("edited"):
+        return fav
+    if not _call_trip_core("looks_like_salon", fav, default=False):
+        return fav
+    updated = dict(fav)
+    updated["category"] = "美容"
+    updated["model_category"] = "salon"
+    return updated
+
+
+def _same_favourite(left: dict, right: dict) -> bool:
+    same = getattr(trip_core, "same_favourite", None)
+    if not callable(same):
+        return False
+    try:
+        return bool(same(left, right))
+    except Exception:
+        logger.exception("same_favourite failed")
+        return False
+
+
+def _collapse_favourites(favs: list[dict]) -> tuple[list[dict], dict[str, str]]:
+    """已經各自有 id 的同一間店也要收成一張。"""
+    kept: list[dict] = []
+    id_map: dict[str, str] = {}
+    for raw in favs:
+        fav = _retag_salon(dict(raw))
+        match = next((existing for existing in kept if _same_favourite(existing, fav)), None)
+        if match is None:
+            kept.append(fav)
+            if fav.get("id"):
+                id_map[str(fav["id"])] = str(fav["id"])
+            continue
+        merged = _retag_salon(_merge_fav(match, fav))
+        kept[kept.index(match)] = merged
+        survivor = str(merged.get("id") or match.get("id") or "")
+        for old in (match.get("id"), fav.get("id")):
+            if old and survivor:
+                id_map[str(old)] = survivor
+    return kept, id_map
+
+
 def _publish_favourites() -> None:
     removed = set(st.session_state.get("removed_fav_ids") or [])
     previous = [dict(fav) for fav in st.session_state.get("favourites") or [] if fav.get("id") not in removed]
-    by_id = {fav["id"]: fav for fav in previous if fav.get("id")}
-    order = [fav["id"] for fav in previous if fav.get("id")]
+    collapsed, id_map = _collapse_favourites(previous)
+    by_id = {fav["id"]: fav for fav in collapsed if fav.get("id")}
+    order = [fav["id"] for fav in collapsed if fav.get("id")]
     for item in st.session_state.inbox:
         if _collect_status(item) != COLLECT_STATUS_DONE:
             continue
         sha = _image_sha(item)
-        for place in item.get("places") or []:
+        places = list(item.get("places") or [])
+        sole = len(places) == 1
+        for place in places:
             fid = _ensure_fav_id(place)
             if fid in removed:
                 continue
+            mapped = id_map.get(str(fid), fid)
+            if mapped in removed:
+                continue
+            place["fav_id"] = mapped
             fresh = _favourite_record(place, item)
             if sha:
                 fresh["image_shas"] = [sha]
-            match = by_id.get(fid)
-            same = getattr(trip_core, "same_favourite", None)
-            if match is None and callable(same):
-                for existing in by_id.values():
-                    if same(existing, fresh):
-                        match = existing
-                        break
+            fresh["sole_image"] = sole
+            match = by_id.get(fresh["id"])
+            for existing in list(by_id.values()):
+                if match is not None and existing.get("id") == match.get("id"):
+                    continue
+                if not _same_favourite(existing, fresh):
+                    continue
+                if match is not None and match.get("id") in by_id and match.get("id") != existing.get("id"):
+                    by_id.pop(match["id"], None)
+                    id_map[str(match["id"])] = str(existing["id"])
+                match = existing
+                break
             if match is None:
+                fresh = _retag_salon(fresh)
                 by_id[fresh["id"]] = fresh
                 order.append(fresh["id"])
+                place["fav_id"] = fresh["id"]
                 continue
-            merged = _merge_fav(match, fresh)
+            merged = _retag_salon(_merge_fav(match, fresh))
             place["fav_id"] = match["id"]
             by_id[match["id"]] = merged
-    st.session_state.favourites = [by_id[fid] for fid in order if fid in by_id]
+    final, _remap = _collapse_favourites([by_id[fid] for fid in order if fid in by_id])
+    st.session_state.favourites = final
 
 
 def _drop_favourites_for(item_id: str) -> None:
@@ -1220,7 +1320,13 @@ def _render_favourite(fav: dict) -> None:
         with left:
             _thumb(source)
         with right:
-            st.markdown(f"**{fav.get('name') or '未命名'}**")
+            name_col, edit_col = st.columns([5, 1], vertical_alignment="top")
+            with name_col:
+                st.markdown(f"**{fav.get('name') or '未命名'}**")
+            with edit_col:
+                if st.button("✎ 編輯", key=f"edit_{fav['id']}"):
+                    st.session_state.editing_fav = fav["id"]
+                    st.rerun()
             st.markdown(trip_core.attribution_html(fav.get("added_by") or "", _viewer_name()), unsafe_allow_html=True)
             tags = " ".join(
                 [f"`{fav.get('category') or '其他'}`"]
@@ -1232,9 +1338,6 @@ def _render_favourite(fav: dict) -> None:
                 f"🕒 {trip_core.public_fact(fav.get('opening_hours'))} · "
                 f"⭐ {trip_core.public_fact(fav.get('rating'), rating=True)}"
             )
-            if st.button("✎ 編輯", key=f"edit_{fav['id']}"):
-                st.session_state.editing_fav = fav["id"]
-                st.rerun()
             if st.session_state.get("editing_fav") == fav["id"]:
                 options = list(dict.fromkeys([*(fav.get("regions") or []), *trip_core.QUICK_REGION_FIXES]))
                 region_key = f"edit_regions_{fav['id']}"
@@ -1454,6 +1557,53 @@ def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -
     return trip_core.attach_place_facts(itinerary, list(known_places) + list(enriched or []))
 
 
+_WALK_RE = re.compile(r"步行|走路|徒歩|行路")
+
+
+def _transit_icon(text: str) -> str:
+    if _WALK_RE.search(text or ""):
+        return "🚶"
+    return "🚇"
+
+
+def _stop_card_html(stop: dict) -> str:
+    ai = bool(stop.get("ai"))
+    if ai:
+        source = '<span class="who-ai" style="color:#8A6A20;font-weight:600;">AI 建議</span>'
+    else:
+        who = trip_core.attribution_html(stop.get("added_by") or "", _viewer_name())
+        source = f'<span style="color:#E85D52;font-weight:600;">來自收藏</span> {who}'
+    activity = html.escape(stop.get("activity") or "")
+    hours = html.escape(str(stop.get("opening_hours") or UNVERIFIED))
+    rating = html.escape(str(stop.get("rating") or UNVERIFIED))
+    name = html.escape(stop.get("place_name") or "")
+    blurb = f'<div class="blurb">{activity}</div>' if activity else ""
+    kind = "ai-sug" if ai else ""
+    return (
+        f'<div class="stop {kind}">'
+        f'<div class="stop-time">{html.escape(stop.get("time") or "")}</div>'
+        f'<div class="stop-card">'
+        f'<div class="name">{name}</div>'
+        f'<div class="source-row">{source}</div>'
+        f"{blurb}"
+        f'<div class="meta-line">🕒 {hours} · ⭐ {rating}</div>'
+        f"</div></div>"
+    )
+
+
+def _render_timeline(stops: list[dict]) -> None:
+    chunks = ["<div class='itinerary'>"]
+    for stop in stops:
+        transit = (stop.get("transit") or "").strip()
+        if transit:
+            chunks.append(
+                f"<div class='transit'>{_transit_icon(transit)} {html.escape(transit)}</div>"
+            )
+        chunks.append(_stop_card_html(stop))
+    chunks.append("</div>")
+    st.markdown("".join(chunks), unsafe_allow_html=True)
+
+
 def _render_results() -> None:
     itinerary = st.session_state.get("itinerary")
     style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
@@ -1485,30 +1635,7 @@ def _render_results() -> None:
                 st.session_state.allow_ai = True
                 st.session_state.planned_allow_ai = True
                 st.rerun()
-        for stop in visible:
-            if stop.get("transit"):
-                st.caption(f"🚇 {stop['transit']}")
-            with st.container(border=True):
-                if stop.get("time"):
-                    st.markdown(f"**{stop['time']}**")
-                st.markdown(f"**{stop.get('place_name') or ''}**")
-                if stop.get("ai"):
-                    st.markdown(
-                        '<span class="who-ai" style="color:#8A6A20;font-weight:600;">AI 建議</span>',
-                        unsafe_allow_html=True,
-                    )
-                else:
-                    who = trip_core.attribution_html(stop.get("added_by") or "", _viewer_name())
-                    st.markdown(
-                        f'<span style="color:#E85D52;font-weight:600;">來自收藏</span> {who}',
-                        unsafe_allow_html=True,
-                    )
-                if stop.get("activity"):
-                    st.caption(stop["activity"])
-                st.caption(
-                    f"🕒 {stop.get('opening_hours') or UNVERIFIED} · "
-                    f"⭐ {stop.get('rating') or UNVERIFIED}"
-                )
+        _render_timeline(visible)
     st.markdown("**分享行程**")
     st.code(_share_url(), language=None)
     st.caption("連結可供朋友瀏覽；編輯權限與收藏收件匣分開。")

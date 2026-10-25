@@ -944,6 +944,55 @@ def test_near_duplicate_addresses_are_the_same_favourite():
     )
 
 
+def test_kchiara_stays_one_salon_when_address_or_script_drifts():
+    bare = {"name": "kchiara", "category": "shop", "address": "福岡県福岡市中央区大名"}
+    numbered = {
+        "name": "kchiara",
+        "category": "shop",
+        "address": "福岡県福岡市中央区大名1-10-14",
+    }
+    assert trip_core.looks_like_salon(bare)
+    assert trip_core.favourite_category(bare) == "美容"
+    assert trip_core.model_category(bare) == "salon"
+    assert trip_core.addresses_near(bare["address"], numbered["address"])
+    assert trip_core.addresses_near("福岡市中央區大名1-10-14", "福岡縣福岡市中央區大名")
+    assert trip_core.same_favourite(bare, numbered)
+    assert trip_core.same_favourite(
+        {"name": "kchiara", "address": numbered["address"]},
+        {"name": "キアラ", "address": bare["address"]},
+    )
+    visit = trip_core.rewrite_activity("kchiara", "參觀人氣選物店，挑選特色商品", "shop")
+    assert "選物" not in visit and "美容" in visit
+    hunt = trip_core.rewrite_activity("kchiara", "再次造訪大名區特色店舖尋寶", "購物")
+    assert "尋寶" not in hunt and "購物" not in hunt
+    title = trip_core.rewrite_trip_title(
+        "福岡 3 日悠閒美食與購物之旅",
+        [{"name": "kchiara", "category": "美容"}],
+    )
+    assert "購物" not in title and "美食" in title
+    kept = trip_core.rewrite_trip_title(
+        "福岡 3 日悠閒美食與購物之旅",
+        [{"name": "kchiara", "category": "美容"}, {"name": "無印良品", "category": "購物"}],
+    )
+    assert "購物" in kept
+    assert not trip_core.same_favourite(
+        {"name": "一蘭", "address": "福岡市", "image_shas": ["shot"], "sole_image": False},
+        {"name": "太宰府天滿宮", "address": "太宰府市", "image_shas": ["shot"], "sole_image": False},
+    )
+    shown = trip_core.present_itinerary({
+        "title": "福岡 3 日悠閒美食與購物之旅",
+        "days": [{"day": 1, "items": [{
+            "time": "12:30",
+            "place_name": "kchiara",
+            "activity": "再次造訪大名區特色店舖尋寶",
+            "transit": "步行約 15 分鐘",
+        }]}],
+    }, [{"name": "kchiara", "category": "美容", "added_by": "旅人"}], allow_ai=True)
+    assert "購物" not in shown["title"]
+    assert "尋寶" not in shown["days"][0]["items"][0]["activity"]
+    assert "美容" in shown["days"][0]["items"][0]["activity"]
+
+
 def test_infer_city_fukuoka_from_caption_address():
     places = [{
         "name": "博多炉端 魚男",

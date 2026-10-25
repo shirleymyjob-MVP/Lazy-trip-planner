@@ -118,7 +118,9 @@ _SALON_RE = re.compile(
     r"美容室|美容院|美髮|美发|理髮|理发|理容室|理容院|美甲|ネイル|ヘアサロン|hair\s*salon|髮型屋|发型屋",
     re.IGNORECASE,
 )
-_SHOPPING_COPY_RE = re.compile(r"選物|購物|逛街|血拼|買手信|手信店")
+# 福岡大名的キアラ。畫面往往只有英文店名，沒有「美容室」三個字。
+_SALON_NAME_RE = re.compile(r"kchiara|キアラ|きあら|奇阿拉", re.IGNORECASE)
+_SHOPPING_COPY_RE = re.compile(r"選物|購物|逛街|血拼|買手信|手信店|尋寶|特色商品|店舖|店铺")
 CONFIDENCE_LEVELS = ("高", "中", "低")
 _CONFIDENCE_ALIASES = {
     "high": "高", "medium": "中", "mid": "中", "low": "低",
@@ -254,14 +256,17 @@ def normalize_category(value: Any) -> str:
 
 
 def looks_like_salon(place: dict | None) -> bool:
-    """美容室／美髮／美甲唔係商店。店名、備註或類別有這些字就當 salon。"""
+    """美容室／美髮／美甲唔係商店。店名、備註或類別有這些字就當 salon。
+
+    kchiara／キアラ 是福岡大名的美容室。模型常常只回傳店名，並把類別寫成 shop。
+    """
     if not isinstance(place, dict):
         return False
     blob = " ".join(
         _clean_str(place.get(key))
         for key in ("name", "name_zh", "name_original", "notes", "category", "fav_category")
     )
-    if _SALON_RE.search(blob):
+    if _SALON_RE.search(blob) or _SALON_NAME_RE.search(blob):
         return True
     return normalize_category(place.get("category")) == "salon"
 
@@ -512,6 +517,34 @@ def rewrite_activity(place_name: str, activity: str, category: str = "") -> str:
     if not text or _SHOPPING_COPY_RE.search(text):
         return "預留時間做髮型或美容。"
     return text
+
+
+def _is_real_shop(fav: dict) -> bool:
+    """收藏裡真的是商店。美容室即使曾被標成購物，也不算。"""
+    if looks_like_salon(fav):
+        return False
+    category = _clean_str(fav.get("category"))
+    model = _clean_str(fav.get("model_category"))
+    if category in ("購物", "shop") or model == "shop":
+        return True
+    return normalize_category(category) == "shop" or normalize_category(model) == "shop"
+
+
+def rewrite_trip_title(title: str, favourites: Iterable[dict] | None = None) -> str:
+    """收藏裡只有美容室、沒有真商店時，標題不要再寫購物之旅。"""
+    text = _clean_str(title)
+    if "購物" not in text:
+        return text
+    favs = [fav for fav in (favourites or []) if isinstance(fav, dict)]
+    if not any(looks_like_salon(fav) for fav in favs):
+        return text
+    if any(_is_real_shop(fav) for fav in favs):
+        return text
+    text = text.replace("與購物", "").replace("和購物", "")
+    text = text.replace("購物之旅", "之旅").replace("購物", "")
+    text = re.sub(r"[與和]之旅", "之旅", text)
+    text = re.sub(r"\s{2,}", " ", text).strip(" 、，,")
+    return text or _clean_str(title)
 
 
 def place_regions(place: dict, item: dict | None = None) -> list[str]:
@@ -1311,6 +1344,7 @@ def parse_itinerary_response(text: str | None) -> dict:
 
 def _address_parts(address: str) -> tuple[str, list[int]]:
     text = unicodedata.normalize("NFKC", address or "").lower()
+    text = text.replace("縣", "県").replace("區", "区")
     text = re.sub(r"[\s　]", "", text)
     nums = [int(n) for n in re.findall(r"\d+", text)]
     stem = re.sub(r"[\d\-－ー−‐]+", "", text)
@@ -1319,17 +1353,27 @@ def _address_parts(address: str) -> tuple[str, list[int]]:
     return stem, nums
 
 
+def _same_street(stem_a: str, stem_b: str) -> bool:
+    """街名相同，或較短的一邊是較長地址的街名後綴（大名 ⊂ …中央区大名）。"""
+    if not stem_a or not stem_b:
+        return False
+    if stem_a == stem_b:
+        return True
+    short, long_ = (stem_a, stem_b) if len(stem_a) <= len(stem_b) else (stem_b, stem_a)
+    return len(short) >= 2 and long_.endswith(short)
+
+
 def addresses_near(left: str, right: str) -> bool:
-    """同一條街、門牌只差一號（例如 1-10-15 同 1-10-14）視為同一次核對嘅漂移。"""
+    """同一條街。門牌只差一號，或其中一邊沒寫門牌（大名 vs 大名1-10-14），都當漂移。"""
     stem_a, nums_a = _address_parts(left)
     stem_b, nums_b = _address_parts(right)
-    if not stem_a or not stem_b or not nums_a or not nums_b:
+    if not _same_street(stem_a, stem_b):
         return False
+    if not nums_a or not nums_b:
+        return True
     if len(nums_a) != len(nums_b) or nums_a[:-1] != nums_b[:-1]:
         return False
-    if abs(nums_a[-1] - nums_b[-1]) > 1:
-        return False
-    return stem_a in stem_b or stem_b in stem_a
+    return abs(nums_a[-1] - nums_b[-1]) <= 1
 
 
 def _record_name_keys(record: dict) -> set[str]:
@@ -1349,26 +1393,43 @@ def _record_image_shas(record: dict) -> set[str]:
     return found
 
 
+def _shares_salon_alias(left: dict, right: dict) -> bool:
+    """kchiara 與キアラ是同一間美容室，即使字面互不包含。"""
+    blob_a = " ".join(_record_name_keys(left))
+    blob_b = " ".join(_record_name_keys(right))
+    return bool(_SALON_NAME_RE.search(blob_a) and _SALON_NAME_RE.search(blob_b))
+
+
+def _primary_name_key(record: dict) -> str:
+    """卡上顯示的名字。不要用另一個欄位的舊值把兩間不同的店併在一起。"""
+    return _norm_key(record.get("name") or record.get("name_zh") or record.get("name_original") or "")
+
+
 def names_match(left: dict, right: dict) -> bool:
-    keys_a = _record_name_keys(left)
-    keys_b = _record_name_keys(right)
-    if keys_a & keys_b:
+    if _shares_salon_alias(left, right):
         return True
-    for key_a in keys_a:
-        for key_b in keys_b:
-            short, long = (key_a, key_b) if len(key_a) <= len(key_b) else (key_b, key_a)
-            if len(short) >= 4 and short in long:
-                return True
-    return False
+    key_a = _primary_name_key(left)
+    key_b = _primary_name_key(right)
+    if not key_a or not key_b:
+        return False
+    if key_a == key_b:
+        return True
+    short, long = (key_a, key_b) if len(key_a) <= len(key_b) else (key_b, key_a)
+    return len(short) >= 4 and short in long
 
 
 def same_favourite(left: dict, right: dict) -> bool:
-    """同名，或同一張截圖再核對出嚟嘅相近地址，都係同一張收藏卡。"""
+    """同名，或同一張截圖再核對出嚟嘅相近地址，都係同一張收藏卡。
+
+    一張圖裡有多間店時，不能只因共用圖片就把不同店併成一張。
+    """
     if names_match(left, right):
         return True
     if not (_record_image_shas(left) & _record_image_shas(right)):
         return False
-    return addresses_near(left.get("address") or "", right.get("address") or "")
+    if addresses_near(left.get("address") or "", right.get("address") or ""):
+        return True
+    return bool(left.get("sole_image") and right.get("sole_image"))
 
 
 def _favourite_keys(fav: dict) -> set[str]:
@@ -1417,7 +1478,11 @@ def present_itinerary(itinerary: dict, favourites: Iterable[dict] | None, *, all
                 "rating": public_fact((fav or {}).get("rating") or stop.get("rating"), rating=True),
             })
         days.append({**day, "items": items})
-    return {**itinerary, "days": days}
+    return {
+        **itinerary,
+        "title": rewrite_trip_title(itinerary.get("title") or "", favourites),
+        "days": days,
+    }
 
 
 def fallback_trip_title(region: str, days: int) -> str:
