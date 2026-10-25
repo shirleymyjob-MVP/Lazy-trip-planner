@@ -195,6 +195,36 @@ _RATING_EMPTY = {
 }
 
 
+_HOUR_RANGE_RE = re.compile(
+    r"\d{1,2}[:：]\d{2}\s*[-–—~～至到]\s*\d{1,2}[:：]\d{2}"
+)
+_WEEKDAY_RE = re.compile(r"[月火水木金土日]|週|星期|曜|定休|休み|祝")
+
+
+def hours_specificity(text: str) -> tuple[int, int, int]:
+    """分曜日、多過一個時段，比單一 10:00-20:00 更可信。"""
+    cleaned = _clean_str(text)
+    if not cleaned:
+        return (0, 0, 0)
+    weekday = 1 if _WEEKDAY_RE.search(cleaned) else 0
+    return (weekday, len(_HOUR_RANGE_RE.findall(cleaned)), len(cleaned))
+
+
+def prefer_printed_facts(place: dict) -> dict:
+    """畫面印住嘅分曜日時間同評分，唔好被模型收成嘅單一時段蓋過。"""
+    if not isinstance(place, dict):
+        return place
+    printed_hours = _clean_str(place.get("hours_on_image"))
+    if printed_hours and hours_specificity(printed_hours) > hours_specificity(place.get("opening_hours") or ""):
+        place["opening_hours"] = printed_hours
+    printed_rating = _clean_str(place.get("rating_on_image"))
+    if printed_rating:
+        shown = format_rating(printed_rating)
+        if shown:
+            place["rating"] = shown
+    return place
+
+
 def format_rating(value: Any) -> str:
     """整理評分成卡上可讀字串。冇把握或空值回傳空字串。"""
     v = _clean_str(value)
@@ -951,8 +981,11 @@ def normalize_place(raw: dict) -> dict | None:
         "source_images": _to_int_list(src),
         "caption_index": normalize_caption_index(raw.get("caption_index")),
         "address_on_image": _clean_str(raw.get("address_on_image")),
+        "hours_on_image": _clean_str(raw.get("hours_on_image")),
+        "rating_on_image": _clean_str(raw.get("rating_on_image")),
     }
     apply_visible_address(place)
+    prefer_printed_facts(place)
     if looks_like_salon(place):
         place["category"] = "salon"
     return place
@@ -979,9 +1012,19 @@ def _norm_key(s: str) -> str:
 
 def _merge(a: dict, b: dict) -> dict:
     merged = dict(a)
-    for key in ("name_zh", "area", "opening_hours", "rating", "address_on_image"):
+    for key in (
+        "name_zh", "area", "opening_hours", "rating", "address_on_image",
+        "hours_on_image", "rating_on_image",
+    ):
         if not merged.get(key) and b.get(key):
             merged[key] = b[key]
+    if hours_specificity(b.get("hours_on_image") or "") > hours_specificity(merged.get("hours_on_image") or ""):
+        merged["hours_on_image"] = b.get("hours_on_image")
+    if hours_specificity(b.get("opening_hours") or "") > hours_specificity(merged.get("opening_hours") or ""):
+        merged["opening_hours"] = b.get("opening_hours")
+    if b.get("rating_on_image") and not merged.get("rating_on_image"):
+        merged["rating_on_image"] = b.get("rating_on_image")
+    prefer_printed_facts(merged)
     merged["address"] = prefer_visible_address(merged.get("address") or "", b.get("address") or "")
     apply_visible_address(merged)
     if b.get("notes") and b["notes"] not in merged.get("notes", ""):

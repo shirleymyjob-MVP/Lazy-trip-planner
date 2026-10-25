@@ -1110,6 +1110,8 @@ def test_copy_link_component_uses_in_page_fallback():
     assert "execCommand" in html
     assert "writeText" in html
     assert "width: 100%" in html
+    assert "#FFF5F2" in html
+    assert "flex-direction: row" in html
     assert "已複製" in html
     assert "請長按上面的連結再複製" in html
     assert "font-size: 16px" in html
@@ -1123,6 +1125,47 @@ def test_mobile_fix_unlocks_fullscreen_images():
     assert "position" in html
     assert "92vw" in html
     assert "stImage" in html
+
+
+def test_weekday_hours_and_screenshot_rating_beat_a_flat_window():
+    printed = "月-金 11:00-20:00／土 10:00-19:00／日 定休"
+    place = trip_core.normalize_place({
+        "name": "kchiara",
+        "name_zh": "kchiara",
+        "category": "salon",
+        "area": "福岡",
+        "hours_on_image": printed,
+        "rating_on_image": "4.5",
+        "opening_hours": "10:00-20:00",
+        "rating": "4.0/5",
+    })
+    assert place["opening_hours"] == printed
+    assert place["rating"] == "4.5/5"
+    assert "hours_on_image" in gemini_client.NAMES_PROMPT
+    assert "rating_on_image" in gemini_client.NAMES_PROMPT
+    assert "10:00-20:00" in gemini_client.NAMES_PROMPT
+    schema = gemini_client.NAMES_SCHEMA.model_dump_json()
+    assert "hours_on_image" in schema and "rating_on_image" in schema
+    merged = trip_core.merge_known_places(
+        [place],
+        [trip_core.normalize_place({
+            "name": "kchiara",
+            "opening_hours": "10:00-20:00",
+            "rating": "3.9/5",
+            "address": "福岡市中央区大名1-10-15",
+        })],
+    )
+    assert merged[0]["opening_hours"] == printed
+    assert merged[0]["rating"] == "4.5/5"
+    assert "1-10-15" in merged[0]["address"]
+    flat = {"opening_hours": "10:00-20:00", "hours_on_image": ""}
+    richer = {"opening_hours": printed, "hours_on_image": printed, "name": "kchiara"}
+    upgraded = trip_core.merge_known_places(
+        [trip_core.normalize_place({"name": "kchiara", **flat, "category": "salon", "area": "福岡"})],
+        [trip_core.normalize_place({"name": "kchiara", **richer, "category": "salon", "area": "福岡"})],
+    )
+    assert "月" in upgraded[0]["opening_hours"]
+    assert upgraded[0]["opening_hours"] != "10:00-20:00"
 
 
 def test_printed_address_beats_a_nearby_guess_and_ties_keep_the_first():

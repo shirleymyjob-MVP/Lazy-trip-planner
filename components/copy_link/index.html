@@ -5,13 +5,30 @@
 <style>
   html, body { margin: 0; background: transparent; }
   body { font-family: "PingFang TC", "Noto Sans TC", "Source Sans Pro", sans-serif; }
-  .box {
+  .row {
     width: 100%;
     max-width: 100%;
     box-sizing: border-box;
     display: flex;
     flex-direction: column;
     gap: 6px;
+    position: relative;
+  }
+  .row.invite {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+    background: #FFF5F2;
+    border-radius: 12px;
+    padding: 8px 10px;
+  }
+  .invite-copy {
+    flex: 1 1 auto;
+    min-width: 0;
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.35;
+    color: #5A5A5A;
   }
   input {
     width: 100%;
@@ -24,6 +41,15 @@
     color: #2C2C2C;
     background: #FFFFFF;
   }
+  .row.invite input.offscreen {
+    position: absolute;
+    left: 0;
+    top: 0;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    opacity: 0;
+  }
   button {
     width: 100%;
     box-sizing: border-box;
@@ -34,27 +60,37 @@
     padding: 8px 12px;
     font-weight: 700;
     font-size: 14px;
+    white-space: nowrap;
+  }
+  .row.invite button {
+    width: auto;
+    flex: 0 0 auto;
   }
   #status {
     margin: 0;
-    min-height: 1em;
+    min-height: 0;
     font-size: 12px;
     text-align: center;
     color: #5A5A5A;
   }
+  .row.invite #status:empty { display: none; }
 </style>
 </head>
 <body>
-  <div class="box">
+  <div class="row" id="row">
+    <p class="invite-copy" id="invite" hidden></p>
     <input id="url" readonly aria-label="分享連結" />
     <button id="copy" type="button">複製連結</button>
     <p id="status" role="status"></p>
   </div>
   <script>
+    const row = document.getElementById("row");
+    const invite = document.getElementById("invite");
     const input = document.getElementById("url");
     const button = document.getElementById("copy");
     const statusEl = document.getElementById("status");
     let current = "";
+    let inviteLabel = "";
 
     function post(type, extra) {
       window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, extra || {}), "*");
@@ -69,15 +105,28 @@
       sendHeight();
     }
 
+    function applyMode() {
+      const compact = Boolean(inviteLabel);
+      row.classList.toggle("invite", compact);
+      invite.hidden = !compact;
+      invite.textContent = inviteLabel;
+      input.classList.toggle("offscreen", compact);
+      sendHeight();
+    }
+
     function fallbackCopy(text) {
+      input.classList.remove("offscreen");
       input.focus();
       input.select();
       input.setSelectionRange(0, text.length);
+      let ok = false;
       try {
-        return document.execCommand("copy");
+        ok = document.execCommand("copy");
       } catch (err) {
-        return false;
+        ok = false;
       }
+      if (ok && inviteLabel) input.classList.add("offscreen");
+      return ok;
     }
 
     function copyText(text) {
@@ -93,7 +142,10 @@
     button.addEventListener("click", function () {
       copyText(current).then(function (ok) {
         if (ok) setStatus("已複製");
-        else setStatus("請長按上面的連結再複製");
+        else {
+          input.classList.remove("offscreen");
+          setStatus("請長按上面的連結再複製");
+        }
       });
     });
 
@@ -102,8 +154,9 @@
       if (data.type !== "streamlit:render") return;
       const args = data.args || {};
       current = args.url || "";
+      inviteLabel = args.label || "";
       if (input.value !== current) input.value = current;
-      sendHeight();
+      applyMode();
     });
 
     post("streamlit:componentReady", { apiVersion: 1 });

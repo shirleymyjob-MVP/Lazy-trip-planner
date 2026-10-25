@@ -138,29 +138,30 @@ st.markdown(
       }
       .thumb-fallback {
         width: 56px;
-        height: 72px;
+        height: 56px;
         border-radius: 8px;
         background: #FFE8E5;
         display: flex;
         align-items: center;
         justify-content: center;
-        font-size: 22px;
+        font-size: 20px;
         flex: 0 0 56px;
       }
       .mini-card {
         display: flex;
         gap: 8px;
-        align-items: stretch;
-        max-height: 96px;
+        align-items: center;
+        max-height: 80px;
         overflow: hidden;
       }
       .mini-thumb {
         width: 56px;
-        height: 84px;
+        height: 56px;
         flex: 0 0 56px;
         object-fit: cover;
         border-radius: 8px;
         background: #FFE8E5;
+        cursor: pointer;
       }
       .mini-main { flex: 1 1 auto; min-width: 0; padding-right: 34px; }
       .mini-status, .mini-line, .mini-addr, .mini-meta {
@@ -178,12 +179,13 @@ st.markdown(
         overflow: hidden;
         text-overflow: ellipsis;
       }
-      .mini-addr {
+      .mini-addr, .mini-meta {
         display: -webkit-box;
-        -webkit-line-clamp: 2;
         -webkit-box-orient: vertical;
         overflow: hidden;
       }
+      .mini-addr { -webkit-line-clamp: 1; }
+      .mini-meta { -webkit-line-clamp: 2; }
       .tag {
         display: inline-block;
         margin-right: 4px;
@@ -284,7 +286,7 @@ st.markdown(
       }
       [data-testid="stImage"] img {
         width: 56px !important;
-        height: 72px !important;
+        height: 56px !important;
         max-width: 56px !important;
         object-fit: cover !important;
         border-radius: 8px !important;
@@ -295,6 +297,10 @@ st.markdown(
         position: absolute !important;
         z-index: 3;
         width: 32px !important;
+        max-width: 32px !important;
+        height: 32px !important;
+        max-height: 32px !important;
+        overflow: hidden !important;
         margin: 0 !important;
       }
       div[class*="st-key-edit_"],
@@ -310,6 +316,28 @@ st.markdown(
         font-size: 14px !important;
         line-height: 1 !important;
         border-radius: 8px !important;
+      }
+      div[class*="st-key-zoom_thumb_"] {
+        position: absolute !important;
+        width: 56px !important;
+        height: 56px !important;
+        max-width: 56px !important;
+        max-height: 56px !important;
+        top: 2px !important;
+        left: 6px !important;
+        overflow: hidden !important;
+        z-index: 2;
+      }
+      div[class*="st-key-zoom_thumb_"] button {
+        width: 56px !important;
+        height: 56px !important;
+        min-height: 56px !important;
+        max-height: 56px !important;
+        opacity: 0.02 !important;
+        background: transparent !important;
+        border: none !important;
+        color: transparent !important;
+        box-shadow: none !important;
       }
       div[data-testid="stPills"] [data-testid="stButtonGroup"],
       div[data-testid="stPills"] div[data-testid="stHorizontalBlock"] {
@@ -345,7 +373,13 @@ st.markdown(
         overflow: hidden !important;
       }
       div[data-testid="stLinkButton"] { max-width: 100%; }
-      div[data-testid="stLinkButton"] a { max-width: 100%; }
+      div[data-testid="stLinkButton"] a {
+        max-width: 100%;
+        background: #FF7A6E !important;
+        border: 1px solid #FF7A6E !important;
+        color: #FFFFFF !important;
+        font-weight: 700 !important;
+      }
       div.stButton > button {
         border-radius: 12px;
         font-weight: 600;
@@ -397,11 +431,26 @@ st.markdown(
       .stop-card .source-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 4px; }
       .stop-card .blurb, .stop-card .meta-line { font-size: 13px; color: #5A5A5A; line-height: 1.45; }
       .transit { font-size: 12px; color: #8A8A8A; padding: 6px 0 6px 4px; }
+      div[class*="st-key-uploader_"],
+      div[class*="st-key-inbox_paste_"] {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+      }
+      div[class*="st-key-inbox_paste_"] iframe {
+        height: 108px !important;
+        min-height: 108px !important;
+        max-height: 120px !important;
+      }
+      [data-testid="stFileUploader"] {
+        margin-top: 0 !important;
+        margin-bottom: 0 !important;
+      }
       [data-testid="stFileUploader"] section {
         border: 1.5px solid #FF7A6E !important;
-        background: #FFFFFF !important;
+        background: #FFF5F2 !important;
         border-radius: 12px !important;
-        padding: 0.4rem 0.8rem !important;
+        padding: 0.35rem 0.7rem !important;
+        min-height: 0 !important;
       }
       [data-testid="stFileUploader"] button {
         color: #E85D52;
@@ -889,16 +938,49 @@ def _remember_remark(item_id: str) -> None:
             return
 
 
+_HOUR_RANGE_RE = re.compile(r"\d{1,2}[:：]\d{2}\s*[-–—~～至到]\s*\d{1,2}[:：]\d{2}")
+_WEEKDAY_RE = re.compile(r"[月火水木金土日]|週|星期|曜|定休|休み|祝")
+
+
+def _hours_rank(text: str) -> tuple[int, int, int]:
+    cleaned = str(text or "").strip()
+    if not cleaned:
+        return (0, 0, 0)
+    weekday = 1 if _WEEKDAY_RE.search(cleaned) else 0
+    return (weekday, len(_HOUR_RANGE_RE.findall(cleaned)), len(cleaned))
+
+
+def _keep_printed_facts(place: dict) -> None:
+    """截圖上的分曜日時間同星級留喺 app.py。舊 trip_core 收成 10:00-20:00 都要改返。"""
+    if not isinstance(place, dict):
+        return
+    fn = getattr(trip_core, "prefer_printed_facts", None)
+    if callable(fn):
+        try:
+            fn(place)
+        except Exception:
+            logger.exception("prefer_printed_facts failed")
+    printed_hours = str(place.get("hours_on_image") or "").strip()
+    if printed_hours and _hours_rank(printed_hours) > _hours_rank(str(place.get("opening_hours") or "")):
+        place["opening_hours"] = printed_hours
+    printed_rating = str(place.get("rating_on_image") or "").strip()
+    if printed_rating:
+        shown = trip_core.format_rating(printed_rating) or printed_rating
+        if shown:
+            place["rating"] = shown
+
+
 def _overlay_enriched(items: list[dict], enriched: list[dict]) -> None:
     for item in items:
         item["places"] = trip_core.merge_known_places(item.get("places") or [], enriched)
         visible = getattr(trip_core, "apply_visible_address", None)
-        if callable(visible):
-            for place in item.get("places") or []:
+        for place in item.get("places") or []:
+            if callable(visible):
                 try:
                     visible(place)
                 except Exception:
                     logger.exception("apply_visible_address failed")
+            _keep_printed_facts(place)
         _apply_region(item)
 
 
@@ -1058,6 +1140,8 @@ def _favourite_record(place: dict, item: dict) -> dict:
         "address": (place.get("address") or "").strip(),
         "opening_hours": (place.get("opening_hours") or "").strip(),
         "rating": place.get("rating") or "",
+        "hours_on_image": (place.get("hours_on_image") or "").strip(),
+        "rating_on_image": (place.get("rating_on_image") or "").strip(),
         "added_by": (item.get("added_by") or "").strip() or "旅人",
         "edited": False,
         "address_on_image": (place.get("address_on_image") or "").strip(),
@@ -1067,6 +1151,7 @@ def _favourite_record(place: dict, item: dict) -> dict:
         record["category"] = "美容"
         record["model_category"] = "salon"
     _prefer_printed_address(record, place.get("notes") or "", place.get("address") or "")
+    _keep_printed_facts(record)
     return record
 
 
@@ -1235,6 +1320,13 @@ def _merge_fav(prev: dict, fresh: dict) -> dict:
     merged["edited"] = bool(prev.get("edited"))
     merged["added_by"] = prev.get("added_by") or fresh.get("added_by")
     merged["added_at"] = prev.get("added_at") or fresh.get("added_at")
+    if _hours_rank(str(fresh.get("hours_on_image") or "")) > _hours_rank(str(merged.get("hours_on_image") or "")):
+        merged["hours_on_image"] = fresh.get("hours_on_image")
+    if _hours_rank(str(fresh.get("opening_hours") or "")) > _hours_rank(str(merged.get("opening_hours") or "")):
+        merged["opening_hours"] = fresh.get("opening_hours")
+    if fresh.get("rating_on_image") and not merged.get("rating_on_image"):
+        merged["rating_on_image"] = fresh.get("rating_on_image")
+    _keep_printed_facts(merged)
     return merged
 
 
@@ -1471,14 +1563,15 @@ def _render_nav() -> None:
         st.rerun()
 
 
-def _render_copy_link(key: str) -> None:
-    _COPY(url=_share_url(), key=key)
+def _render_copy_link(key: str, *, label: str = "") -> None:
+    _COPY(url=_share_url(), label=label, key=key)
 
 
 def _render_invite() -> None:
-    st.markdown('<div class="invite-label">邀請朋友一起收集</div>', unsafe_allow_html=True)
-    st.caption("朋友打開後可加入同一收藏清單，一起貼上截圖並修改。")
-    _render_copy_link("copy_invite_link")
+    _render_copy_link(
+        "copy_invite_link",
+        label="朋友打開後可加入同一收藏清單，一起貼上截圖並修改。",
+    )
 
 
 def _data_uri(image: bytes) -> str:
@@ -1550,19 +1643,10 @@ def _google_trip_url(stops: list[dict]) -> str:
     return "https://www.google.com/maps/dir/?" + urlencode(params, safe="|")
 
 
-def _open_zoom(image: bytes | None) -> None:
-    if not image:
-        return
-    st.session_state.zoom_image = bytes(image)
-    st.rerun()
-
-
-@st.dialog("放大截圖", width="large")
-def _zoom_dialog() -> None:
-    image = st.session_state.get("zoom_image")
-    if not isinstance(image, (bytes, bytearray)) or not image:
-        return
-    uri = _data_uri(bytes(image))
+@st.dialog("放大截圖", width="large", on_dismiss="rerun")
+def _zoom_dialog(image: bytes) -> None:
+    """只可以喺撳縮圖或 ⤢ 嗰一下呼叫。唔好靠 session 喺下一次 rerun 再打開。"""
+    uri = _data_uri(image)
     st.iframe(
         (
             "<div style='margin:0;background:#1a1a1a;'>"
@@ -1574,22 +1658,17 @@ def _zoom_dialog() -> None:
         height=540,
     )
     if st.button("關閉", key="close_zoom"):
-        st.session_state.zoom_image = None
         st.rerun()
-
-
-def _maybe_zoom() -> None:
-    image = st.session_state.get("zoom_image")
-    if not isinstance(image, (bytes, bytearray)) or not image:
-        return
-    _zoom_dialog()
 
 
 def _zoom_button(image: bytes | None, key: str) -> None:
     if not isinstance(image, (bytes, bytearray)) or not image:
         return
-    if st.button("⤢", key=key, help="放大截圖"):
-        _open_zoom(bytes(image))
+    raw = bytes(image)
+    thumb = st.button("放大", key=f"zoom_thumb_{key}", help="放大截圖")
+    icon = st.button("⤢", key=f"zoom_{key}", help="放大截圖")
+    if thumb or icon:
+        _zoom_dialog(raw)
 
 
 def _collect_who(item: dict) -> str:
@@ -1601,6 +1680,7 @@ def _place_mini(item: dict, place: dict | None, *, status: str = "", who: str = 
     tags: list[str] = []
     address = hours = rating = ""
     if place:
+        _keep_printed_facts(place)
         title = (place.get("name_zh") or place.get("name") or title).strip() or title
         try:
             tags = [str(region) for region in (trip_core.place_regions(place, item) or []) if region]
@@ -1642,19 +1722,12 @@ def _fact_caption(place: dict) -> str:
 
 
 def _ingest_collect_inputs() -> None:
-    pasted = _PASTE(key=f"inbox_paste_{st.session_state.batch}", default=None)
-    decoded = trip_core.decode_clipboard_payload(pasted)
-    if decoded and decoded[0] not in st.session_state.seen_paste_ids:
-        paste_id, image, remark = decoded
-        seen = set(st.session_state.seen_paste_ids)
-        seen.add(paste_id)
-        st.session_state.seen_paste_ids = seen
-        st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark, batch=False)]
-
+    """相簿／相機係 iPhone 穩陣入口。貼上區只係電腦後備，而且要貼住上傳區。"""
     uploaded = st.file_uploader(
-        "批量上傳",
+        "從相簿或相機加入",
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
+        help="iPhone 最穩。IG 選「複製並刪除」之後，點這裡從相簿或相機揀圖。可以一次選多張。",
         key=f"uploader_{st.session_state.batch}",
     )
     uploaded = list(uploaded or [])
@@ -1682,6 +1755,15 @@ def _ingest_collect_inputs() -> None:
         ]
     st.session_state.seen_upload_ids = seen_uploads
 
+    pasted = _PASTE(key=f"inbox_paste_{st.session_state.batch}", default=None)
+    decoded = trip_core.decode_clipboard_payload(pasted)
+    if decoded and decoded[0] not in st.session_state.seen_paste_ids:
+        paste_id, image, remark = decoded
+        seen = set(st.session_state.seen_paste_ids)
+        seen.add(paste_id)
+        st.session_state.seen_paste_ids = seen
+        st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark, batch=False)]
+
 
 def _card_columns():
     return st.columns([1, 5], vertical_alignment="top")
@@ -1692,7 +1774,7 @@ def _render_collect_card(item: dict) -> None:
     who = _collect_who(item)
     places = list(item.get("places") or [])
     with st.container(border=True):
-        _zoom_button(item.get("image"), f"zoom_{item['id']}")
+        _zoom_button(item.get("image"), item["id"])
         if status == COLLECT_STATUS_DONE and places:
             blocks = [
                 _place_mini(item, place, status=status if index == 0 else "", who=who if index == 0 else "")
@@ -1741,7 +1823,7 @@ def _render_collect_card(item: dict) -> None:
                     else:
                         st.warning("請輸入店名")
         elif status == COLLECT_STATUS_DONE:
-            if st.button("改", key=f"rename_open_{item['id']}", help="改名"):
+            if st.button("✎", key=f"rename_open_{item['id']}", help="改名"):
                 st.session_state.renaming_id = item["id"]
                 st.rerun()
             if st.session_state.get("renaming_id") == item["id"]:
@@ -1815,7 +1897,7 @@ def _render_favourite(fav: dict) -> None:
     with st.container(border=True):
         source = next((item for item in st.session_state.inbox if item.get("id") == fav.get("source_item")), None)
         image = source.get("image") if isinstance(source, dict) else None
-        _zoom_button(image, f"zoom_fav_{fav['id']}")
+        _zoom_button(image, f"fav_{fav['id']}")
         if st.button("✎", key=f"edit_{fav['id']}", help="編輯"):
             st.session_state.editing_fav = fav["id"]
             st.rerun()
@@ -1823,6 +1905,7 @@ def _render_favourite(fav: dict) -> None:
         for region in fav.get("regions") or []:
             if region and region not in tags:
                 tags.append(str(region))
+        _keep_printed_facts(fav)
         address = str(fav.get("address") or "").strip()
         hours = str(fav.get("opening_hours") or "").strip()
         rating = str(fav.get("rating") or "").strip()
@@ -2216,7 +2299,7 @@ def _render_results() -> None:
     st.markdown("**分享行程**")
     maps_url = _google_trip_url(visible)
     if maps_url:
-        st.link_button("喺 Google 睇行程", maps_url, use_container_width=True)
+        st.link_button("喺 Google 睇行程", maps_url, type="primary", use_container_width=True)
     _render_copy_link("copy_result_link")
     st.caption("連結可供朋友瀏覽；編輯權限與收藏收件匣分開。")
 
@@ -2245,7 +2328,6 @@ _publish_favourites()
 
 _render_nav()
 _MOBILE(key="mobile_fix")
-_maybe_zoom()
 _render_notice()
 screen = st.session_state.get("screen") or "A"
 if not API_KEY:
