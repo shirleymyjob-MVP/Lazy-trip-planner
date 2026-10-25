@@ -288,6 +288,8 @@ def test_plan_requires_a_start_date_and_labels_collection_versus_ai():
     assert "AI 建議" in page
     assert "小美" in page and "#8A8A8A" in page
     assert "西鉄電車 約 25 分鐘" in page
+    assert "🚇" in page
+    assert "🚶" not in page
     assert "06:00-19:00" in page
     assert "未核實" in page
     assert at.session_state["usage"] == 1
@@ -387,7 +389,107 @@ def test_same_screenshot_publishes_one_favourite():
     favs = at.session_state["favourites"]
     assert len(favs) == 1
     assert "1-10-15" in favs[0]["address"]
+    assert favs[0]["category"] == "美容"
     assert not any(button.label == "從剪貼簿貼上" for button in at.button)
+
+
+def test_saved_kchiara_cards_collapse_even_with_different_ids():
+    """UAT：同一張 kchiara.png 分析兩次，地址和時間字串略有不同，仍然只能有一張美容卡。"""
+    image = _png("red")
+
+    def place(fav_id, address, hours):
+        return {
+            "fav_id": fav_id,
+            "name": "kchiara",
+            "name_zh": "kchiara",
+            "category": "shop",
+            "area": "福岡",
+            "address": address,
+            "opening_hours": hours,
+            "rating": "4.2/5",
+        }
+
+    def item(item_id, fav):
+        return {
+            "id": item_id,
+            "image": image,
+            "analysis": "done",
+            "facts": "done",
+            "places": [fav],
+            "added_by": "旅人",
+            "remark": "",
+            "batch": False,
+        }
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "C"
+    at.session_state["favourites"] = [
+        {
+            "id": "card-a",
+            "name": "kchiara",
+            "name_original": "kchiara",
+            "category": "購物",
+            "address": "福岡県福岡市中央区大名1-10-14",
+            "opening_hours": "12:00-19:00",
+            "rating": "4.2/5",
+            "added_by": "旅人",
+            "regions": ["福岡"],
+        },
+        {
+            "id": "card-b",
+            "name": "kchiara",
+            "name_original": "kchiara",
+            "category": "購物",
+            "address": "福岡県福岡市中央区大名",
+            "opening_hours": "11:00-20:00",
+            "rating": "4.2/5",
+            "added_by": "旅人",
+            "regions": ["福岡"],
+        },
+    ]
+    at.session_state["inbox"] = [
+        item("a", place("card-a", "福岡県福岡市中央区大名1-10-14", "12:00-19:00")),
+        item("b", place("card-b", "福岡県福岡市中央区大名", "11:00-20:00")),
+    ]
+    at.run()
+    assert not at.exception
+    favs = at.session_state["favourites"]
+    assert len(favs) == 1
+    assert favs[0]["category"] == "美容"
+    assert favs[0]["model_category"] == "salon"
+    assert "1-10-14" in favs[0]["address"]
+    page = _page(at)
+    assert page.count("kchiara") == 1
+    assert "購物" not in page
+
+
+def test_one_photo_with_two_places_stays_two_favourites():
+    image = _png("blue")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "C"
+    at.session_state["inbox"] = [{
+        "id": "mix",
+        "image": image,
+        "analysis": "done",
+        "facts": "done",
+        "places": [
+            {
+                "name": "一蘭", "name_zh": "一蘭", "category": "restaurant",
+                "area": "福岡", "address": "福岡市博多區中洲1-1-1",
+            },
+            {
+                "name": "太宰府天滿宮", "name_zh": "太宰府天滿宮", "category": "attraction",
+                "area": "太宰府", "address": "福岡縣太宰府市宰府4-7-1",
+            },
+        ],
+        "added_by": "旅人",
+        "remark": "",
+        "batch": False,
+    }]
+    at.run()
+    assert not at.exception
+    names = {fav["name"] for fav in at.session_state["favourites"]}
+    assert names == {"一蘭", "太宰府天滿宮"}
 
 
 def test_ai_suggestion_is_enriched_instead_of_staying_unverified():
@@ -435,6 +537,8 @@ def test_ai_suggestion_is_enriched_instead_of_staying_unverified():
     assert "4.4/5" in page
     assert "AI 建議" in page
     assert "未核實" not in page
+    assert "🚶" in page
+    assert "🚇" not in page
     assert at.session_state["usage"] == 1
 
 
