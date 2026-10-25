@@ -360,7 +360,8 @@ def test_collect_page_has_helper_and_no_clipboard_button():
     assert "查看我的收藏 →" in [button.label for button in at.button]
     assert "從剪貼簿貼上" not in [button.label for button in at.button]
     assert "貼上截圖" not in [button.label for button in at.button]
-    assert at.file_uploader[0].label == "批量上傳"
+    assert at.file_uploader[0].label == "從相簿或相機加入"
+    assert "相簿或相機" in (at.file_uploader[0].help or "")
 
 
 def test_same_screenshot_publishes_one_favourite():
@@ -957,6 +958,79 @@ def test_done_cards_put_the_newest_on_top_and_zoom_opens():
     _button(at, "⤢").click().run()
     assert not at.exception
     assert any(button.label == "關閉" for button in at.button)
+    _button(at, "查看我的收藏 →").click().run()
+    assert not at.exception
+    assert not any(button.label == "關閉" for button in at.button)
+
+
+def test_unrelated_buttons_do_not_open_the_zoom_dialog():
+    """放大只可以由縮圖或 ⤢ 打開。其他頁的常用掣唔可以彈 dialog。"""
+    image = _png("blue")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["zoom_image"] = image
+    at.session_state["screen"] = "A"
+    at.run()
+    assert not at.exception
+    assert not any(button.label == "關閉" for button in at.button)
+
+    _button(at, "先複製邀請連結").click().run()
+    assert not any(button.label == "關閉" for button in at.button)
+    _button(at, "開始收集想去的地方").click().run()
+    assert at.session_state["screen"] == "B"
+    assert not any(button.label == "關閉" for button in at.button)
+
+    at.session_state["inbox"] = [{
+        "id": "shot1",
+        "image": image,
+        "analysis": "done",
+        "facts": "done",
+        "places": [{
+            "name": "kchiara",
+            "name_zh": "kchiara",
+            "category": "salon",
+            "area": "福岡",
+            "address": "大名",
+            "opening_hours": "月-金 11:00-20:00",
+            "rating": "4.5/5",
+        }],
+        "added_by": "旅人",
+        "remark": "",
+        "batch": False,
+        "added_at": 1,
+    }]
+    at.session_state["favourites"] = [{
+        "id": "fav1",
+        "name": "kchiara",
+        "category": "美容",
+        "regions": ["福岡"],
+        "address": "大名",
+        "opening_hours": "月-金 11:00-20:00",
+        "rating": "4.5/5",
+        "added_by": "旅人",
+        "source_item": "shot1",
+    }]
+    at.session_state["screen"] = "B"
+    at.run()
+    assert any(button.label == "⤢" for button in at.button)
+    _button(at, "✎").click().run()
+    assert not any(button.label == "關閉" for button in at.button)
+
+    _button(at, "放大").click().run()
+    assert any(button.label == "關閉" for button in at.button)
+    _button(at, "關閉").click().run()
+    assert not any(button.label == "關閉" for button in at.button)
+
+    nav = [pill for pill in at.pills if pill.label == "步驟"][0]
+    for label, screen in (("收藏", "C"), ("排程", "D"), ("結果", "E"), ("開場", "A")):
+        nav.set_value(label).run()
+        assert at.session_state["screen"] == screen
+        assert not at.exception
+        assert not any(button.label == "關閉" for button in at.button)
+        if screen == "C":
+            _button(at, "✎").click().run()
+            assert not any(button.label == "關閉" for button in at.button)
+        nav = [pill for pill in at.pills if pill.label == "步驟"][0]
 
 
 def test_favourites_keep_unstamped_order_and_pencil_stays_a_button():

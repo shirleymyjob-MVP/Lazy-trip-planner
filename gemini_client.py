@@ -221,6 +221,14 @@ NAMES_SCHEMA = _S(
                         type=_T.STRING,
                         description="畫面印住嘅地址原句，例如 1-12-8 セシオ大名5階。冇就空字串",
                     ),
+                    "hours_on_image": _S(
+                        type=_T.STRING,
+                        description="畫面印住嘅營業時間原句。分曜日就逐日抄，唔好收成 10:00-20:00。冇就空字串",
+                    ),
+                    "rating_on_image": _S(
+                        type=_T.STRING,
+                        description="畫面印住嘅評分，例如 4.5 或 4.5/5。冇就空字串",
+                    ),
                     "confidence": _S(type=_T.STRING, enum=list(trip_core.CONFIDENCE_LEVELS)),
                     "source_images": _S(type=_T.ARRAY, items=_S(type=_T.INTEGER)),
                     "caption_index": _S(type=_T.INTEGER, description="說明編號，冇就 0"),
@@ -235,6 +243,8 @@ NAMES_SCHEMA = _S(
 NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前面有「圖片 #編號」）。
 只係快認店名，唔好上網搵地址、營業時間或者評分。
 畫面本身印住嘅地址要原句抄入 address_on_image（例如 1-12-8 セシオ大名5階），唔好改成你記得嘅另一個門牌。冇印住就空字串。
+畫面印住嘅營業時間原句抄入 hours_on_image。如果分曜日（月火水木金土日、定休、祝），逐日照抄，唔好收成一個 10:00-20:00。冇印住就空字串。
+畫面印住嘅星級抄入 rating_on_image，例如 4.5 或 4.5/5。冇就空字串。唔好用你記得嘅分數取代畫面。
 目的地：{destination}
 用家備註：{remarks}
 
@@ -251,6 +261,8 @@ NAMES_PROMPT = """你係旅行助手。以下係 {n} 張旅遊截圖（每張前
 福岡大名的 kchiara／キアラ／奇阿拉／きあら 是美容室，category 用 salon，唔好用 shop。
 - area：地區同城市
 - address_on_image：畫面印住嘅地址原句，包括樓層。冇就空字串
+- hours_on_image：畫面印住嘅營業時間原句。分曜日就逐日抄，唔好收成 10:00-20:00。冇就空字串
+- rating_on_image：畫面印住嘅評分，例如 4.5。冇就空字串
 - confidence：高 / 中 / 低
 - source_images：邊幾張圖
 - caption_index：① 或 1. = 1，冇編號就 0
@@ -300,8 +312,8 @@ ENRICH_PROMPT = """你係旅行助手。用 Google Maps 核對下面每個地方
 美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 - area：沿用輸入地區
 - address：Maps 上嘅地址
-- opening_hours：Maps 上嘅營業時間
-- rating：Maps 上嘅評分，例子「4.3/5」
+- opening_hours：Maps 上嘅營業時間。如果輸入已有 hours_on_image，必須沿用該句，唔好收成單一時段（例如 10:00-20:00）
+- rating：Maps 上嘅評分，例子「4.3/5」。如果輸入已有 rating_on_image，沿用畫面分數（例如 4.5/5）
 - notes：廣東話口吻一句
 - confidence：高 / 中 / 低
 - source_images：空陣列
@@ -327,8 +339,8 @@ ENRICH_TEXT_PROMPT = """你係日本旅行資料編輯。下面每個地方已�
 美容室、美髮、理髮、美甲用 salon，唔好用 shop。
 - area：沿用輸入地區
 - address：公開街道地址，包含城市
-- opening_hours：公開營業時間，例如 11:00-22:00
-- rating：公開評分，例如 4.3/5
+- opening_hours：公開營業時間，例如 11:00-22:00。輸入如果有 hours_on_image（尤其分曜日），必須沿用，唔好改成 10:00-20:00 呢類單一區間
+- rating：公開評分，例如 4.3/5。輸入如果有 rating_on_image，沿用畫面分數，例如 4.5/5
 - notes：廣東話口吻一句
 - confidence：填齊三項就高，只填到部分就中，三項都空先至低
 - source_images：空陣列
@@ -915,7 +927,11 @@ def enrich_places(
     chosen = (model or "").strip() or DEFAULT_ENRICH_MODEL
     want_maps = _maps_opt_in(use_maps) and not _maps_grounding_disabled
     slim = [
-        {k: place.get(k) for k in ("name", "name_zh", "area", "address") if place.get(k)}
+        {
+            k: place.get(k)
+            for k in ("name", "name_zh", "area", "address", "hours_on_image", "rating_on_image")
+            if place.get(k)
+        }
         for place in seeds
     ]
     seeds_json = json.dumps(slim, ensure_ascii=False, indent=1)

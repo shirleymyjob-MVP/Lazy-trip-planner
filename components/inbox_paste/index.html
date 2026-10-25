@@ -57,7 +57,7 @@
       <p>將 IG／小紅書／YouTube 截圖拖入或貼上</p>
     </div>
   </div>
-  <p id="status" role="status">手機請點一下這個框，再長按選擇貼上。</p>
+  <p id="status" role="status">電腦可以拖入或貼上。手機請用上面「從相簿或相機加入」。</p>
   <script>
     const zone = document.getElementById("zone");
     const statusEl = document.getElementById("status");
@@ -141,7 +141,7 @@
     async function ingest(file) {
       cleanupPastedNodes();
       if (!file) {
-        setStatus("沒有讀到圖片。請再長按這個框選擇貼上。");
+        setStatus("沒有讀到圖片。請用上面「從相簿或相機加入」。");
         sendHeight();
         return;
       }
@@ -186,7 +186,7 @@
           else cleanupPastedNodes();
         } catch (err) {
           cleanupPastedNodes();
-          setStatus("沒有讀到圖片。請再長按這個框選擇貼上。");
+          setStatus("沒有讀到圖片。請用上面「從相簿或相機加入」。");
           sendHeight();
         }
       }, 60);
@@ -218,7 +218,7 @@
       const file = imageFileFromData(event.dataTransfer);
       const extra = event.dataTransfer && event.dataTransfer.files ? event.dataTransfer.files.length : 0;
       ingest(file);
-      if (extra > 1) setStatus("一次放入一張。多張請用下面的批量上傳。");
+      if (extra > 1) setStatus("一次拖入一張。多張請用上面「從相簿或相機加入」。");
     });
 
     window.addEventListener("message", function (event) {
