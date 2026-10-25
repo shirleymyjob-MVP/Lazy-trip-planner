@@ -148,31 +148,50 @@ st.markdown(
         flex: 0 0 56px;
       }
       .mini-card {
-        display: flex;
-        gap: 8px;
+        display: grid;
+        grid-template-columns: 56px minmax(0, 1fr);
+        column-gap: 12px;
         align-items: center;
-        max-height: 80px;
-        overflow: hidden;
+        width: 100%;
+        max-height: none;
+        overflow: visible;
       }
-      .mini-thumb {
+      .mini-thumb-wrap {
         width: 56px;
         height: 56px;
-        flex: 0 0 56px;
-        object-fit: cover;
+        min-width: 56px;
+        max-width: 56px;
+        overflow: hidden;
+        border-radius: 8px;
+        background: #FFE8E5;
+      }
+      .mini-thumb {
+        display: block;
+        width: 56px !important;
+        height: 56px !important;
+        min-width: 0 !important;
+        max-width: 56px !important;
+        object-fit: cover !important;
         border-radius: 8px;
         background: #FFE8E5;
         cursor: pointer;
       }
-      .mini-main { flex: 1 1 auto; min-width: 0; padding-right: 34px; }
+      .mini-main {
+        min-width: 0;
+        padding: 4px 34px 4px 0;
+        display: flex;
+        flex-direction: column;
+        gap: 6px;
+      }
       .mini-status, .mini-line, .mini-addr, .mini-meta {
-        font-size: 11px;
-        line-height: 1.25;
+        font-size: 12px;
+        line-height: 1.45;
         color: #5A5A5A;
         margin: 0;
       }
       .mini-name {
-        font-size: 13px;
-        line-height: 1.25;
+        font-size: 14px;
+        line-height: 1.35;
         font-weight: 700;
         color: #2C2C2C;
         white-space: nowrap;
@@ -208,12 +227,13 @@ st.markdown(
         border-radius: 12px !important;
         box-shadow: 0 2px 12px rgba(255, 122, 110, 0.12);
         background: #FFFFFF;
-        padding: 2px 6px !important;
-        margin-bottom: 6px !important;
+        padding: 12px 10px 14px !important;
+        margin-bottom: 8px !important;
       }
       div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stVerticalBlock"],
       div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stVerticalBlock"] {
-        gap: 0.15rem !important;
+        gap: 0.4rem !important;
+        height: auto !important;
       }
       div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"],
       div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"],
@@ -358,9 +378,25 @@ st.markdown(
       [data-testid="StyledFullScreenButton"] {
         display: none !important;
       }
+      div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"],
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"],
+      div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"] > div,
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"] > div {
+        height: auto !important;
+        min-height: 0 !important;
+        display: block !important;
+      }
       div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdownContainer"],
       div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdownContainer"] {
         padding: 0 !important;
+        margin-bottom: 0 !important;
+      }
+      div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdownContainer"] img.mini-thumb,
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdownContainer"] img.mini-thumb {
+        width: 56px !important;
+        height: 56px !important;
+        max-width: 56px !important;
+        object-fit: cover !important;
       }
       div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"] p,
       div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"] p {
@@ -1646,7 +1682,10 @@ def _mini_card_html(
         meta.append(f"⭐ {html.escape(rating)}")
     if meta:
         bits.append(f'<div class="mini-meta">{" · ".join(meta)}</div>')
-    return f'<div class="mini-card">{thumb}<div class="mini-main">{"".join(bits)}</div></div>'
+    return (
+        f'<div class="mini-card"><div class="mini-thumb-wrap">{thumb}</div>'
+        f'<div class="mini-main">{"".join(bits)}</div></div>'
+    )
 
 
 def _google_trip_url(stops: list[dict]) -> str:
