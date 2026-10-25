@@ -1092,11 +1092,37 @@ def test_paste_component_is_drop_zone_without_clipboard_button():
     assert "從剪貼簿貼上" not in html
     assert "貼上截圖" not in html
     assert "clipboard.read" not in html
+    assert 'contenteditable="true"' in html
+    assert "insertFromPaste" in html
     assert "paste" in html
     assert "drop" in html
     assert "streamlit:setComponentValue" in html
     assert "<select" not in html.lower()
     assert "目的地" not in html
+
+
+def test_copy_link_component_uses_in_page_fallback():
+    html = open(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "components", "copy_link", "index.html"),
+        encoding="utf-8",
+    ).read()
+    assert "複製連結" in html
+    assert "execCommand" in html
+    assert "writeText" in html
+    assert "width: 100%" in html
+    assert "已複製" in html
+    assert "請長按上面的連結再複製" in html
+    assert "font-size: 16px" in html
+
+
+def test_mobile_fix_unlocks_fullscreen_images():
+    html = open(
+        os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "components", "mobile_fix", "index.html"),
+        encoding="utf-8",
+    ).read()
+    assert "position" in html
+    assert "92vw" in html
+    assert "stImage" in html
 
 
 def test_printed_address_beats_a_nearby_guess_and_ties_keep_the_first():

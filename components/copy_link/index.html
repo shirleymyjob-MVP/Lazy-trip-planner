@@ -1,0 +1,113 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8" />
+<style>
+  html, body { margin: 0; background: transparent; }
+  body { font-family: "PingFang TC", "Noto Sans TC", "Source Sans Pro", sans-serif; }
+  .box {
+    width: 100%;
+    max-width: 100%;
+    box-sizing: border-box;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  input {
+    width: 100%;
+    box-sizing: border-box;
+    font-size: 16px;
+    line-height: 1.3;
+    padding: 8px 10px;
+    border: 1px solid #F0E8E6;
+    border-radius: 10px;
+    color: #2C2C2C;
+    background: #FFFFFF;
+  }
+  button {
+    width: 100%;
+    box-sizing: border-box;
+    background: #FF7A6E;
+    color: #FFFFFF;
+    border: 1px solid #FF7A6E;
+    border-radius: 12px;
+    padding: 8px 12px;
+    font-weight: 700;
+    font-size: 14px;
+  }
+  #status {
+    margin: 0;
+    min-height: 1em;
+    font-size: 12px;
+    text-align: center;
+    color: #5A5A5A;
+  }
+</style>
+</head>
+<body>
+  <div class="box">
+    <input id="url" readonly aria-label="分享連結" />
+    <button id="copy" type="button">複製連結</button>
+    <p id="status" role="status"></p>
+  </div>
+  <script>
+    const input = document.getElementById("url");
+    const button = document.getElementById("copy");
+    const statusEl = document.getElementById("status");
+    let current = "";
+
+    function post(type, extra) {
+      window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, extra || {}), "*");
+    }
+
+    function sendHeight() {
+      post("streamlit:setFrameHeight", { height: Math.ceil(document.documentElement.scrollHeight) });
+    }
+
+    function setStatus(text) {
+      statusEl.textContent = text || "";
+      sendHeight();
+    }
+
+    function fallbackCopy(text) {
+      input.focus();
+      input.select();
+      input.setSelectionRange(0, text.length);
+      try {
+        return document.execCommand("copy");
+      } catch (err) {
+        return false;
+      }
+    }
+
+    function copyText(text) {
+      if (!text) return Promise.resolve(false);
+      /* 先同步 execCommand，手勢先過期的話 iOS 會當撳咗冇反應。 */
+      if (fallbackCopy(text)) return Promise.resolve(true);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        return navigator.clipboard.writeText(text).then(function () { return true; }).catch(function () { return false; });
+      }
+      return Promise.resolve(false);
+    }
+
+    button.addEventListener("click", function () {
+      copyText(current).then(function (ok) {
+        if (ok) setStatus("已複製");
+        else setStatus("請長按上面的連結再複製");
+      });
+    });
+
+    window.addEventListener("message", function (event) {
+      const data = event.data || {};
+      if (data.type !== "streamlit:render") return;
+      const args = data.args || {};
+      current = args.url || "";
+      if (input.value !== current) input.value = current;
+      sendHeight();
+    });
+
+    post("streamlit:componentReady", { apiVersion: 1 });
+    sendHeight();
+  </script>
+</body>
+</html>

@@ -21,6 +21,7 @@ def test_save_and_load_round_trip(monkeypatch, tmp_path):
             "region_confidence": "高",
             "warning": "",
             "added_by": "Ada",
+            "added_at": 99.5,
             "image": b"\xff\xd8fake",
         }],
         "itinerary": {"title": "試"},
@@ -40,6 +41,7 @@ def test_save_and_load_round_trip(monkeypatch, tmp_path):
     loaded = trip_store.load_trip(token)
     assert loaded is not None
     assert loaded["inbox"][0]["added_by"] == "Ada"
+    assert loaded["inbox"][0]["added_at"] == 99.5
     assert loaded["inbox"][0]["regions"] == ["福岡", "東京"]
     assert loaded["inbox"][0]["image"] == b"\xff\xd8fake"
     assert loaded["itinerary"]["title"] == "試"
