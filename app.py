@@ -1803,7 +1803,7 @@ def _render_collect_card(item: dict) -> None:
         elif status == COLLECT_STATUS_RUNNING:
             st.caption("正在識別截圖…")
         elif status == COLLECT_STATUS_FAIL:
-            st.caption(item.get("warning") or "可能是風景或截圖過於模糊。")
+            st.caption(item.get("warning") or "認唔到店名。畫面有大字店名就可以手動輸入。")
             if st.button("重試", key=f"retry_{item['id']}"):
                 item["places"] = []
                 item["facts"] = ""

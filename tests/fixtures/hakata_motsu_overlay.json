@@ -1,0 +1,12 @@
+{
+  "case": "IG Reel food close-up with a center overlay shop name",
+  "visible_text": [
+    "福岡5間",
+    "不吃會後悔的美食",
+    "博多もつ將",
+    "超會烤牛腸老闆"
+  ],
+  "expected_name": "博多もつ將",
+  "expected_area": "博多, 福岡",
+  "expected_category": "restaurant"
+}
