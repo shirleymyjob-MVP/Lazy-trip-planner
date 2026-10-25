@@ -466,6 +466,14 @@ st.markdown(
       .stop-card .name { font-size: 16px; font-weight: 700; margin-bottom: 4px; color: #2C2C2C; }
       .stop-card .source-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 4px; }
       .stop-card .blurb, .stop-card .meta-line { font-size: 13px; color: #5A5A5A; line-height: 1.45; }
+      .stop-card .stop-map {
+        display: inline-block;
+        margin-top: 8px;
+        color: #E85D52;
+        font-weight: 700;
+        font-size: 13px;
+        text-decoration: none;
+      }
       .transit { font-size: 12px; color: #8A8A8A; padding: 6px 0 6px 4px; }
       div[class*="st-key-uploader_"],
       div[class*="st-key-inbox_paste_"] {
@@ -2178,7 +2186,9 @@ def _suggested_seeds(itinerary: dict, known_places: list[dict]) -> list[dict]:
         for stop in day.get("items") or []:
             if trip_core.match_place(stop, known_places):
                 continue
-            name = (stop.get("place_name") or "").strip()
+            name = trip_core.strip_ai_label(stop.get("place_name") or "")
+            if not name or trip_core.generic_suggestion_name(name):
+                continue
             key = trip_core._norm_key(name)
             if not key or key in seen:
                 continue
@@ -2194,8 +2204,18 @@ def _suggested_seeds(itinerary: dict, known_places: list[dict]) -> list[dict]:
     return seeds
 
 
+def _itinerary_has_generic_suggestion(itinerary: dict, known_places: list[dict]) -> bool:
+    for day in itinerary.get("days") or []:
+        for stop in day.get("items") or []:
+            if trip_core.match_place(stop, known_places):
+                continue
+            if trip_core.generic_suggestion_name(stop.get("place_name") or ""):
+                return True
+    return False
+
+
 def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -> dict:
-    """AI 建議用同一條文字核對，失敗就保持未核實，唔好拖垮成個行程。"""
+    """真實店名先核對資料。空殼名改搵錨點附近嘅真實店，搵唔到就唔插。"""
     seeds = _suggested_seeds(itinerary, known_places)
     enriched: list[dict] = []
     if seeds:
@@ -2205,7 +2225,23 @@ def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -
         except Exception:  # noqa: BLE001
             logger.exception("AI suggestion enrich failed")
             enriched = []
-    return trip_core.attach_place_facts(itinerary, list(known_places) + list(enriched or []))
+    attached = trip_core.attach_place_facts(itinerary, list(known_places) + list(enriched or []))
+    nearby: list[dict] = []
+    if _itinerary_has_generic_suggestion(attached, known_places):
+        status.write("搵收藏地點附近的真實高評分餐廳或景點。")
+        try:
+            found = gemini_client.suggest_nearby(
+                _client(),
+                ENRICH_MODEL,
+                known_places,
+                limit=4,
+                use_maps=USE_MAPS,
+            )
+            nearby = list(getattr(found, "places", None) or [])
+        except Exception:  # noqa: BLE001
+            logger.exception("Nearby suggestion lookup failed")
+            nearby = []
+    return trip_core.replace_generic_suggestions(attached, known_places, nearby)
 
 
 _WALK_RE = re.compile(r"步行|走路|徒歩|行路")
@@ -2215,6 +2251,20 @@ def _transit_icon(text: str) -> str:
     if _WALK_RE.search(text or ""):
         return "🚶"
     return "🚇"
+
+
+def _stop_maps_url(stop: dict) -> str:
+    name = (stop.get("place_name") or "").strip()
+    if not name:
+        return ""
+    address = (stop.get("address") or "").strip()
+    area = (stop.get("area") or "").strip()
+    query = " ".join(part for part in (name, address or area) if part).strip()
+    if not query:
+        query = (stop.get("maps_query") or "").strip()
+    if not query:
+        return ""
+    return "https://www.google.com/maps/search/?api=1&query=" + quote(query)
 
 
 def _stop_card_html(stop: dict) -> str:
@@ -2228,7 +2278,14 @@ def _stop_card_html(stop: dict) -> str:
     hours = html.escape(str(stop.get("opening_hours") or UNVERIFIED))
     rating = html.escape(str(stop.get("rating") or UNVERIFIED))
     name = html.escape(stop.get("place_name") or "")
+    address = (stop.get("address") or "").strip()
     blurb = f'<div class="blurb">{activity}</div>' if activity else ""
+    addr_html = f'<div class="meta-line">📍 {html.escape(address)}</div>' if address else ""
+    maps_url = _stop_maps_url(stop)
+    maps_html = (
+        f'<a class="stop-map" href="{html.escape(maps_url, quote=True)}" target="_blank" rel="noopener">Google 地圖</a>'
+        if maps_url else ""
+    )
     kind = "ai-sug" if ai else ""
     return (
         f'<div class="stop {kind}">'
@@ -2237,7 +2294,9 @@ def _stop_card_html(stop: dict) -> str:
         f'<div class="name">{name}</div>'
         f'<div class="source-row">{source}</div>'
         f"{blurb}"
+        f"{addr_html}"
         f'<div class="meta-line">🕒 {hours} · ⭐ {rating}</div>'
+        f"{maps_html}"
         f"</div></div>"
     )
 

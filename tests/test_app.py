@@ -303,6 +303,9 @@ def test_plan_requires_a_start_date_and_labels_collection_versus_ai():
     assert maps[0].proto.url.startswith("https://www.google.com/maps/dir/")
     decoded = unquote(maps[0].proto.url)
     assert "太宰府天滿宮" in decoded and "大濠公園" in decoded
+    assert page.count("Google 地圖") >= 2
+    assert "maps/search" in page
+    assert "query=%E5%A4%AA%E5%AE%B0%E5%BA%9C%E5%A4%A9%E6%BB%BF%E5%AE%AE" in page or "太宰府天滿宮" in page
 
 
 def test_plan_failure_does_not_spend_a_turn():
@@ -558,6 +561,57 @@ def test_ai_suggestion_is_enriched_instead_of_staying_unverified():
     assert "🚶" in page
     assert "🚇" not in page
     assert at.session_state["usage"] == 1
+
+
+def test_generic_ai_shell_is_replaced_before_the_results_page():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "D"
+    at.session_state["start_date"] = date(2026, 11, 14)
+    at.session_state["favourites"] = [_fav(added_by="小美")]
+    at.session_state["allow_ai"] = True
+    at.run()
+    fake = {
+        "title": "福岡一日",
+        "days": [{"day": 1, "area": "福岡", "items": [
+            {
+                "time": "09:00", "place_name": "太宰府天滿宮", "activity": "參拜。",
+                "is_meal": False, "maps_query": "太宰府天滿宮", "transit": "",
+            },
+            {
+                "time": "12:30", "place_name": "天神網紅餐廳 (AI建議)", "activity": "打卡食午餐。",
+                "is_meal": True, "maps_query": "天神", "transit": "地鐵 約 25 分鐘",
+            },
+        ]}],
+        "tips": [],
+    }
+    nearby = gemini_client.AnalysisResult([{
+        "name": "一蘭 天神店",
+        "name_zh": "一蘭 天神店",
+        "category": "restaurant",
+        "area": "天神",
+        "address": "福岡市中央區天神2-1-1",
+        "opening_hours": "11:00-22:00",
+        "rating": "4.3/5",
+        "notes": "天神站附近，有公開評分。",
+    }], [])
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=fake), \
+         mock.patch.object(gemini_client, "suggest_nearby", return_value=nearby) as nearby_call:
+        _button(at, "開始排行程").click().run()
+    assert not at.exception
+    assert nearby_call.call_count == 1
+    page = _page(at)
+    assert "天神網紅餐廳" not in page
+    assert "打卡熱點" not in page
+    assert "一蘭 天神店" in page
+    assert "福岡市中央區天神2-1-1" in page
+    assert "11:00-22:00" in page
+    assert "4.3/5" in page
+    assert "AI 建議" in page
+    assert page.count("Google 地圖") >= 2
+    saved = at.session_state["itinerary"]["days"][0]["items"]
+    assert [item["place_name"] for item in saved] == ["太宰府天滿宮", "一蘭 天神店"]
 
 
 def test_missing_trip_style_constant_still_opens_and_shows_build(monkeypatch):

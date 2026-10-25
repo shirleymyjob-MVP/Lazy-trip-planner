@@ -958,6 +958,97 @@ def garbled_place_name(name: str) -> bool:
     return bool(_GARBLED_SCRIPT_RE.search(name or ""))
 
 
+_GENERIC_SUGGESTION_RE = re.compile(
+    r"打卡|網紅|熱點|潮流|網美|人氣店|人氣餐廳|必去|必吃|推薦店|特色店|"
+    r"市中心|附近餐廳|附近景點|當地美食|網紅店|打卡點"
+)
+_AI_LABEL_RE = re.compile(r"[（(]\s*AI\s*建議\s*[）)]")
+_AREA_CATEGORY_RE = re.compile(
+    r"^[\u4e00-\u9fffA-Za-z]{1,10}(餐廳|餐館|景點|景點|咖啡|咖啡廳|咖啡店|Cafe|CAFE|甜品店|商店)$"
+)
+
+
+def strip_ai_label(name: str) -> str:
+    return _AI_LABEL_RE.sub("", name or "").strip()
+
+
+def generic_suggestion_name(name: str) -> bool:
+    """「福岡市中心打卡熱點」「天神網紅餐廳」唔係實體店名。"""
+    text = strip_ai_label(name)
+    if not text or garbled_place_name(text):
+        return True
+    if _GENERIC_SUGGESTION_RE.search(text):
+        return True
+    return bool(_AREA_CATEGORY_RE.fullmatch(text))
+
+
+def suggestion_is_verifiable(place: dict) -> bool:
+    """真實店名，而且有地址、營業時間或評分可以核對。空殼名一律唔算。"""
+    name = strip_ai_label(place.get("name_zh") or place.get("name") or "")
+    if generic_suggestion_name(name):
+        return False
+    address = _clean_str(place.get("address"))
+    hours = _clean_str(place.get("opening_hours"))
+    rating = _clean_str(place.get("rating"))
+    if address and address != UNVERIFIED:
+        return True
+    if hours and hours != UNVERIFIED and re.search(r"\d", hours):
+        return True
+    return bool(rating and rating != UNVERIFIED and re.search(r"\d", rating))
+
+
+def replace_generic_suggestions(
+    itinerary: dict,
+    known_places: Iterable[dict] | None,
+    nearby_places: Iterable[dict] | None,
+) -> dict:
+    """空殼 AI 建議換成已核對嘅附近真實店。換唔到就唔插，唔好留假名。"""
+    known = list(known_places or [])
+    pool: list[dict] = []
+    seen: set[str] = set()
+    for place in nearby_places or []:
+        if not suggestion_is_verifiable(place):
+            continue
+        name = strip_ai_label(place.get("name_zh") or place.get("name") or "")
+        key = _norm_key(name)
+        if not key or key in seen or match_place({"place_name": name}, known):
+            continue
+        seen.add(key)
+        pool.append({**place, "name": place.get("name") or name, "name_zh": name})
+    days = []
+    for day in itinerary.get("days") or []:
+        items = []
+        for stop in day.get("items") or []:
+            cloned = dict(stop)
+            if match_place(cloned, known):
+                items.append(cloned)
+                continue
+            cleaned = strip_ai_label(cloned.get("place_name") or "")
+            if cleaned and not generic_suggestion_name(cleaned):
+                cloned["place_name"] = cleaned
+                items.append(cloned)
+                continue
+            if not pool:
+                continue
+            place = pool.pop(0)
+            name = strip_ai_label(place.get("name_zh") or place.get("name") or "")
+            address = _clean_str(place.get("address"))
+            area = _clean_str(place.get("area")) or _clean_str(day.get("area"))
+            items.append({
+                **cloned,
+                "place_name": name,
+                "activity": _clean_str(place.get("notes")) or "順路可以去呢間附近、有公開資料嘅店。",
+                "maps_query": " ".join(part for part in (name, address or area) if part),
+                "address": address,
+                "opening_hours": _clean_str(place.get("opening_hours")),
+                "rating": _clean_str(place.get("rating")),
+                "area": area,
+                "is_meal": bool(cloned.get("is_meal")) or place.get("category") in {"restaurant", "cafe", "dessert"},
+            })
+        days.append({**day, "items": items})
+    return {**itinerary, "days": days}
+
+
 # IG Reels 標題句。中央大字店名（博多もつ將）有假名，唔好當標題丟掉。
 _LISTICLE_TITLE_RE = re.compile(r"不吃會後悔|不吃会后悔|必吃|必去|攻略|合集|的美食|老闆$|老板$")
 _COUNT_TITLE_RE = re.compile(r"\d+\s*間")
@@ -1605,6 +1696,7 @@ def present_itinerary(itinerary: dict, favourites: Iterable[dict] | None, *, all
                 "hidden": ai and not allow_ai,
                 "added_by": (fav or {}).get("added_by") or "",
                 "activity": rewrite_activity(stop.get("place_name") or "", stop.get("activity") or "", category),
+                "address": (fav or {}).get("address") or stop.get("address") or "",
                 "opening_hours": public_fact((fav or {}).get("opening_hours") or stop.get("opening_hours")),
                 "rating": public_fact((fav or {}).get("rating") or stop.get("rating"), rating=True),
             })
