@@ -312,7 +312,7 @@ ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方�
 - 美容室、美髮、理髮、美甲唔好當成購物。activity 要寫做髮型或美容，唔好寫參觀選物店、購物或逛街
 - kchiara／キアラ／奇阿拉是美容室。標題同 activity 唔好寫購物、選物店、尋寶或購物之旅。步行就寫步行，唔好寫成地鐵
 - 每一日只放該日的地點，唔好把第一日的清單複製到 Day 2、Day 3
-- 其他要求如果話只可以排清單入面的地方，就唔好加新店。如果話可以加入 AI 建議，先可以加清單以外的地方
+- 其他要求如果話只可以排清單入面的地方，就唔好加新店。如果話可以加入 AI 建議，先可以加清單以外的地方。新地點必須係清單入面某個錨點附近、地圖查得到嘅真實店名或景點名，盡量帶地址同評分。禁止「打卡熱點」「網紅餐廳」「潮流Cafe」「人氣店」同任何「(AI建議)」空殼名。搵唔到真實附近點就唔好加嗰一站
 - maps_query：原文名 + 地址或地區，方便 Google Maps
 - tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實營業時間"""
 
@@ -361,6 +361,24 @@ ENRICH_TEXT_PROMPT = """你係日本旅行資料編輯。下面每個地方已�
 - notes：廣東話口吻一句
 - confidence：填齊三項就高，只填到部分就中，三項都空先至低
 - source_images：空陣列
+"""
+
+NEARBY_PROMPT = """你係旅行編輯。客人已經收藏咗下面嘅真實地點。請喺呢啲錨點附近，推薦真實存在、高評分或高人氣嘅餐廳或景點。
+錨點（JSON）：
+{anchors_json}
+最多 {limit} 個。可以少過，唔好為咗湊數而作假。
+
+規則：
+- 每個 name 必須係地圖上查得到嘅實體店名或景點名，例如「一蘭 天神店」「太宰府天滿宮」。
+- 禁止空泛名：打卡熱點、網紅餐廳、潮流Cafe、人氣店、市中心景點、任何帶「AI建議」嘅標題。
+- 必須靠近錨點嘅地區（同一區，或短程地鐵），唔好跳去另一個城市。
+- 唔好重複錨點本身。
+- address、opening_hours、rating 用公開資料。查唔到就留空字串，唔好估門牌或分數。
+- notes 用一句廣東話講點解適合順路。
+- category：restaurant / cafe / dessert / attraction / shop / salon / other
+
+只回傳 JSON。可以用 ```json 圍住。格式：
+{{"places":[{{"name":"","name_zh":"","category":"restaurant","area":"","address":"","opening_hours":"","rating":"","notes":"","confidence":"中","source_images":[],"caption_index":0}}]}}
 """
 
 
@@ -1041,6 +1059,81 @@ def _itinerary_http_options() -> types.HttpOptions:
         timeout=ITINERARY_TIMEOUT_MS,
         retry_options=types.HttpRetryOptions(attempts=ITINERARY_HTTP_ATTEMPTS),
     )
+
+
+def suggest_nearby(
+    client,
+    model: str | None,
+    anchors: list[dict],
+    *,
+    limit: int = 4,
+    parse_attempts: int = 1,
+    retry_sleep: float = 0.4,
+    use_maps: bool | str | None = None,
+) -> AnalysisResult:
+    """喺客人已有地點附近搵真實高評分店。Maps 429 就改文字，假名同冇資料嘅結果會丟掉。"""
+    global _maps_grounding_disabled
+    anchors = [place for place in anchors or [] if (place.get("name") or place.get("name_zh"))]
+    if not anchors:
+        return AnalysisResult([], [])
+    chosen = (model or "").strip() or DEFAULT_ENRICH_MODEL
+    cap = max(1, min(int(limit), 6))
+    slim = [
+        {
+            k: place.get(k)
+            for k in ("name", "name_zh", "area", "address", "category")
+            if place.get(k)
+        }
+        for place in anchors
+    ]
+    prompt = NEARBY_PROMPT.format(
+        anchors_json=json.dumps(slim, ensure_ascii=False, indent=1),
+        limit=cap,
+    )
+    want_maps = _maps_opt_in(use_maps) and not _maps_grounding_disabled
+    maps_tool = types.Tool(google_maps=types.GoogleMaps())
+
+    def once(*, use_maps: bool):
+        return _generate_parsed(
+            client,
+            chosen,
+            prompt,
+            None if use_maps else ENRICH_SCHEMA,
+            0.2,
+            trip_core.parse_places_response,
+            failure_message="附近推薦暫時搵唔到，已略過空殼建議。",
+            parse_attempts=parse_attempts,
+            retry_sleep=retry_sleep,
+            http_options=_enrich_http_options(),
+            tools=[maps_tool] if use_maps else None,
+        )
+
+    warnings: list[str] = []
+    try:
+        if want_maps:
+            try:
+                found = once(use_maps=True)
+            except GeminiError as err:
+                if not _maps_grounding_blocked(err):
+                    raise
+                logger.info("Maps grounding blocked for nearby (%s); using text", err)
+                _maps_grounding_disabled = True
+                warnings.append(MAPS_UNAVAILABLE_WARNING)
+                found = once(use_maps=False)
+        else:
+            found = once(use_maps=False)
+    except GeminiError:
+        logger.exception("Nearby suggestion lookup failed")
+        return AnalysisResult([], ["附近真實推薦暫時搵唔到。"])
+    kept = []
+    for place in trip_core.dedupe_places(found or []):
+        if trip_core.suggestion_is_verifiable(place):
+            kept.append(place)
+        if len(kept) >= cap:
+            break
+    if not kept:
+        warnings.append("附近冇核對到真實店名，已略過空殼建議。")
+    return AnalysisResult(kept, warnings)
 
 
 def generate_itinerary(client, model: str | None, places: list[dict], days: int,

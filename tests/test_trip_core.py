@@ -1239,6 +1239,62 @@ def test_printed_address_beats_a_nearby_guess_and_ties_keep_the_first():
     assert "セシオ" in place["address_on_image"]
 
 
+def test_generic_ai_shells_are_replaced_by_verified_nearby_places():
+    assert trip_core.generic_suggestion_name("福岡市中心打卡熱點 (AI建議)")
+    assert trip_core.generic_suggestion_name("天神網紅餐廳")
+    assert trip_core.generic_suggestion_name("中洲潮流Cafe (AI建議)")
+    assert not trip_core.generic_suggestion_name("一蘭 天神店")
+    assert not trip_core.generic_suggestion_name("太宰府天滿宮")
+    assert not trip_core.generic_suggestion_name("一蘭 (AI建議)")
+    real = {
+        "name": "一蘭 天神店",
+        "name_zh": "一蘭 天神店",
+        "category": "restaurant",
+        "area": "天神",
+        "address": "福岡市中央區天神2-1-1",
+        "opening_hours": "11:00-22:00",
+        "rating": "4.3/5",
+        "notes": "天神站附近，有公開評分。",
+    }
+    assert trip_core.suggestion_is_verifiable(real)
+    assert not trip_core.suggestion_is_verifiable({
+        "name": "天神網紅餐廳",
+        "address": "福岡市中央區",
+        "rating": "4.8/5",
+    })
+    assert not trip_core.suggestion_is_verifiable({"name": "一蘭 天神店"})
+    shown = trip_core.replace_generic_suggestions({
+        "title": "福岡一日",
+        "days": [{"day": 1, "area": "福岡", "items": [
+            {
+                "time": "18:30", "place_name": "すみ劇場一六八", "activity": "晚餐",
+                "is_meal": True, "maps_query": "すみ劇場一六八",
+            },
+            {
+                "time": "15:00", "place_name": "中洲潮流Cafe (AI建議)", "activity": "打卡下午茶",
+                "is_meal": False, "maps_query": "中洲",
+            },
+            {
+                "time": "10:00", "place_name": "福岡市中心打卡熱點 (AI建議)", "activity": "打卡",
+                "is_meal": False, "maps_query": "福岡",
+            },
+        ]}],
+    }, [{"name": "すみ劇場一六八", "name_zh": "すみ劇場一六八"}], [real])
+    names = [item["place_name"] for item in shown["days"][0]["items"]]
+    assert names == ["すみ劇場一六八", "一蘭 天神店"]
+    ichiran = shown["days"][0]["items"][1]
+    assert ichiran["address"] == "福岡市中央區天神2-1-1"
+    assert ichiran["opening_hours"] == "11:00-22:00"
+    assert ichiran["rating"] == "4.3/5"
+    assert "打卡" not in ichiran["activity"]
+    dropped = trip_core.replace_generic_suggestions({
+        "days": [{"day": 1, "items": [
+            {"time": "10:00", "place_name": "天神網紅餐廳 (AI建議)", "activity": "食飯", "is_meal": True},
+        ]}],
+    }, [], [])
+    assert dropped["days"][0]["items"] == []
+
+
 def test_garbled_ai_stop_is_dropped_and_cloned_days_go_blank():
     assert trip_core.garbled_place_name("Café Del ม")
     assert not trip_core.garbled_place_name("kchiara")
