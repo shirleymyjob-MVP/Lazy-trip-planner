@@ -1,7 +1,7 @@
-"""懶人行程規劃 — Streamlit entry point.
+"""懶人出行 — Streamlit entry point.
 
-MVP：貼上截圖放入行程匣（可寫備註，未填行程都收）→ 稍後先選目的地／日數／偏好
-→ 揀行程匣項目 → 按營業時間、距離同偏好排行程。
+收集截圖（先不分析）→ 開始分析（店名，再核實地址／時間／評分）→ 我的收藏
+→ 一鍵排行程 → 結果。收費維持待定，不擋住排程。
 """
 from __future__ import annotations
 
@@ -24,7 +24,31 @@ import trip_store
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("lazy_trip_planner")
 
-st.set_page_config(page_title="懶人行程規劃 (原型)", page_icon="✈️", layout="centered")
+st.set_page_config(page_title="懶人出行 ✈️", page_icon="✈️", layout="centered")
+st.markdown(
+    """
+    <style>
+      .stApp { background: linear-gradient(180deg, #FFF8F5 0%, #FFFFFF 240px); }
+      h1, h2, h3 { color: #2C2C2C; }
+      div.stButton > button[kind="primary"] {
+        background: #FF7A6E;
+        border: 1px solid #FF7A6E;
+        color: #FFFFFF;
+      }
+      div.stButton > button[kind="primary"]:hover {
+        background: #E85D52;
+        border-color: #E85D52;
+        color: #FFFFFF;
+      }
+      div.stButton > button[kind="secondary"] {
+        background: #FFFFFF;
+        color: #E85D52;
+        border: 1.5px solid #FF7A6E;
+      }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 MAX_IMAGES_PER_UPLOAD = 10
 # 認完店名之後一次過搵公開資料。多過呢個數就留待下一輪，避免一次 prompt 太長。
@@ -114,6 +138,13 @@ def init_state():
     st.session_state.setdefault("inbox_region_filter", "全部")
     st.session_state.setdefault("display_name", "旅人")
     st.session_state.setdefault("members", [])
+    st.session_state.setdefault("screen", "A")
+    st.session_state.setdefault("favourites", [])
+    st.session_state.setdefault("removed_fav_ids", [])
+    st.session_state.setdefault("trip_style", trip_core.DEFAULT_TRIP_STYLE)
+    st.session_state.setdefault("allow_ai", True)
+    st.session_state.setdefault("day_count", 3)
+    st.session_state.setdefault("show_invite", False)
 
 
 def remaining_quota() -> int:
@@ -139,7 +170,11 @@ def _upload_key(uploaded_file) -> str:
     return hashlib.sha256(uploaded_file.getvalue()).hexdigest()
 
 
-def _new_item(image: bytes, remark: str) -> dict:
+def _viewer_name() -> str:
+    return (st.session_state.get("display_name") or "旅人").strip() or "旅人"
+
+
+def _new_item(image: bytes, remark: str, *, batch: bool = False) -> dict:
     number = st.session_state.next_image_num
     st.session_state.next_image_num = number + 1
     return {
@@ -148,13 +183,15 @@ def _new_item(image: bytes, remark: str) -> dict:
         "image": image,
         "remark": (remark or "").strip(),
         "status": "未排程",
-        "analysis": "pending",
+        "analysis": "idle",
+        "facts": "",
+        "batch": batch,
         "places": [],
         "city": "",
         "regions": [],
         "region_confidence": trip_core.REGION_LOW,
         "warning": "",
-        "added_by": (st.session_state.get("display_name") or "旅人").strip() or "旅人",
+        "added_by": _viewer_name(),
     }
 
 
@@ -253,7 +290,7 @@ def _recognize_pending():
     succeeded = False
     warnings: list[str] = []
     with st.status(f"認緊 {len(pending)} 張新截圖嘅店名…", expanded=True) as status:
-        status.write("認完店名，會再搵公開地址、營業時間、評分。")
+        status.write("先辨識店名同地區，接著核實地址、營業時間、評分。")
         for remark, items in groups:
             images = [item["image"] for item in items]
             try:
@@ -365,6 +402,14 @@ def _apply_loaded_trip(loaded: dict) -> None:
     for key in _TRIP_FIELDS:
         if loaded.get(key) is not None:
             st.session_state[key] = loaded[key]
+    st.session_state.favourites = list(loaded.get("favourites") or [])
+    st.session_state.removed_fav_ids = list(loaded.get("removed_fav_ids") or [])
+    if loaded.get("trip_style"):
+        st.session_state.trip_style = loaded["trip_style"]
+    if "allow_ai" in loaded:
+        st.session_state.allow_ai = bool(loaded.get("allow_ai"))
+    if loaded.get("day_count"):
+        st.session_state.day_count = int(loaded["day_count"])
     picks = loaded.get("picks") or {}
     for item in st.session_state.inbox:
         st.session_state[f"pick_{item['id']}"] = bool(picks.get(item["id"], True))
@@ -419,6 +464,11 @@ def _snapshot() -> dict:
         "next_image_num": st.session_state.next_image_num,
         "picks": picks,
         "members": members,
+        "favourites": list(st.session_state.get("favourites") or []),
+        "removed_fav_ids": list(st.session_state.get("removed_fav_ids") or []),
+        "trip_style": st.session_state.get("trip_style") or trip_core.DEFAULT_TRIP_STYLE,
+        "allow_ai": bool(st.session_state.get("allow_ai")),
+        "day_count": int(st.session_state.get("day_count") or 3),
         **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
     }
 
@@ -541,7 +591,7 @@ def _enrich_inbox_facts() -> None:
             item["facts"] = "done"
         return
     try:
-        with st.status("認緊資料…", expanded=True) as status:
+        with st.status("資料核實中…", expanded=True) as status:
             status.write("用店名搵公開地址、營業時間、評分。")
             result = _enrich_result(batch)
             _overlay_enriched(targeted, result.places)
@@ -604,211 +654,675 @@ def _recognize_later() -> None:
         return
     if any(item.get("analysis") == "pending" for item in st.session_state.inbox):
         _recognize_pending()
+        _publish_favourites()
         st.rerun()
     if any(item.get("facts") == "pending" for item in st.session_state.inbox):
         _enrich_inbox_facts()
+        _publish_favourites()
         st.rerun()
+
+
+def _ensure_fav_id(place: dict) -> str:
+    if not place.get("fav_id"):
+        place["fav_id"] = uuid.uuid4().hex[:16]
+    return str(place["fav_id"])
+
+
+def _favourite_record(place: dict, item: dict) -> dict:
+    name = (place.get("name_zh") or place.get("name") or "").strip()
+    original = (place.get("name") or name).strip()
+    return {
+        "id": _ensure_fav_id(place),
+        "source_item": item.get("id") or "",
+        "name": name or original,
+        "name_zh": place.get("name_zh") or "",
+        "name_original": original,
+        "category": trip_core.favourite_category(place),
+        "model_category": place.get("category") or "other",
+        "regions": trip_core.place_regions(place, item),
+        "address": (place.get("address") or "").strip(),
+        "opening_hours": (place.get("opening_hours") or "").strip(),
+        "rating": place.get("rating") or "",
+        "added_by": (item.get("added_by") or "").strip() or "旅人",
+        "edited": False,
+    }
+
+
+def _publish_favourites() -> None:
+    removed = set(st.session_state.get("removed_fav_ids") or [])
+    previous = [dict(fav) for fav in st.session_state.get("favourites") or [] if fav.get("id") not in removed]
+    by_id = {fav["id"]: fav for fav in previous}
+    for item in st.session_state.inbox:
+        if trip_core.collect_status(item) != trip_core.COLLECT_STATUS_DONE:
+            continue
+        for place in item.get("places") or []:
+            fid = _ensure_fav_id(place)
+            if fid in removed:
+                continue
+            fresh = _favourite_record(place, item)
+            prev = by_id.get(fid)
+            if prev:
+                for field in ("address", "opening_hours", "rating"):
+                    if not (fresh.get(field) or "").strip() and (prev.get(field) or "").strip():
+                        fresh[field] = prev[field]
+                if prev.get("edited"):
+                    fresh["name"] = prev.get("name") or fresh["name"]
+                    fresh["regions"] = list(prev.get("regions") or fresh["regions"])
+                    fresh["category"] = prev.get("category") or fresh["category"]
+                    fresh["edited"] = True
+            by_id[fid] = fresh
+    ordered: list[dict] = []
+    seen: set[str] = set()
+    for fav in previous:
+        fid = fav.get("id")
+        if fid in by_id and fid not in seen:
+            ordered.append(by_id[fid])
+            seen.add(fid)
+    for fid, fav in by_id.items():
+        if fid not in seen:
+            ordered.append(fav)
+    st.session_state.favourites = ordered
+
+
+def _drop_favourites_for(item_id: str) -> None:
+    st.session_state.favourites = [
+        fav for fav in st.session_state.get("favourites") or []
+        if fav.get("source_item") != item_id
+    ]
+
+
+def _sync_remarks() -> None:
+    for item in st.session_state.inbox:
+        key = f"remark_{item['id']}"
+        if key in st.session_state:
+            item["remark"] = (st.session_state.get(key) or "").strip()
+
+
+def _kick_analysis() -> None:
+    _sync_remarks()
+    if _sync_recognize() or not API_KEY or remaining_quota() <= 0:
+        _recognize_pending()
+    if _sync_recognize():
+        _enrich_inbox_facts()
+    _publish_favourites()
+
+
+def _mark_for_analysis(item_ids: set[str]) -> None:
+    _sync_remarks()
+    started = False
+    for item in st.session_state.inbox:
+        if item.get("id") in item_ids and item.get("analysis") in ("idle", "failed"):
+            item["analysis"] = "pending"
+            item["facts"] = ""
+            item["warning"] = ""
+            item["places"] = []
+            started = True
+    if started:
+        _drop_started_favourites(item_ids)
+        st.rerun()
+
+
+def _drop_started_favourites(item_ids: set[str]) -> None:
+    for item_id in item_ids:
+        _drop_favourites_for(item_id)
+
+
+def _apply_manual_name(item: dict, name: str) -> None:
+    place = trip_core.seed_place(name, area=item.get("city") or "", category="other")
+    if not place:
+        return
+    _ensure_fav_id(place)
+    item["places"] = [place]
+    item["analysis"] = "done"
+    item["facts"] = "pending"
+    item["warning"] = ""
+    _apply_region(item)
+
+
+def _places_from_favourites(favs: list[dict]) -> list[dict]:
+    places = []
+    for fav in favs:
+        places.append({
+            "name": fav.get("name_original") or fav.get("name") or "",
+            "name_zh": fav.get("name") or "",
+            "category": fav.get("model_category") or "other",
+            "area": "、".join(fav.get("regions") or []),
+            "address": fav.get("address") or "",
+            "opening_hours": fav.get("opening_hours") or "",
+            "rating": fav.get("rating") or "",
+            "added_by": fav.get("added_by") or "",
+        })
+    return places
+
+
+def _favourite_destination(favs: list[dict]) -> str:
+    sets = []
+    for fav in favs:
+        names = {
+            name for name in (fav.get("regions") or [])
+            if name and name != trip_core.UNSORTED_REGION
+        }
+        if names:
+            sets.append(names)
+    if not sets:
+        return "日本"
+    common = set.intersection(*sets)
+    if len(common) == 1:
+        return next(iter(common))
+    return "日本"
+
+
+def _allow_ai_suggestions(favs: list[dict]) -> bool:
+    if len(favs) >= trip_core.SPARSE_COLLECTION_MIN:
+        return False
+    return bool(st.session_state.get("allow_ai", True))
+
+
+def _go(screen: str) -> None:
+    st.session_state.screen = screen
+    st.rerun()
+
+
+def _render_nav() -> None:
+    labels = (("A", "開場"), ("B", "收集"), ("C", "收藏"), ("D", "排程"), ("E", "結果"))
+    columns = st.columns(len(labels))
+    current = st.session_state.get("screen") or "A"
+    for column, (screen, label) in zip(columns, labels):
+        with column:
+            if st.button(
+                label,
+                key=f"nav_{screen}",
+                type="primary" if current == screen else "secondary",
+                width="stretch",
+            ):
+                _go(screen)
+
+
+def _render_invite() -> None:
+    st.markdown("**邀請朋友一起收集**")
+    st.caption("朋友打開後可加入同一收藏清單，一起貼上截圖並修改。")
+    st.code(_share_url(), language=None)
+
+
+def _thumb(item: dict) -> None:
+    if item.get("image"):
+        st.image(item["image"], width="stretch")
+    else:
+        st.caption(item.get("label") or "截圖")
+
+
+def _fact_caption(place: dict) -> str:
+    address = trip_core.public_fact(place.get("address"))
+    hours = trip_core.public_fact(place.get("opening_hours"))
+    rating = trip_core.public_fact(place.get("rating"), rating=True)
+    return f"📍 {address}\n\n🕒 {hours} · ⭐ {rating}"
+
+
+def _ingest_collect_inputs() -> None:
+    pasted = _PASTE(key=f"inbox_paste_{st.session_state.batch}", default=None)
+    decoded = trip_core.decode_clipboard_payload(pasted)
+    if decoded and decoded[0] not in st.session_state.seen_paste_ids:
+        paste_id, image, remark = decoded
+        seen = set(st.session_state.seen_paste_ids)
+        seen.add(paste_id)
+        st.session_state.seen_paste_ids = seen
+        st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark, batch=False)]
+
+    uploaded = st.file_uploader(
+        "批量上傳相簿圖片（可多張）",
+        type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
+        key=f"uploader_{st.session_state.batch}",
+    )
+    uploaded = list(uploaded or [])
+    if len(uploaded) > MAX_IMAGES_PER_UPLOAD:
+        st.warning(f"一次最多收 {MAX_IMAGES_PER_UPLOAD} 張，今次只用頭 {MAX_IMAGES_PER_UPLOAD} 張。")
+        uploaded = uploaded[:MAX_IMAGES_PER_UPLOAD]
+    seen_uploads = set(st.session_state.seen_upload_ids)
+    fresh = []
+    for file in uploaded:
+        key = _upload_key(file)
+        if key in seen_uploads:
+            continue
+        seen_uploads.add(key)
+        try:
+            image = trip_core.prepare_image(file.getvalue())
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to read image %s", getattr(file, "name", "?"))
+            st.warning(f"「{getattr(file, 'name', '圖片')}」讀不到，已略過。")
+            continue
+        fresh.append(image)
+    batch = len(fresh) > 1
+    if fresh:
+        st.session_state.inbox = list(st.session_state.inbox) + [
+            _new_item(image, "", batch=batch) for image in fresh
+        ]
+    st.session_state.seen_upload_ids = seen_uploads
+
+
+def _render_collect_card(item: dict) -> None:
+    status = trip_core.collect_status(item)
+    with st.container(border=True):
+        left, right = st.columns([1, 2])
+        with left:
+            _thumb(item)
+        with right:
+            st.markdown(f"**{status}**")
+            st.caption(f"加入：{item.get('added_by') or '未記名'}")
+            if status == trip_core.COLLECT_STATUS_IDLE and not item.get("batch"):
+                remark_key = f"remark_{item['id']}"
+                if remark_key not in st.session_state:
+                    st.session_state[remark_key] = item.get("remark") or ""
+                st.text_input("備註（可選）", key=remark_key, placeholder="例如：想吃晚餐、需要訂位…")
+                if st.button("開始分析", key=f"analyze_{item['id']}", type="primary"):
+                    _mark_for_analysis({item["id"]})
+            elif status == trip_core.COLLECT_STATUS_IDLE and item.get("batch"):
+                st.caption("批量項目：不設個別備註")
+            elif status == trip_core.COLLECT_STATUS_RUNNING:
+                st.caption("正在識別截圖…")
+            elif status == trip_core.COLLECT_STATUS_VERIFYING:
+                for place in item.get("places") or []:
+                    title = place.get("name_zh") or place.get("name")
+                    st.markdown(f"**{title}**")
+                    regions = "、".join(trip_core.place_regions(place, item))
+                    st.caption(regions)
+                st.caption("資料核實中…（地址／營業時間／評分）")
+            elif status == trip_core.COLLECT_STATUS_FAIL:
+                st.markdown("**無法辨識這張圖片**")
+                st.caption(item.get("warning") or "可能是風景或截圖過於模糊。")
+                if st.button("重試", key=f"retry_{item['id']}"):
+                    item["places"] = []
+                    item["facts"] = ""
+                    item["warning"] = ""
+                    _drop_favourites_for(item["id"])
+                    _mark_for_analysis({item["id"]})
+                if st.button("手動輸入店名", key=f"manual_open_{item['id']}"):
+                    st.session_state.manual_id = item["id"]
+                    st.rerun()
+                if st.session_state.get("manual_id") == item["id"]:
+                    manual = st.text_input("店舖名稱", key=f"manual_name_{item['id']}", placeholder="輸入正確店名")
+                    if st.button("確認店名", key=f"manual_ok_{item['id']}", type="primary"):
+                        if (manual or "").strip():
+                            _apply_manual_name(item, manual.strip())
+                            st.session_state.manual_id = None
+                            st.rerun()
+                        else:
+                            st.warning("請輸入店名")
+            else:
+                for place in item.get("places") or []:
+                    title = place.get("name_zh") or place.get("name")
+                    st.markdown(f"**{title}**")
+                    st.caption("、".join(trip_core.place_regions(place, item)))
+                    st.markdown(_fact_caption(place))
+                if st.button("改名", key=f"rename_open_{item['id']}"):
+                    st.session_state.renaming_id = item["id"]
+                    st.rerun()
+                if st.session_state.get("renaming_id") == item["id"]:
+                    renamed = st.text_input("店舖名稱", key=f"rename_name_{item['id']}")
+                    if st.button("儲存店名", key=f"rename_ok_{item['id']}", type="primary"):
+                        cleaned = (renamed or "").strip()
+                        if cleaned and item.get("places"):
+                            place = item["places"][0]
+                            place["name"] = cleaned
+                            place["name_zh"] = cleaned
+                            for fav in st.session_state.favourites:
+                                if fav.get("id") == place.get("fav_id"):
+                                    fav["name"] = cleaned
+                                    fav["edited"] = True
+                            st.session_state.renaming_id = None
+                            _publish_favourites()
+                            st.rerun()
+
+
+def _render_collect() -> None:
+    st.subheader("收集想去的地方")
+    st.caption("貼上截圖，系統會幫你識別並分類。貼上後先排隊，不會自動分析。")
+    st.caption("將 IG／小紅書／YouTube 截圖貼上或批量上傳。")
+    _ingest_collect_inputs()
+    _kick_analysis()
+    pending = [item for item in st.session_state.inbox if trip_core.collect_status(item) != trip_core.COLLECT_STATUS_DONE]
+    done = [item for item in st.session_state.inbox if trip_core.collect_status(item) == trip_core.COLLECT_STATUS_DONE]
+    st.markdown(f"**待分析 {len(pending)}**")
+    if not pending:
+        st.caption("尚未有待分析項目。")
+    for item in pending:
+        _render_collect_card(item)
+    idle_ids = {item["id"] for item in pending if item.get("analysis") in ("idle", "failed")}
+    if idle_ids and st.button("開始分析全部待處理", key="analyze_all", type="secondary"):
+        _mark_for_analysis(idle_ids)
+    st.markdown("**已處理**")
+    if not done:
+        st.caption("分析完成後會顯示在這裡，並加入收藏。")
+    for item in done:
+        _render_collect_card(item)
+    if st.button("查看我的收藏 →", type="primary", key="to_collection"):
+        _go("C")
+
+
+def _filtered_favourites() -> list[dict]:
+    favs = list(st.session_state.get("favourites") or [])
+    regions = []
+    categories = []
+    for fav in favs:
+        for region in fav.get("regions") or []:
+            if region not in regions:
+                regions.append(region)
+        category = fav.get("category") or ""
+        if category and category not in categories:
+            categories.append(category)
+    options = ["全部", *regions, *categories]
+    if st.session_state.get("fav_filter") not in options:
+        st.session_state["fav_filter"] = "全部"
+    picked = st.pills("篩選", options, key="fav_filter") or "全部"
+    if picked == "全部":
+        return favs
+    return [
+        fav for fav in favs
+        if picked in (fav.get("regions") or []) or fav.get("category") == picked
+    ]
+
+
+def _render_favourite(fav: dict) -> None:
+    with st.container(border=True):
+        source = next((item for item in st.session_state.inbox if item.get("id") == fav.get("source_item")), None)
+        left, right = st.columns([1, 3])
+        with left:
+            if source:
+                _thumb(source)
+            else:
+                st.caption("📍")
+        with right:
+            st.markdown(f"**{fav.get('name') or '未命名'}**")
+            st.markdown(trip_core.attribution_html(fav.get("added_by") or "", _viewer_name()), unsafe_allow_html=True)
+            tags = " ".join(
+                [f"`{fav.get('category') or '其他'}`"]
+                + [f"`{region}`" for region in fav.get("regions") or []]
+            )
+            st.markdown(tags)
+            st.markdown(
+                f"📍 {trip_core.public_fact(fav.get('address'))}\n\n"
+                f"🕒 {trip_core.public_fact(fav.get('opening_hours'))} · "
+                f"⭐ {trip_core.public_fact(fav.get('rating'), rating=True)}"
+            )
+            if st.button("✎ 編輯", key=f"edit_{fav['id']}"):
+                st.session_state.editing_fav = fav["id"]
+                st.rerun()
+            if st.session_state.get("editing_fav") == fav["id"]:
+                options = list(dict.fromkeys([*(fav.get("regions") or []), *trip_core.QUICK_REGION_FIXES]))
+                region_key = f"edit_regions_{fav['id']}"
+                if region_key not in st.session_state:
+                    st.session_state[region_key] = list(fav.get("regions") or [])
+                st.pills("地區（可多選）", options, selection_mode="multi", key=region_key)
+                cat_key = f"edit_cat_{fav['id']}"
+                if cat_key not in st.session_state:
+                    st.session_state[cat_key] = fav.get("category") or "其他"
+                st.selectbox("類別", list(trip_core.FAVOURITE_CATEGORIES), key=cat_key)
+                save_col, remove_col = st.columns(2)
+                with save_col:
+                    if st.button("儲存", key=f"save_{fav['id']}", type="primary"):
+                        chosen = st.session_state.get(region_key) or []
+                        if isinstance(chosen, str):
+                            chosen = [chosen]
+                        fav["regions"] = list(chosen) or fav.get("regions") or [trip_core.UNSORTED_REGION]
+                        fav["category"] = st.session_state.get(cat_key) or fav.get("category")
+                        fav["edited"] = True
+                        st.session_state.editing_fav = None
+                        st.rerun()
+                with remove_col:
+                    if st.button("移除", key=f"remove_{fav['id']}"):
+                        removed = list(st.session_state.get("removed_fav_ids") or [])
+                        removed.append(fav["id"])
+                        st.session_state.removed_fav_ids = removed
+                        st.session_state.favourites = [
+                            row for row in st.session_state.favourites if row.get("id") != fav["id"]
+                        ]
+                        st.session_state.editing_fav = None
+                        st.rerun()
+
+
+def _render_collection() -> None:
+    st.subheader("我的收藏")
+    st.caption("這裡只有你和朋友收藏的地點，排行程時會用這些。")
+    _render_invite()
+    favs = list(st.session_state.get("favourites") or [])
+    if not favs:
+        st.info("尚未有收藏。請先在「收集」分析截圖，或手動輸入店名。")
+    else:
+        st.caption("右側 ✎ 可改地區、類別或移除。每一張卡都會標明是你還是朋友加入。")
+        visible = _filtered_favourites()
+        if not visible:
+            st.caption("此篩選暫時沒有地點。")
+        for fav in visible:
+            _render_favourite(fav)
+    if st.button("一鍵排行程 →", type="primary", key="to_plan"):
+        _go("D")
+    st.caption(trip_core.PAYWALL_NOTE)
+
+
+def _render_plan() -> None:
+    st.subheader("一鍵排行程")
+    favs = list(st.session_state.get("favourites") or [])
+    st.markdown("**出發日與日數**")
+    day_col, count_col = st.columns(2)
+    with day_col:
+        st.date_input("出發日", value=None, key="start_date")
+    with count_col:
+        st.number_input("日數", min_value=1, max_value=14, step=1, key="day_count")
+    raw_prefs = list(st.session_state.get("pref_pills") or [])
+    clean_prefs = [item for item in raw_prefs if item in trip_core.PLAN_PREF_OPTIONS]
+    if clean_prefs != raw_prefs:
+        st.session_state.pref_pills = clean_prefs or ["美食", "景點"]
+    st.pills(
+        "你想去哪些類型的地方？（可多選）",
+        list(trip_core.PLAN_PREF_OPTIONS),
+        selection_mode="multi",
+        key="pref_pills",
+    )
+    style_labels = [name for name, _blurb in trip_core.TRIP_STYLES]
+    if st.session_state.get("trip_style") not in style_labels:
+        st.session_state.trip_style = trip_core.DEFAULT_TRIP_STYLE
+    st.radio(
+        "行程風格（單選）",
+        style_labels,
+        captions=[blurb for _name, blurb in trip_core.TRIP_STYLES],
+        key="trip_style",
+    )
+    allow_ai = _allow_ai_suggestions(favs)
+    if len(favs) < trip_core.SPARSE_COLLECTION_MIN:
+        st.markdown("**目前收藏的地方較少，是否需要 AI 協助建議其他地點？**")
+        yes_col, no_col = st.columns(2)
+        with yes_col:
+            if st.button("需要", key="ai_yes", type="primary" if st.session_state.get("allow_ai", True) else "secondary"):
+                st.session_state.allow_ai = True
+                st.rerun()
+        with no_col:
+            if st.button(
+                "不用，只用我的收藏",
+                key="ai_no",
+                type="primary" if not st.session_state.get("allow_ai", True) else "secondary",
+            ):
+                st.session_state.allow_ai = False
+                st.rerun()
+        allow_ai = bool(st.session_state.get("allow_ai", True))
+    has_date = bool(st.session_state.get("start_date"))
+    can_plan = bool(API_KEY) and remaining_quota() > 0 and has_date and (bool(favs) or allow_ai)
+    if not has_date:
+        st.caption("請先選擇出發日與日數。")
+    elif not favs and not allow_ai:
+        st.caption("收藏是空的。可以允許 AI 建議，或先回去收集。")
+    elif not API_KEY:
+        st.caption("AI 未設定，未可以排行程。")
+    elif remaining_quota() <= 0:
+        st.caption("今次可用次數已用完。")
+    submitted = st.button("開始排行程", type="primary", disabled=not can_plan, key="plan_go")
+    if not submitted:
+        return
+    style = st.session_state.get("trip_style") or trip_core.DEFAULT_TRIP_STYLE
+    request = trip_core.compose_trip_request(
+        trip_core.DESTINATION_DEFAULT,
+        days=st.session_state.get("day_count") or 3,
+        preferences=list(st.session_state.get("pref_pills") or []),
+        party=trip_core.PARTY_DEFAULT,
+        start_date=_date_text(st.session_state.get("start_date")),
+    )
+    destination = _favourite_destination(favs)
+    if destination == "日本":
+        destination = request["destination"]
+    notes = "；".join(
+        bit for bit in (
+            request.get("notes") or "",
+            trip_core.style_planning_note(style, allow_ai=allow_ai),
+        ) if bit
+    )
+    places = _places_from_favourites(favs)
+    plan_error = ""
+    with st.status("正在安排行程…", expanded=True) as status:
+        try:
+            missing = trip_core.places_needing_facts(places)
+            if missing:
+                status.write("核對未齊的地址、營業時間、評分。")
+                enriched = _enrich_places(missing)
+                for extra in enriched:
+                    fav = trip_core.match_favourite(extra.get("name_zh") or extra.get("name") or "", favs)
+                    if not fav:
+                        continue
+                    for field in ("address", "opening_hours", "rating"):
+                        if extra.get(field) and not (fav.get(field) or "").strip():
+                            fav[field] = extra[field]
+                places = _places_from_favourites(favs)
+            itinerary = gemini_client.generate_itinerary(
+                _client(),
+                ITINERARY_MODEL,
+                places,
+                request["days"],
+                destination,
+                notes,
+                preferences=request["preferences"],
+                party=request["party"],
+            )
+        except gemini_client.GeminiError as err:
+            plan_error = str(err)
+            status.update(label=f"排行程失敗：{plan_error}", state="error")
+        except Exception:  # noqa: BLE001
+            logger.exception("Unexpected error during itinerary generation")
+            plan_error = "排行程途中出了意外，請再試一次。"
+            status.update(label=f"排行程失敗：{plan_error}", state="error")
+        else:
+            if (itinerary.get("title") or "") in ("", "我嘅懶人行程"):
+                itinerary["title"] = trip_core.fallback_trip_title(destination, request["days"])
+            st.session_state.usage += 1
+            st.session_state.itinerary = itinerary
+            st.session_state.itinerary_places = places
+            st.session_state.planned_style = style
+            st.session_state.planned_allow_ai = allow_ai
+            st.session_state.screen = "E"
+            st.session_state.notice = None
+            status.update(label="行程排好了", state="complete")
+    if plan_error:
+        st.session_state.notice = ("error", plan_error)
+        st.error(plan_error)
+    elif st.session_state.get("screen") == "E":
+        st.rerun()
+
+
+def _render_results() -> None:
+    itinerary = st.session_state.get("itinerary")
+    style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or trip_core.DEFAULT_TRIP_STYLE
+    if not itinerary:
+        st.subheader("行程結果")
+        st.caption("尚未安排行程。")
+        if st.button("前往排行程", key="back_to_plan"):
+            _go("D")
+        return
+    shown = trip_core.present_itinerary(
+        itinerary,
+        st.session_state.get("favourites") or [],
+        allow_ai=bool(st.session_state.get("planned_allow_ai", True)),
+    )
+    st.subheader(shown.get("title") or "行程結果")
+    st.markdown(f"**已按「{style}」安排**")
+    days = shown.get("days") or []
+    labels = [f"Day {day.get('day')}" for day in days]
+    if labels:
+        if st.session_state.get("day_tab") not in labels:
+            st.session_state["day_tab"] = labels[0]
+        picked = st.pills("行程日", labels, key="day_tab") or labels[0]
+        day = next((item for item in days if f"Day {item.get('day')}" == picked), days[0])
+        visible = [stop for stop in day.get("items") or [] if not stop.get("hidden")]
+        own = [stop for stop in visible if not stop.get("ai")]
+        if not own and any(stop.get("hidden") for stop in day.get("items") or []):
+            st.caption("這一天主要依賴 AI 建議；你選擇了只用收藏，因此內容較少。")
+            if st.button("改為加入 AI 建議", key="enable_ai_from_results"):
+                st.session_state.allow_ai = True
+                st.session_state.planned_allow_ai = True
+                st.rerun()
+        for stop in visible:
+            if stop.get("transit"):
+                st.caption(f"🚇 {stop['transit']}")
+            with st.container(border=True):
+                if stop.get("time"):
+                    st.markdown(f"**{stop['time']}**")
+                st.markdown(f"**{stop.get('place_name') or ''}**")
+                if stop.get("ai"):
+                    st.markdown(
+                        '<span class="who-ai" style="color:#8A6A20;font-weight:600;">AI 建議</span>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    who = trip_core.attribution_html(stop.get("added_by") or "", _viewer_name())
+                    st.markdown(
+                        f'<span style="color:#E85D52;font-weight:600;">來自收藏</span> {who}',
+                        unsafe_allow_html=True,
+                    )
+                if stop.get("activity"):
+                    st.caption(stop["activity"])
+                st.caption(
+                    f"🕒 {stop.get('opening_hours') or trip_core.UNVERIFIED} · "
+                    f"⭐ {stop.get('rating') or trip_core.UNVERIFIED}"
+                )
+    st.markdown("**分享行程**")
+    st.code(_share_url(), language=None)
+    st.caption("連結可供朋友瀏覽；編輯權限與收藏收件匣分開。")
+
+
+def _render_opening() -> None:
+    st.title("懶人出行 ✈️")
+    st.markdown(trip_core.HERO_LINE)
+    steps = "\n".join(f"{index}. {label}" for index, label in enumerate(trip_core.OPENING_STEPS, start=1))
+    st.markdown(steps)
+    st.text_input("你的顯示名", key="display_name")
+    members = "、".join(st.session_state.get("members") or []) or _viewer_name()
+    st.caption(f"目前一起修改：{members}")
+    if st.button("開始收集想去的地方", type="primary", key="start_collect"):
+        _go("B")
+    if st.button("先複製邀請連結", key="open_invite"):
+        st.session_state.show_invite = not st.session_state.get("show_invite")
+        st.rerun()
+    if st.session_state.get("show_invite"):
+        _render_invite()
 
 
 init_state()
 _ensure_share()
 _load_shared_trip()
+_publish_favourites()
 
-# ---------------------------------------------------------------- header
-st.title("✈️ 懶人行程規劃（原型版）")
-st.caption("先將截圖貼進行程匣，日期同偏好可以稍後先揀。唔會擷取 Instagram／YouTube／小紅書連結。")
-st.caption(trip_core.HAPPY_PATH_CAPTION)
-st.text_input("你嘅顯示名（一齊改行程時會見到）", key="display_name")
-members = "、".join(st.session_state.get("members") or []) or st.session_state.get("display_name") or "旅人"
-st.caption(f"分享連結：開咗嘅人可以一齊貼相、改備註、剔選同排行程。而家有：{members}")
-st.code(_share_url(), language=None)
-
-with st.expander("點樣用？", expanded=not st.session_state.inbox):
-    st.markdown(
-        f"""
-1. **行程匣**：喺 IG 見到地方就截圖，iPhone 撳「複製並刪除」，返嚟呢度貼上。桌面用 Cmd/Ctrl+V，或者撳「從剪貼簿貼上」。相簿可以一次上載多張。備註可寫「只要圖中 1、4」。貼上唔使揀地區。
-2. 貼完先見「認緊」，之後出店名，或者「認唔到」。認到名會再顯示「認緊資料」，用公開資料填地址、營業時間、評分。地區會自動標，一間店可以多過一個區。睇唔準就係未分類，可以之後一撳改。
-3. **開始排行程**係之後先做。至少要有一個齊地址、營業時間、評分嘅地方，同預計等待。模型未填到先再撳「先核對一個樣本」。如果揀咗嘅行程匣交集得一個地區，會跟嗰個地區。
-
-_原型版：每個 session 最多 {MAX_ANALYSES} 次成功嘅 AI 動作（失敗同自動重試唔計）。截圖只會用嚟即時分析。_
-"""
-    )
-
-if not API_KEY:
-    st.error("AI 服務未設定好，暫時認唔到地方同排唔到行程。（管理員請喺 Streamlit Secrets 設定 GEMINI_API_KEY）")
-
-# ---------------------------------------------------------------- inbox first
-st.subheader("1. 行程匣")
-st.caption("貼上同批量上載都唔使揀地區。認完會標地區，例如福岡、博多、今泉；連鎖店可以同時屬幾個區。睇唔準就係未分類，可以之後一撳改。")
-st.caption("未填目的地、日期、偏好都可以收截圖。貼上係主要入口；相簿上載可以一次多張。")
-
-pasted = _PASTE(key=f"inbox_paste_{st.session_state.batch}", default=None)
-decoded_paste = trip_core.decode_clipboard_payload(pasted)
-if decoded_paste and decoded_paste[0] not in st.session_state.seen_paste_ids:
-    paste_id, image, remark = decoded_paste
-    seen = set(st.session_state.seen_paste_ids)
-    seen.add(paste_id)
-    st.session_state.seen_paste_ids = seen
-    st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark)]
-
-st.text_input(
-    "上傳備註（可留空，只適用於下面已儲存嘅圖片）",
-    key="upload_remark",
-    placeholder="例如：只要圖中 1、4",
-)
-uploaded = st.file_uploader(
-    "批量上載相簿圖片（可多張。貼上唔使先儲存相簿）",
-    type=["png", "jpg", "jpeg", "webp"],
-    accept_multiple_files=True,
-    key=f"uploader_{st.session_state.batch}",
-)
-uploaded = list(uploaded or [])
-if len(uploaded) > MAX_IMAGES_PER_UPLOAD:
-    st.warning(f"一次最多收 {MAX_IMAGES_PER_UPLOAD} 張，今次只用頭 {MAX_IMAGES_PER_UPLOAD} 張。")
-    uploaded = uploaded[:MAX_IMAGES_PER_UPLOAD]
-upload_remark = st.session_state.get("upload_remark") or ""
-seen_uploads = set(st.session_state.seen_upload_ids)
-new_items: list[dict] = []
-for file in uploaded:
-    key = _upload_key(file)
-    if key in seen_uploads:
-        continue
-    seen_uploads.add(key)
-    try:
-        image = trip_core.prepare_image(file.getvalue())
-    except Exception:  # noqa: BLE001
-        logger.exception("Failed to read image %s", getattr(file, "name", "?"))
-        st.warning(f"「{getattr(file, 'name', '圖片')}」讀唔到，可能唔係圖片檔，已略過。")
-        continue
-    new_items.append(_new_item(image, upload_remark))
-if new_items:
-    st.session_state.inbox = list(st.session_state.inbox) + new_items
-st.session_state.seen_upload_ids = seen_uploads
-
-if st.session_state.inbox and st.button("清空行程匣", key=f"clear_{st.session_state.batch}"):
-    clear_inbox()
-    st.rerun()
-
-_recognize_pending() if _sync_recognize() or not API_KEY or remaining_quota() <= 0 else None
-if _sync_recognize():
-    _enrich_inbox_facts()
-failed = [item for item in st.session_state.inbox if item.get("analysis") == "failed"]
-if failed and API_KEY and remaining_quota() > 0:
-    if st.button("再試一次分析", type="primary", key=f"retry_{st.session_state.batch}"):
-        for item in failed:
-            item["analysis"] = "pending"
-            item["warning"] = ""
-        st.session_state.notice = None
-        if _sync_recognize():
-            _recognize_pending()
-            _enrich_inbox_facts()
+_render_nav()
 _render_notice()
-
-
-def _render_inbox_card(item: dict) -> None:
-    with st.container(border=True):
-        pick_key = f"pick_{item['id']}"
-        if pick_key not in st.session_state:
-            st.session_state[pick_key] = True
-        st.checkbox(f"排行程時包括 {item['label']}", key=pick_key)
-        left, right = st.columns([1, 2])
-        with left:
-            if item.get("image"):
-                st.image(item["image"], caption=item["label"], width="stretch")
-            else:
-                st.caption(item["label"])
-        with right:
-            names = [name for name in trip_core.inbox_region_names(item) if name != trip_core.UNSORTED_REGION]
-            region_text = "、".join(trip_core.inbox_region_names(item))
-            st.markdown(f"**{item['label']}** · 狀態：{item['status']}")
-            st.markdown(f"**{trip_core.recognition_headline(item)}**")
-            st.markdown(f"地區：{region_text}")
-            st.caption(f"加入：{item.get('added_by') or '未記名'}")
-            st.markdown(f"備註：{item.get('remark') or '（冇）'}")
-            remark_key = f"remark_{item['id']}"
-            if remark_key not in st.session_state:
-                st.session_state[remark_key] = item.get("remark") or ""
-            st.text_input(
-                f"改 {item['label']} 備註",
-                key=remark_key,
-                on_change=_remember_remark,
-                args=(item["id"],),
-                label_visibility="collapsed",
-            )
-            fix_key = f"region_fix_{item['id']}"
-            if fix_key not in st.session_state:
-                st.session_state[fix_key] = names
-            elif item.get("region_confidence") != trip_core.REGION_MANUAL and list(st.session_state.get(fix_key) or []) != names:
-                st.session_state[fix_key] = names
-            fix_label = "可以一撳改（唔改都得）" if not names else "唔岩可以一撳改（可多過一個）"
-            st.pills(
-                fix_label,
-                list(trip_core.QUICK_REGION_FIXES),
-                selection_mode="multi",
-                key=fix_key,
-                on_change=_remember_region_fix,
-                args=(item["id"],),
-                wrap=True,
-            )
-            if item.get("analysis") == "failed":
-                st.caption(item.get("warning") or "認唔到")
-            elif item.get("analysis") != "pending" and not item.get("places"):
-                st.caption(item.get("warning") or "認唔到")
-            elif item.get("places"):
-                if item.get("facts") == "pending":
-                    st.caption("認緊資料…")
-                elif item.get("facts") == "failed" and trip_core.places_needing_facts(item.get("places") or []):
-                    st.caption("未有自動填到地址、營業時間、評分。可以再核對樣本。")
-                if item.get("warning"):
-                    st.caption(item["warning"])
-                for place in item["places"]:
-                    title = place.get("name_zh") or place.get("name")
-                    if place.get("caption_index"):
-                        title = f"{trip_core.caption_mark(place['caption_index'])} {title}"
-                    st.markdown(f"**{title}**")
-                    if place.get("name_zh") and place.get("name") and place["name"] != place["name_zh"]:
-                        st.caption(place["name"])
-                    lines = trip_core.place_fact_lines(place)
-                    if item.get("facts") == "pending" and not trip_core.place_is_complete(place):
-                        lines = [line.replace("未有", "認緊資料…") for line in lines]
-                    st.markdown("\n\n".join(lines))
-
-
-if not st.session_state.inbox:
-    st.info("行程匣未有截圖。貼上一張就會出現喺呢度，狀態係未排程。")
+screen = st.session_state.get("screen") or "A"
+if not API_KEY:
+    st.error("AI 服務未設定好，暫時認不到地方，也排不了行程。（管理員請在 Streamlit Secrets 設定 GEMINI_API_KEY）")
+if screen == "A":
+    _render_opening()
+elif screen == "B":
+    _render_collect()
+elif screen == "C":
+    _render_collection()
+elif screen == "D":
+    _render_plan()
 else:
-    st.caption("每張卡有認到嘅地方、地區、備註、狀態。未分類可以之後一撳改，唔改都得。未排程＝未放入行程。")
-    groups = trip_core.group_inbox(st.session_state.inbox)
-    region_names = [name for name, _grouped in groups]
-    filter_options = ["全部", *region_names]
-    if st.session_state.get("inbox_region_filter") not in filter_options:
-        st.session_state["inbox_region_filter"] = "全部"
-    counts = {name: len(grouped) for name, grouped in groups}
-    counts["全部"] = len(st.session_state.inbox)
-    picked = st.pills(
-        "按地區睇",
-        filter_options,
-        key="inbox_region_filter",
-        format_func=lambda name: f"{name}（{counts.get(name, 0)}）",
-        wrap=True,
-    )
-    visible = groups if not picked or picked == "全部" else [
-        (name, grouped) for name, grouped in groups if name == picked
-    ]
-    shown_ids: set[str] = set()
-    for name, grouped in visible:
-        st.markdown(f"**{name}** · {len(grouped)} 張")
-        fresh = []
-        for item in grouped:
-            if item["id"] in shown_ids:
-                continue
-            shown_ids.add(item["id"])
-            fresh.append(item)
-        if not fresh:
-            st.caption("呢張相已經喺上面另一個地區顯示。")
-            continue
-        for item in fresh:
-            _render_inbox_card(item)
+    _render_results()
+
 if not _sync_recognize():
     if any(
         item.get("analysis") == "pending" or item.get("facts") == "pending"
@@ -817,228 +1331,8 @@ if not _sync_recognize():
         st.session_state._skip_recognize_fragment = True
     _recognize_later()
 
-# ---------------------------------------------------------------- plan later
-st.subheader("2. 開始排行程")
-st.caption("呢段係稍後先做。預設可以唔改。只會用上面剔咗嘅行程匣項目。")
-st.caption(trip_core.ROUTE_NOTE)
-dest_col, day_col = st.columns(2)
-with dest_col:
-    st.selectbox("目的地", trip_core.destination_labels(), key="destination_choice")
-with day_col:
-    st.selectbox("玩幾多日？", list(trip_core.DAY_OPTIONS), key="days_choice")
-if "start_date" not in st.session_state:
-    st.date_input("出發日期（可唔填）", value=None, key="start_date")
-else:
-    st.date_input("出發日期（可唔填）", key="start_date")
-if st.session_state.get("destination_choice") == trip_core.DESTINATION_OTHER:
-    st.text_input("其他目的地", key="destination_other", placeholder="例如：韓國首爾")
-st.pills(
-    "偏好（可多選）",
-    list(trip_core.PREFERENCE_OPTIONS),
-    selection_mode="multi",
-    key="pref_pills",
-)
-if trip_core.OTHER_CHOICE in (st.session_state.get("pref_pills") or []):
-    st.text_input("其他偏好", key="pref_other", placeholder="例如：唔想行太多")
-st.pills("同行", list(trip_core.PARTY_OPTIONS), key="party_pills")
-if st.session_state.get("party_pills") == trip_core.OTHER_CHOICE:
-    st.text_input("其他同行", key="party_other", placeholder="例如：兩代同遊")
-
-selected_items = _selected_items()
-selected_places = trip_core.dedupe_places(
-    place for item in selected_items for place in (item.get("places") or [])
-)
-plan_request = _trip_request()
-plan_destination = _plan_destination(plan_request, selected_items)
-sample = trip_core.first_complete_place(selected_places)
-missing_facts = trip_core.places_needing_facts(selected_places)
-eta = trip_core.estimate_plan_seconds(len(missing_facts))
-if selected_places:
-    st.caption(
-        f"預計開始排行程大約 {eta} 秒"
-        f"（核對 {len(missing_facts)} 個未齊地址／時間／評分嘅地方，再排日程）。"
-        "呢個係預算，未有真實 Gemini 時延實測。"
-    )
-if sample:
-    st.markdown("**收費前樣本**")
-    st.markdown(f"**{trip_core.place_title(sample)}**")
-    st.markdown("\n\n".join(trip_core.place_fact_lines(sample)))
-elif selected_places and API_KEY and remaining_quota() > 0 and missing_facts:
-    if st.button("先核對一個樣本", key=f"sample_{st.session_state.batch}"):
-        try:
-            started = time.perf_counter()
-            result = _enrich_result(missing_facts[:1])
-            _overlay_enriched(selected_items, result.places)
-            st.session_state.usage += 1
-            st.session_state.last_plan_timing = {
-                "sample_s": round(time.perf_counter() - started, 3),
-                "source": "sample",
-            }
-            updated = trip_core.dedupe_places(
-                place for item in selected_items for place in (item.get("places") or [])
-            )
-            if trip_core.first_complete_place(updated):
-                st.session_state.notice = None
-            else:
-                bits = [gemini_client.ENRICH_INCOMPLETE_WARNING]
-                for warning in result.warnings:
-                    if warning and warning not in bits:
-                        bits.append(warning)
-                st.session_state.notice = ("warning", " ".join(bits))
-            st.rerun()
-        except gemini_client.GeminiError as err:
-            message = str(err)
-            if message == gemini_client.CROWD_RATE_LIMIT_MESSAGE:
-                st.error(message)
-            else:
-                bits = [gemini_client.ENRICH_INCOMPLETE_WARNING]
-                if not USE_MAPS:
-                    bits.append(gemini_client.MAPS_UNAVAILABLE_WARNING)
-                if message and message not in bits and gemini_client.CROWD_RATE_LIMIT_MESSAGE not in message:
-                    bits.append(message)
-                st.session_state.notice = ("warning", " ".join(bits))
-                st.rerun()
-        except Exception:  # noqa: BLE001
-            logger.exception("Sample enrich failed")
-            st.session_state.notice = ("warning", "核對樣本失敗，請再試一次。")
-            st.rerun()
-can_plan = bool(API_KEY) and bool(sample) and remaining_quota() > 0
-if not selected_places:
-    st.caption("行程匣未有可排嘅地方，所以下面個掣未撳得。")
-elif not sample:
-    st.caption("未有齊地址、營業時間同評分嘅樣本，所以未可以開始排行程。")
-elif not API_KEY:
-    st.caption("AI 未設定，未可以排行程。")
-elif remaining_quota() <= 0:
-    st.caption("今個 session 次數用完，未可以排行程。")
-elif plan_request["destination"] == "日本" and plan_destination != "日本":
-    st.caption(f"今次會跟行程匣地區「{plan_destination}」排。上面目的地下拉可以改。")
-submitted = st.button(
-    "✨ 開始排行程",
-    type="primary",
-    disabled=not can_plan,
-    key=f"plan_{st.session_state.batch}",
-)
-if submitted:
-    request = plan_request
-    if not selected_places:
-        st.warning("最少要有一個認到嘅地方先排到行程。")
-    elif remaining_quota() == 0:
-        st.warning("今個 session 嘅免費次數用完喇 🙏 之後會推出登入／付費版本。")
-    else:
-        plan_error = ""
-        with st.status("AI 排緊行程…", expanded=True) as status:
-            status.write(f"會先核對未齊嘅地址、時間、評分，再用目的地{plan_destination}、日數、偏好、同行排。")
-            try:
-                started = time.perf_counter()
-                enrich_s = 0.0
-                if missing_facts:
-                    status.write("核對緊地址、營業時間、評分。")
-                    enriched = _enrich_places(missing_facts)
-                    _overlay_enriched(selected_items, enriched)
-                    selected_places = trip_core.dedupe_places(
-                        place for item in selected_items for place in (item.get("places") or [])
-                    )
-                    enrich_s = time.perf_counter() - started
-                planned_at = time.perf_counter()
-                itinerary = gemini_client.generate_itinerary(
-                    _client(),
-                    ITINERARY_MODEL,
-                    selected_places,
-                    request["days"],
-                    plan_destination,
-                    _plan_notes(request, selected_items),
-                    preferences=request["preferences"],
-                    party=request["party"],
-                )
-                finished = time.perf_counter()
-            except gemini_client.GeminiError as err:
-                plan_error = str(err)
-                status.update(label=f"排行程失敗：{plan_error}", state="error")
-            except Exception:  # noqa: BLE001
-                logger.exception("Unexpected error during itinerary generation")
-                plan_error = "排行程途中出咗意外，請再試一次。"
-                status.update(label=f"排行程失敗：{plan_error}", state="error")
-            else:
-                st.session_state.usage += 1
-                st.session_state.itinerary = itinerary
-                st.session_state.itinerary_places = selected_places
-                st.session_state.last_plan_timing = {
-                    "enrich_s": round(enrich_s, 3),
-                    "itinerary_s": round(finished - planned_at, 3),
-                    "total_s": round(finished - started, 3),
-                    "source": "plan",
-                }
-                for item in selected_items:
-                    if item.get("places"):
-                        item["status"] = "已排程"
-                st.session_state.notice = None
-                status.update(label="行程排好喇", state="complete")
-        if plan_error:
-            st.session_state.notice = ("error", plan_error)
-            st.error(plan_error)
-
-# ---------------------------------------------------------------- itinerary view
-itinerary = st.session_state.itinerary
-if itinerary:
-    fact_source = st.session_state.itinerary_places
-    shown = trip_core.attach_place_facts(itinerary, fact_source)
-    st.divider()
-    st.subheader(f"🧳 {shown['title']}")
-    st.caption("對得返行程匣地點嘅，下面會直接寫地址、營業時間、評分。")
-    for day in shown["days"]:
-        with st.container(border=True):
-            title = f"**Day {day['day']}**"
-            if day["area"]:
-                title += f"｜{day['area']}"
-            st.markdown(title)
-            if day["theme"]:
-                st.caption(day["theme"])
-            for stop in day["items"]:
-                icon = "🍽️ " if stop["is_meal"] else ""
-                time = f"`{stop['time']}` " if stop["time"] else ""
-                map_url = trip_core.maps_search_url({"name": stop["maps_query"]}) if stop["maps_query"] else None
-                if map_url and stop["place_name"]:
-                    name = f"[{trip_core.escape_markdown_label(stop['place_name'])}]({map_url})"
-                else:
-                    name = stop["place_name"]
-                activity = f" — {stop['activity']}" if stop["activity"] else ""
-                st.markdown(f"- {time}{icon}{name}{activity}")
-                bits = []
-                if stop.get("address"):
-                    bits.append(f"🏠 {stop['address']}")
-                elif stop.get("area"):
-                    bits.append(f"📍 {stop['area']}")
-                if stop.get("opening_hours"):
-                    bits.append(f"🕒 {stop['opening_hours']}")
-                if stop.get("rating"):
-                    bits.append(f"⭐ {stop['rating']}")
-                if bits:
-                    st.caption(" · ".join(bits))
-            route = trip_core.day_directions_url(day)
-            if route:
-                st.link_button("🗺️ 當日路線（Google Maps）", route)
-    if shown["tips"]:
-        st.markdown("**小貼士**")
-        for tip in shown["tips"]:
-            st.markdown(f"- {tip}")
-    st.download_button(
-        "⬇️ 下載行程（Markdown）",
-        data=trip_core.itinerary_to_markdown(shown),
-        file_name="itinerary.md",
-        mime="text/markdown",
-        width="stretch",
-    )
-    st.caption("地址、營業時間、評分來自截圖同 AI 有把握先填嘅資料，基本核對唔使離開呢版。Maps 只係想導航或睇街景先開。")
-
-timing = st.session_state.get("last_plan_timing") or {}
-if timing.get("source") == "plan":
-    st.caption(
-        f"今次核對 {timing.get('enrich_s', 0)} 秒，排日程 {timing.get('itinerary_s', 0)} 秒。"
-        "呢個係呢次呼叫嘅秒數，未當收費過關實測。"
-    )
 st.divider()
 st.caption(
-    f"原型版本 | 行程匣 MVP | 今個 session 仲有 {remaining_quota()}/{MAX_ANALYSES} 次 | build: {_build_sha()}"
+    f"原型版本 | 今次還可使用 {remaining_quota()}/{MAX_ANALYSES} 次 | build: {_build_sha()}"
 )
 _persist_shared_trip()

@@ -157,6 +157,10 @@ ITINERARY_SCHEMA = _S(
                                 "is_meal": _S(type=_T.BOOLEAN),
                                 "maps_query": _S(type=_T.STRING,
                                                  description="俾 Google Maps 搜尋用：原文名 + 地址或地區"),
+                                "transit": _S(
+                                    type=_T.STRING,
+                                    description="由上一個地點過來的交通同大約時間，例如 地鐵 約 15 分鐘。第一個留空",
+                                ),
                             },
                             required=["time", "place_name", "activity", "is_meal", "maps_query"],
                         ),
@@ -264,7 +268,10 @@ ITINERARY_PROMPT = """你係旅行規劃師，幫「懶人」將收藏嘅地方�
 其他：
 - 每日由朝到晚排大約時間（time，例如 09:30），早餐／午餐／晚餐 is_meal=true，優先用清單入面嘅餐廳、cafe、甜品
 - 地方太多就揀合偏好嘅重點，太少就留自由時間，唔好硬塞
-- place_name 用繁體中文（可附原文），activity 用廣東話口吻一句
+- place_name 用繁體中文（可附原文），activity 用一句說明停留大約幾耐
+- 每個地點填 transit：由上一個地點過嚟的交通同大約時間（例如「地鐵 約 15 分鐘」）。當日第一個留空字串
+- 風格（其他要求入面會寫明）。平衡型：每日最多 4 餐，1 至 2 個景點，餐廳停留約 1 至 1.5 小時，唔好成日冇食，亦唔好全日只去餐廳。網紅打卡型：多打卡、節奏快。Chill 型：少站、停留長。美食優先：以餐廳為主，仍然要有非用餐休息
+- 其他要求如果話只可以排清單入面的地方，就唔好加新店。如果話可以加入 AI 建議，先可以加清單以外的地方
 - maps_query：原文名 + 地址或地區，方便 Google Maps
 - tips：交通（日本就提 JR／地鐵／Suica）、預約、邊幾項要出發前再核實營業時間"""
 

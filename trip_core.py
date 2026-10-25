@@ -27,21 +27,40 @@ JPEG_QUALITY = 80
 # 稍後排行程：預設全選，撳「開始排行程」係 1 步。改城市／日數／偏好／同行係選項。
 CAPTURE_TO_INBOX_TAPS = 1
 PLAN_FROM_INBOX_TAPS = 1
-HAPPY_PATH_CAPTION = (
-    f"放入行程匣：{CAPTURE_TO_INBOX_TAPS} 步。"
-    "貼上截圖（Cmd/Ctrl+V 或「從剪貼簿貼上」）或者批量上載相簿，未填日期同偏好都收得。"
-    "貼完會先顯示「認緊」，之後出店名，或者「認唔到」。"
-    "認到店名之後會再顯示「認緊資料」，用公開資料填地址、營業時間、評分，唔使另撳一次。"
-    "備註可順手寫，例如「只要圖中 1、4」，唔使再撳確認。"
-    "貼上唔使揀城市。認完會按畫面自動標地區，一間店可以屬於多過一個地區（例如一蘭）。"
-    "睇唔準就係未分類，可以之後一撳改。"
-    "iPhone 撳完「複製並刪除」之後，可能要先撳一下貼上框再貼上。"
-    f"稍後排行程：{PLAN_FROM_INBOX_TAPS} 步。"
-    "開始排行程之前要有至少一個齊地址、營業時間、評分嘅地方，同預計等待。"
-    "模型未填到嘅，可以撳「先核對一個樣本」。"
-    "目的地預設日本、3 日、美食同景點、同朋友；行程匣已經有地區就唔使再揀城市。"
-    "分享連結可以俾另一個人一齊貼相、改備註、剔選同排行程。"
+HERO_LINE = "貼上你想去的地方，系統會幫你整理清單並安排每日行程，完成後可分享給朋友一起修改。"
+OPENING_STEPS = (
+    "收集想去的地方",
+    "查看／整理我的收藏",
+    "一鍵排行程",
+    "收集後可邀請朋友一起修改",
 )
+HAPPY_PATH_CAPTION = HERO_LINE
+PAYWALL_NOTE = "收費：待定"
+UNVERIFIED = "未核實"
+SELF_ATTRIBUTION = "我"
+SELF_COLOR = "#4A90D9"
+FRIEND_COLOR = "#8A8A8A"
+SPARSE_COLLECTION_MIN = 3
+FAVOURITE_CATEGORIES = ("美食", "景點", "購物", "文化體驗", "自然／戶外", "其他")
+PLAN_PREF_OPTIONS = ("美食", "景點", "購物", "文化體驗", "自然／戶外")
+TRIP_STYLES = (
+    ("平衡型", "正常節奏，食與玩均衡"),
+    ("網紅打卡型", "多打卡點，節奏快"),
+    ("Chill 型", "慢活，長時間享用"),
+    ("美食優先", "以餐廳為主"),
+)
+DEFAULT_TRIP_STYLE = "平衡型"
+STYLE_RULES = {
+    "平衡型": "每日最多 4 餐，1 至 2 個景點，餐廳停留約 1 至 1.5 小時。唔好成日冇食，亦唔好全日只去餐廳。",
+    "網紅打卡型": "多打卡點，節奏較快，仍然要有正餐。",
+    "Chill 型": "少站點，停留較長，食飯時間充足。",
+    "美食優先": "以餐廳為主，但仍要有非用餐的休息，唔好全日只食。",
+}
+COLLECT_STATUS_IDLE = "尚未分析"
+COLLECT_STATUS_RUNNING = "分析中…"
+COLLECT_STATUS_VERIFYING = "資料核實中…"
+COLLECT_STATUS_DONE = "已完成"
+COLLECT_STATUS_FAIL = "無法辨識"
 # ETA 係預算，方便收費前講等待。呢度冇真實 Gemini 時延實測。
 PLAN_ENRICH_BUDGET_S = 20
 PLAN_ITINERARY_BUDGET_S = 25
@@ -421,6 +440,85 @@ def shared_inbox_region(items: Iterable[dict]) -> str:
     if len(common) == 1:
         return next(iter(common))
     return ""
+
+
+def collect_status(item: dict) -> str:
+    """收集卡狀態。永遠有字，唔好留空。"""
+    analysis = item.get("analysis") or "idle"
+    if analysis in ("idle", ""):
+        return COLLECT_STATUS_IDLE
+    if analysis == "pending":
+        return COLLECT_STATUS_RUNNING
+    if analysis == "failed":
+        return COLLECT_STATUS_FAIL
+    places = item.get("places") or []
+    if not places:
+        return COLLECT_STATUS_FAIL
+    if item.get("facts") == "pending":
+        return COLLECT_STATUS_VERIFYING
+    return COLLECT_STATUS_DONE
+
+
+def favourite_category(place: dict) -> str:
+    raw = _clean_str(place.get("fav_category") or place.get("category"))
+    if raw in FAVOURITE_CATEGORIES:
+        return raw
+    mapped = {
+        "restaurant": "美食",
+        "cafe": "美食",
+        "dessert": "美食",
+        "attraction": "景點",
+        "shop": "購物",
+    }
+    return mapped.get(normalize_category(raw), "其他")
+
+
+def place_regions(place: dict, item: dict | None = None) -> list[str]:
+    """一間店可以多過一個地區，例如一蘭同時屬福岡市同博多。"""
+    found: list[str] = []
+
+    def add(name: str) -> None:
+        cleaned = (name or "").strip()
+        if not cleaned or cleaned == UNSORTED_REGION or cleaned in found:
+            return
+        found.append(cleaned)
+
+    for part in re.split(r"[,，、/／]", place.get("area") or ""):
+        add(part)
+    if item:
+        for name in item.get("regions") or []:
+            add(str(name))
+        if not found:
+            add(item.get("city") or "")
+    return found or [UNSORTED_REGION]
+
+
+def attribution_label(added_by: str, viewer: str) -> tuple[str, str]:
+    """收藏卡用。自己係（我, self），其他人係（顯示名, friend）。"""
+    viewer_name = (viewer or "").strip() or "旅人"
+    added = (added_by or "").strip()
+    if not added or added == SELF_ATTRIBUTION or added == viewer_name:
+        return SELF_ATTRIBUTION, "self"
+    return added, "friend"
+
+
+def attribution_html(added_by: str, viewer: str) -> str:
+    import html
+
+    label, kind = attribution_label(added_by, viewer)
+    color = SELF_COLOR if kind == "self" else FRIEND_COLOR
+    weight = "700" if kind == "self" else "500"
+    return f'<span class="who-{kind}" style="color:{color};font-weight:{weight};">{html.escape(label)}</span>'
+
+
+def public_fact(value: Any, *, rating: bool = False) -> str:
+    if rating:
+        shown = format_rating(value)
+    else:
+        shown = _clean_str(value)
+        if shown in _RATING_EMPTY or shown == UNVERIFIED:
+            shown = ""
+    return shown or UNVERIFIED
 
 
 def recognition_headline(item: dict) -> str:
@@ -1140,6 +1238,7 @@ def parse_itinerary_response(text: str | None) -> dict:
                 "activity": activity,
                 "is_meal": bool(item.get("is_meal", False)),
                 "maps_query": _clean_str(item.get("maps_query")) or place,
+                "transit": _clean_str(item.get("transit")),
             })
         try:
             day_no = int(day.get("day", i))
@@ -1161,6 +1260,70 @@ def parse_itinerary_response(text: str | None) -> dict:
         "days": days_out,
         "tips": [_clean_str(t) for t in tips if _clean_str(t)],
     }
+
+
+def _favourite_keys(fav: dict) -> set[str]:
+    return {
+        key for key in (
+            _norm_key(fav.get("name", "")),
+            _norm_key(fav.get("name_zh", "")),
+            _norm_key(fav.get("name_original", "")),
+        ) if key
+    }
+
+
+def match_favourite(place_name: str, favourites: Iterable[dict] | None) -> dict | None:
+    key = _norm_key(place_name)
+    if not key:
+        return None
+    exact = [fav for fav in favourites or [] if key in _favourite_keys(fav)]
+    if exact:
+        return exact[0]
+    loose = []
+    for fav in favourites or []:
+        keys = _favourite_keys(fav)
+        if any(len(min(key, other, key=len)) >= 2 and (key in other or other in key) for other in keys):
+            loose.append(fav)
+    if len(loose) == 1:
+        return loose[0]
+    return None
+
+
+def present_itinerary(itinerary: dict, favourites: Iterable[dict] | None, *, allow_ai: bool) -> dict:
+    """標明來自收藏定 AI 建議，並補上營業時間同評分。"""
+    days = []
+    for day in itinerary.get("days") or []:
+        items = []
+        for stop in day.get("items") or []:
+            fav = match_favourite(stop.get("place_name") or "", favourites)
+            ai = fav is None
+            items.append({
+                **stop,
+                "ai": ai,
+                "hidden": ai and not allow_ai,
+                "added_by": (fav or {}).get("added_by") or "",
+                "opening_hours": public_fact((fav or {}).get("opening_hours") or stop.get("opening_hours")),
+                "rating": public_fact((fav or {}).get("rating") or stop.get("rating"), rating=True),
+            })
+        days.append({**day, "items": items})
+    return {**itinerary, "days": days}
+
+
+def fallback_trip_title(region: str, days: int) -> str:
+    place = (region or "").strip() or "日本"
+    return f"{place}{days}日遊"
+
+
+def style_planning_note(style: str, *, allow_ai: bool) -> str:
+    chosen = style if style in STYLE_RULES else DEFAULT_TRIP_STYLE
+    blurb = dict(TRIP_STYLES).get(chosen, "")
+    rule = STYLE_RULES[chosen]
+    extra = (
+        "可以加入清單以外的地點，呢啲係 AI 建議。"
+        if allow_ai
+        else "只可以排清單入面的地方，唔好加入新店。"
+    )
+    return f"行程風格：{chosen}。{blurb}。{rule}{extra}"
 
 
 def day_directions_url(day: dict) -> str | None:
