@@ -47,7 +47,7 @@ SPARSE_COLLECTION_MIN = getattr(trip_core, "SPARSE_COLLECTION_MIN", 3)
 FAVOURITE_CATEGORIES = getattr(
     trip_core,
     "FAVOURITE_CATEGORIES",
-    ("美食", "景點", "購物", "文化體驗", "自然／戶外", "其他"),
+    ("美食", "景點", "購物", "美容", "文化體驗", "自然／戶外", "其他"),
 )
 PLAN_PREF_OPTIONS = getattr(
     trip_core,
@@ -107,8 +107,78 @@ st.caption(f"build: {_build_sha()}")
 st.markdown(
     """
     <style>
-      .stApp { background: linear-gradient(180deg, #FFF8F5 0%, #FFFFFF 240px); }
+      .stApp {
+        background: linear-gradient(180deg, #FFF8F5 0%, #FFF5F2 220px, #FFFFFF 480px);
+        color: #2C2C2C;
+      }
       h1, h2, h3 { color: #2C2C2C; }
+      .hero-line, .style-banner, .invite-label {
+        background: #FFF5F2;
+        border-radius: 16px;
+        padding: 12px 16px;
+        color: #5A5A5A;
+        line-height: 1.6;
+      }
+      .style-banner { text-align: center; }
+      .helper { color: #5A5A5A; font-size: 15px; margin: 0 0 8px; }
+      .section-label { font-weight: 700; font-size: 16px; margin: 18px 0 8px; color: #2C2C2C; }
+      .count-badge {
+        display: inline-block;
+        background: #FF7A6E;
+        color: #FFFFFF;
+        border-radius: 10px;
+        font-size: 12px;
+        padding: 0 7px;
+        margin-left: 6px;
+        vertical-align: 1px;
+      }
+      .thumb-fallback {
+        width: 64px;
+        height: 64px;
+        border-radius: 12px;
+        background: #FFE8E5;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 28px;
+      }
+      div[data-testid="stVerticalBlockBorderWrapper"] {
+        border: 1px solid #F0E8E6 !important;
+        border-radius: 12px !important;
+        box-shadow: 0 2px 12px rgba(255, 122, 110, 0.12);
+        background: #FFFFFF;
+      }
+      div[data-testid="stHorizontalBlock"] { flex-wrap: nowrap !important; align-items: flex-start !important; }
+      div[data-testid="stHorizontalBlock"]:has([data-testid="stImage"]),
+      div[data-testid="stHorizontalBlock"]:has(.thumb-fallback) {
+        width: 100% !important;
+        max-width: 100% !important;
+      }
+      div[data-testid="stHorizontalBlock"]:has([data-testid="stImage"]) > div[data-testid="stColumn"]:first-child,
+      div[data-testid="stHorizontalBlock"]:has(.thumb-fallback) > div[data-testid="stColumn"]:first-child {
+        flex: 0 0 84px !important;
+        width: 84px !important;
+        min-width: 84px !important;
+        max-width: 84px !important;
+      }
+      div[data-testid="stHorizontalBlock"]:has([data-testid="stImage"]) > div[data-testid="stColumn"]:last-child,
+      div[data-testid="stHorizontalBlock"]:has(.thumb-fallback) > div[data-testid="stColumn"]:last-child {
+        flex: 1 1 auto !important;
+        width: auto !important;
+        min-width: 0 !important;
+        max-width: calc(100% - 96px) !important;
+      }
+      [data-testid="stImage"] img {
+        width: 64px !important;
+        height: 64px !important;
+        max-width: 64px !important;
+        object-fit: cover !important;
+        border-radius: 12px !important;
+      }
+      div.stButton > button {
+        border-radius: 12px;
+        font-weight: 600;
+      }
       div.stButton > button[kind="primary"] {
         background: #FF7A6E;
         border: 1px solid #FF7A6E;
@@ -123,6 +193,15 @@ st.markdown(
         background: #FFFFFF;
         color: #E85D52;
         border: 1.5px solid #FF7A6E;
+      }
+      [data-testid="stFileUploader"] section {
+        border: 1.5px solid #FF7A6E !important;
+        background: #FFFFFF !important;
+        border-radius: 12px !important;
+        padding: 0.4rem 0.8rem !important;
+      }
+      [data-testid="stFileUploader"] button {
+        color: #E85D52;
       }
     </style>
     """,
@@ -743,7 +822,7 @@ def _favourite_record(place: dict, item: dict) -> dict:
         "name_zh": place.get("name_zh") or "",
         "name_original": original,
         "category": _call_trip_core("favourite_category", place, default="其他"),
-        "model_category": place.get("category") or "other",
+        "model_category": _call_trip_core("model_category", place, default=place.get("category") or "other"),
         "regions": _call_trip_core("place_regions", place, item, default=[]),
         "address": (place.get("address") or "").strip(),
         "opening_hours": (place.get("opening_hours") or "").strip(),
@@ -753,40 +832,73 @@ def _favourite_record(place: dict, item: dict) -> dict:
     }
 
 
+def _image_sha(item: dict) -> str:
+    data = item.get("image") or b""
+    if not data:
+        return ""
+    return hashlib.sha256(data).hexdigest()[:16]
+
+
+def _merge_fav(prev: dict, fresh: dict) -> dict:
+    """再分析同一地方時留低第一張卡。地址唔好被差一號嘅新結果換走。"""
+    merged = dict(prev)
+    if not prev.get("edited"):
+        for field in ("name", "name_zh", "name_original", "regions"):
+            if not merged.get(field) and fresh.get(field):
+                merged[field] = fresh[field]
+        if fresh.get("category") == "美容" or (
+            fresh.get("model_category") == "salon" and merged.get("category") == "購物"
+        ):
+            merged["category"] = fresh.get("category") or "美容"
+            merged["model_category"] = fresh.get("model_category") or "salon"
+    for field in ("opening_hours", "rating"):
+        if not (str(merged.get(field) or "")).strip() and (str(fresh.get(field) or "")).strip():
+            merged[field] = fresh[field]
+    if not (merged.get("address") or "").strip() and (fresh.get("address") or "").strip():
+        merged["address"] = fresh["address"]
+    shas: list[str] = []
+    for src in (prev, fresh):
+        for sha in list(src.get("image_shas") or []) + ([src["image_sha"]] if src.get("image_sha") else []):
+            if sha and sha not in shas:
+                shas.append(sha)
+    merged["image_shas"] = shas
+    merged["id"] = prev["id"]
+    merged["edited"] = bool(prev.get("edited"))
+    merged["added_by"] = prev.get("added_by") or fresh.get("added_by")
+    return merged
+
+
 def _publish_favourites() -> None:
     removed = set(st.session_state.get("removed_fav_ids") or [])
     previous = [dict(fav) for fav in st.session_state.get("favourites") or [] if fav.get("id") not in removed]
-    by_id = {fav["id"]: fav for fav in previous}
+    by_id = {fav["id"]: fav for fav in previous if fav.get("id")}
+    order = [fav["id"] for fav in previous if fav.get("id")]
     for item in st.session_state.inbox:
         if _collect_status(item) != COLLECT_STATUS_DONE:
             continue
+        sha = _image_sha(item)
         for place in item.get("places") or []:
             fid = _ensure_fav_id(place)
             if fid in removed:
                 continue
             fresh = _favourite_record(place, item)
-            prev = by_id.get(fid)
-            if prev:
-                for field in ("address", "opening_hours", "rating"):
-                    if not (fresh.get(field) or "").strip() and (prev.get(field) or "").strip():
-                        fresh[field] = prev[field]
-                if prev.get("edited"):
-                    fresh["name"] = prev.get("name") or fresh["name"]
-                    fresh["regions"] = list(prev.get("regions") or fresh["regions"])
-                    fresh["category"] = prev.get("category") or fresh["category"]
-                    fresh["edited"] = True
-            by_id[fid] = fresh
-    ordered: list[dict] = []
-    seen: set[str] = set()
-    for fav in previous:
-        fid = fav.get("id")
-        if fid in by_id and fid not in seen:
-            ordered.append(by_id[fid])
-            seen.add(fid)
-    for fid, fav in by_id.items():
-        if fid not in seen:
-            ordered.append(fav)
-    st.session_state.favourites = ordered
+            if sha:
+                fresh["image_shas"] = [sha]
+            match = by_id.get(fid)
+            same = getattr(trip_core, "same_favourite", None)
+            if match is None and callable(same):
+                for existing in by_id.values():
+                    if same(existing, fresh):
+                        match = existing
+                        break
+            if match is None:
+                by_id[fresh["id"]] = fresh
+                order.append(fresh["id"])
+                continue
+            merged = _merge_fav(match, fresh)
+            place["fav_id"] = match["id"]
+            by_id[match["id"]] = merged
+    st.session_state.favourites = [by_id[fid] for fid in order if fid in by_id]
 
 
 def _drop_favourites_for(item_id: str) -> None:
@@ -904,16 +1016,24 @@ def _render_nav() -> None:
 
 
 def _render_invite() -> None:
-    st.markdown("**邀請朋友一起收集**")
-    st.caption("朋友打開後可加入同一收藏清單，一起貼上截圖並修改。")
-    st.code(_share_url(), language=None)
+    label, action = st.columns([3, 1], vertical_alignment="center")
+    with label:
+        st.markdown('<div class="invite-label">邀請朋友一起收集</div>', unsafe_allow_html=True)
+    with action:
+        if st.button("複製連結", key="copy_invite", type="primary"):
+            st.session_state.show_invite = not st.session_state.get("show_invite")
+            st.rerun()
+    if st.session_state.get("show_invite"):
+        st.caption("朋友打開後可加入同一收藏清單，一起貼上截圖並修改。")
+        st.code(_share_url(), language=None)
 
 
 def _thumb(item: dict) -> None:
-    if item.get("image"):
-        st.image(item["image"], width="stretch")
+    image = item.get("image") if item else None
+    if image:
+        st.image(image, width=64)
     else:
-        st.caption(item.get("label") or "截圖")
+        st.markdown('<div class="thumb-fallback">📍</div>', unsafe_allow_html=True)
 
 
 def _fact_caption(place: dict) -> str:
@@ -934,7 +1054,7 @@ def _ingest_collect_inputs() -> None:
         st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark, batch=False)]
 
     uploaded = st.file_uploader(
-        "批量上傳相簿圖片（可多張）",
+        "批量上傳",
         type=["png", "jpg", "jpeg", "webp"],
         accept_multiple_files=True,
         key=f"uploader_{st.session_state.batch}",
@@ -965,10 +1085,14 @@ def _ingest_collect_inputs() -> None:
     st.session_state.seen_upload_ids = seen_uploads
 
 
+def _card_columns():
+    return st.columns([1, 5], vertical_alignment="top")
+
+
 def _render_collect_card(item: dict) -> None:
     status = _collect_status(item)
     with st.container(border=True):
-        left, right = st.columns([1, 2])
+        left, right = _card_columns()
         with left:
             _thumb(item)
         with right:
@@ -1041,13 +1165,15 @@ def _render_collect_card(item: dict) -> None:
 
 def _render_collect() -> None:
     st.subheader("收集想去的地方")
-    st.caption("貼上截圖，系統會幫你識別並分類。貼上後先排隊，不會自動分析。")
-    st.caption("將 IG／小紅書／YouTube 截圖貼上或批量上傳。")
+    st.markdown('<p class="helper">貼上截圖，系統會幫你識別並分類。</p>', unsafe_allow_html=True)
     _ingest_collect_inputs()
     _kick_analysis()
     pending = [item for item in st.session_state.inbox if _collect_status(item) != COLLECT_STATUS_DONE]
     done = [item for item in st.session_state.inbox if _collect_status(item) == COLLECT_STATUS_DONE]
-    st.markdown(f"**待分析 {len(pending)}**")
+    st.markdown(
+        f'<div class="section-label">待分析 <span class="count-badge">{len(pending)}</span></div>',
+        unsafe_allow_html=True,
+    )
     if not pending:
         st.caption("尚未有待分析項目。")
     for item in pending:
@@ -1055,7 +1181,7 @@ def _render_collect() -> None:
     idle_ids = {item["id"] for item in pending if item.get("analysis") in ("idle", "failed")}
     if idle_ids and st.button("開始分析全部待處理", key="analyze_all", type="secondary"):
         _mark_for_analysis(idle_ids)
-    st.markdown("**已處理**")
+    st.markdown('<div class="section-label">已處理</div>', unsafe_allow_html=True)
     if not done:
         st.caption("分析完成後會顯示在這裡，並加入收藏。")
     for item in done:
@@ -1090,12 +1216,9 @@ def _filtered_favourites() -> list[dict]:
 def _render_favourite(fav: dict) -> None:
     with st.container(border=True):
         source = next((item for item in st.session_state.inbox if item.get("id") == fav.get("source_item")), None)
-        left, right = st.columns([1, 3])
+        left, right = _card_columns()
         with left:
-            if source:
-                _thumb(source)
-            else:
-                st.caption("📍")
+            _thumb(source)
         with right:
             st.markdown(f"**{fav.get('name') or '未命名'}**")
             st.markdown(trip_core.attribution_html(fav.get("added_by") or "", _viewer_name()), unsafe_allow_html=True)
@@ -1147,13 +1270,16 @@ def _render_favourite(fav: dict) -> None:
 
 def _render_collection() -> None:
     st.subheader("我的收藏")
-    st.caption("這裡只有你和朋友收藏的地點，排行程時會用這些。")
+    st.markdown(
+        '<p class="helper">這裡只有你（和朋友）收藏的地點，排行程時會用這些。</p>',
+        unsafe_allow_html=True,
+    )
     _render_invite()
     favs = list(st.session_state.get("favourites") or [])
     if not favs:
         st.info("尚未有收藏。請先在「收集」分析截圖，或手動輸入店名。")
     else:
-        st.caption("右側 ✎ 可改地區、類別或移除。每一張卡都會標明是你還是朋友加入。")
+        st.caption("右側 ✎ 可改地區、類別或移除。")
         visible = _filtered_favourites()
         if not visible:
             st.caption("此篩選暫時沒有地點。")
@@ -1265,6 +1391,7 @@ def _render_plan() -> None:
                 preferences=request["preferences"],
                 party=request["party"],
             )
+            itinerary = _enrich_suggested_stops(itinerary, places, status)
         except gemini_client.GeminiError as err:
             plan_error = str(err)
             status.update(label=f"排行程失敗：{plan_error}", state="error")
@@ -1290,6 +1417,43 @@ def _render_plan() -> None:
         st.rerun()
 
 
+def _suggested_seeds(itinerary: dict, known_places: list[dict]) -> list[dict]:
+    seeds = []
+    seen: set[str] = set()
+    for day in itinerary.get("days") or []:
+        for stop in day.get("items") or []:
+            if trip_core.match_place(stop, known_places):
+                continue
+            name = (stop.get("place_name") or "").strip()
+            key = trip_core._norm_key(name)
+            if not key or key in seen:
+                continue
+            if (stop.get("opening_hours") or "").strip() and (stop.get("rating") or "").strip():
+                continue
+            seen.add(key)
+            seeds.append({
+                "name": name,
+                "name_zh": name,
+                "area": day.get("area") or "",
+                "category": "other",
+            })
+    return seeds
+
+
+def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -> dict:
+    """AI 建議用同一條文字核對，失敗就保持未核實，唔好拖垮成個行程。"""
+    seeds = _suggested_seeds(itinerary, known_places)
+    enriched: list[dict] = []
+    if seeds:
+        status.write("核對 AI 建議的地址、營業時間、評分。")
+        try:
+            enriched = _enrich_places(seeds)
+        except Exception:  # noqa: BLE001
+            logger.exception("AI suggestion enrich failed")
+            enriched = []
+    return trip_core.attach_place_facts(itinerary, list(known_places) + list(enriched or []))
+
+
 def _render_results() -> None:
     itinerary = st.session_state.get("itinerary")
     style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
@@ -1305,7 +1469,7 @@ def _render_results() -> None:
         allow_ai=bool(st.session_state.get("planned_allow_ai", True)),
     )
     st.subheader(shown.get("title") or "行程結果")
-    st.markdown(f"**已按「{style}」安排**")
+    st.markdown(f'<div class="style-banner">已按「{style}」安排</div>', unsafe_allow_html=True)
     days = shown.get("days") or []
     labels = [f"Day {day.get('day')}" for day in days]
     if labels:
@@ -1352,7 +1516,7 @@ def _render_results() -> None:
 
 def _render_opening() -> None:
     st.title("懶人出行 ✈️")
-    st.markdown(HERO_LINE)
+    st.markdown(f'<p class="hero-line">{HERO_LINE}</p>', unsafe_allow_html=True)
     steps = "\n".join(f"{index}. {label}" for index, label in enumerate(OPENING_STEPS, start=1))
     st.markdown(steps)
     st.text_input("你的顯示名", key="display_name")

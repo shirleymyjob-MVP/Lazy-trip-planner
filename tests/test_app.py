@@ -339,6 +339,105 @@ def test_shared_inbox_keeps_who_added_the_screenshot():
     assert "加入：Ada" in _page(other)
 
 
+def test_collect_page_has_helper_and_no_clipboard_button():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "B"
+    at.run()
+    assert not at.exception
+    page = _page(at)
+    assert "貼上截圖，系統會幫你識別並分類。" in page
+    assert "待分析" in page and "已處理" in page
+    assert "查看我的收藏 →" in [button.label for button in at.button]
+    assert "從剪貼簿貼上" not in [button.label for button in at.button]
+    assert "貼上截圖" not in [button.label for button in at.button]
+    assert at.file_uploader[0].label == "批量上傳"
+
+
+def test_same_screenshot_publishes_one_favourite():
+    image = _png("red")
+
+    def item(item_id, name, address):
+        return {
+            "id": item_id,
+            "image": image,
+            "analysis": "done",
+            "facts": "done",
+            "places": [{
+                "name": name,
+                "name_zh": name,
+                "category": "shop",
+                "area": "福岡",
+                "address": address,
+                "opening_hours": "11:00-20:00",
+                "rating": "4.2/5",
+            }],
+            "added_by": "旅人",
+            "remark": "",
+            "batch": False,
+        }
+
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "C"
+    at.session_state["inbox"] = [
+        item("a", "kchiara", "福岡市中央區大名1-10-15"),
+        item("b", "キアラ", "福岡縣福岡市中央區大名1-10-14"),
+    ]
+    at.run()
+    assert not at.exception
+    favs = at.session_state["favourites"]
+    assert len(favs) == 1
+    assert "1-10-15" in favs[0]["address"]
+    assert not any(button.label == "從剪貼簿貼上" for button in at.button)
+
+
+def test_ai_suggestion_is_enriched_instead_of_staying_unverified():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "D"
+    at.session_state["start_date"] = date(2026, 11, 14)
+    at.session_state["favourites"] = [_fav(added_by="小美")]
+    at.session_state["allow_ai"] = True
+    at.run()
+    fake = {
+        "title": "福岡3日遊",
+        "days": [{"day": 1, "area": "福岡", "theme": "", "items": [
+            {
+                "time": "09:00", "place_name": "太宰府天滿宮", "activity": "求學問運。",
+                "is_meal": False, "maps_query": "太宰府天滿宮", "transit": "",
+            },
+            {
+                "time": "16:00", "place_name": "大濠公園", "activity": "湖邊散步。",
+                "is_meal": False, "maps_query": "大濠公園", "transit": "步行 約 8 分鐘",
+            },
+        ]}],
+        "tips": [],
+    }
+    enriched = [{
+        "name": "大濠公園",
+        "name_zh": "大濠公園",
+        "category": "attraction",
+        "area": "福岡",
+        "address": "福岡市中央區大濠公園",
+        "opening_hours": "09:00-18:00",
+        "rating": "4.4/5",
+    }]
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=fake), \
+         mock.patch.object(
+             gemini_client, "enrich_places",
+             return_value=gemini_client.AnalysisResult(enriched, []),
+         ) as enrich:
+        _button(at, "開始排行程").click().run()
+    assert not at.exception
+    assert enrich.call_count == 1
+    page = _page(at)
+    assert "09:00-18:00" in page
+    assert "4.4/5" in page
+    assert "AI 建議" in page
+    assert "未核實" not in page
+    assert at.session_state["usage"] == 1
+
+
 def test_missing_trip_style_constant_still_opens_and_shows_build(monkeypatch):
     """舊 trip_core 冇新常數時，開場唔可以 AttributeError，而且 build 要先畫出嚟。"""
     for name in (

@@ -41,7 +41,7 @@ SELF_ATTRIBUTION = "我"
 SELF_COLOR = "#4A90D9"
 FRIEND_COLOR = "#8A8A8A"
 SPARSE_COLLECTION_MIN = 3
-FAVOURITE_CATEGORIES = ("美食", "景點", "購物", "文化體驗", "自然／戶外", "其他")
+FAVOURITE_CATEGORIES = ("美食", "景點", "購物", "美容", "文化體驗", "自然／戶外", "其他")
 PLAN_PREF_OPTIONS = ("美食", "景點", "購物", "文化體驗", "自然／戶外")
 TRIP_STYLES = (
     ("平衡型", "正常節奏，食與玩均衡"),
@@ -104,15 +104,21 @@ DAY_OPTIONS = tuple(str(n) for n in range(1, 15))
 DAY_DEFAULT = "3"
 OTHER_CHOICE = "其他"
 
-CATEGORIES = ("restaurant", "cafe", "dessert", "attraction", "shop", "other")
+CATEGORIES = ("restaurant", "cafe", "dessert", "attraction", "shop", "salon", "other")
 CATEGORY_LABELS = {
     "restaurant": "🍜 餐廳",
     "cafe": "☕ Cafe",
     "dessert": "🍰 甜品",
     "attraction": "📍 景點",
     "shop": "🛍️ 購物",
+    "salon": "💇 美容",
     "other": "✨ 其他",
 }
+_SALON_RE = re.compile(
+    r"美容室|美容院|美髮|美发|理髮|理发|理容室|理容院|美甲|ネイル|ヘアサロン|hair\s*salon|髮型屋|发型屋",
+    re.IGNORECASE,
+)
+_SHOPPING_COPY_RE = re.compile(r"選物|購物|逛街|血拼|買手信|手信店")
 CONFIDENCE_LEVELS = ("高", "中", "低")
 _CONFIDENCE_ALIASES = {
     "high": "高", "medium": "中", "mid": "中", "low": "低",
@@ -241,8 +247,23 @@ def normalize_category(value: Any) -> str:
         "甜品": "dessert", "sweets": "dessert", "bakery": "dessert",
         "景點": "attraction", "sight": "attraction", "sightseeing": "attraction",
         "商店": "shop", "購物": "shop", "shopping": "shop", "store": "shop",
+        "美容": "salon", "美容室": "salon", "美容院": "salon", "美髮": "salon", "美发": "salon",
+        "理髮": "salon", "理发": "salon", "理容": "salon", "美甲": "salon", "salon": "salon",
     }
     return aliases.get(v, "other")
+
+
+def looks_like_salon(place: dict | None) -> bool:
+    """美容室／美髮／美甲唔係商店。店名、備註或類別有這些字就當 salon。"""
+    if not isinstance(place, dict):
+        return False
+    blob = " ".join(
+        _clean_str(place.get(key))
+        for key in ("name", "name_zh", "name_original", "notes", "category", "fav_category")
+    )
+    if _SALON_RE.search(blob):
+        return True
+    return normalize_category(place.get("category")) == "salon"
 
 
 def normalize_confidence(value: Any) -> str:
@@ -460,6 +481,8 @@ def collect_status(item: dict) -> str:
 
 
 def favourite_category(place: dict) -> str:
+    if looks_like_salon(place):
+        return "美容"
     raw = _clean_str(place.get("fav_category") or place.get("category"))
     if raw in FAVOURITE_CATEGORIES:
         return raw
@@ -469,8 +492,26 @@ def favourite_category(place: dict) -> str:
         "dessert": "美食",
         "attraction": "景點",
         "shop": "購物",
+        "salon": "美容",
     }
     return mapped.get(normalize_category(raw), "其他")
+
+
+def model_category(place: dict) -> str:
+    """交俾排行程嘅類別。美容室唔好再係 shop，否則文案會變成選物店。"""
+    if looks_like_salon(place):
+        return "salon"
+    return normalize_category(place.get("category"))
+
+
+def rewrite_activity(place_name: str, activity: str, category: str = "") -> str:
+    """美容室唔好用購物句。原本已經係做髮型／美容嘅句子就保留。"""
+    if not looks_like_salon({"name": place_name, "name_zh": place_name, "category": category}):
+        return activity or ""
+    text = activity or ""
+    if not text or _SHOPPING_COPY_RE.search(text):
+        return "預留時間做髮型或美容。"
+    return text
 
 
 def place_regions(place: dict, item: dict | None = None) -> list[str]:
@@ -812,10 +853,11 @@ def normalize_place(raw: dict) -> dict | None:
     if not name and not name_zh:
         return None
     src = raw.get("source_images", raw.get("source_image", raw.get("source_image_index")))
-    return {
+    category = normalize_category(raw.get("category"))
+    place = {
         "name": name or name_zh,
         "name_zh": name_zh,
-        "category": normalize_category(raw.get("category")),
+        "category": category,
         "area": _clean_str(raw.get("area")),
         "address": _clean_str(raw.get("address")),
         "opening_hours": _clean_str(raw.get("opening_hours")),
@@ -825,6 +867,9 @@ def normalize_place(raw: dict) -> dict | None:
         "source_images": _to_int_list(src),
         "caption_index": normalize_caption_index(raw.get("caption_index")),
     }
+    if looks_like_salon(place):
+        place["category"] = "salon"
+    return place
 
 
 def parse_places_response(text: str | None) -> list[dict]:
@@ -853,7 +898,9 @@ def _merge(a: dict, b: dict) -> dict:
             merged[key] = b[key]
     if b.get("notes") and b["notes"] not in merged.get("notes", ""):
         merged["notes"] = "；".join(x for x in (merged.get("notes"), b["notes"]) if x)
-    if merged.get("category") == "other" and b.get("category") != "other":
+    if looks_like_salon(merged) or looks_like_salon(b) or b.get("category") == "salon":
+        merged["category"] = "salon"
+    elif merged.get("category") == "other" and b.get("category") not in (None, "", "other"):
         merged["category"] = b["category"]
     if not merged.get("caption_index") and b.get("caption_index"):
         merged["caption_index"] = b["caption_index"]
@@ -1262,6 +1309,68 @@ def parse_itinerary_response(text: str | None) -> dict:
     }
 
 
+def _address_parts(address: str) -> tuple[str, list[int]]:
+    text = unicodedata.normalize("NFKC", address or "").lower()
+    text = re.sub(r"[\s　]", "", text)
+    nums = [int(n) for n in re.findall(r"\d+", text)]
+    stem = re.sub(r"[\d\-－ー−‐]+", "", text)
+    for token in ("日本", "福岡県", "福岡縣", "東京都", "大阪府", "京都府", "北海道"):
+        stem = stem.replace(token, "")
+    return stem, nums
+
+
+def addresses_near(left: str, right: str) -> bool:
+    """同一條街、門牌只差一號（例如 1-10-15 同 1-10-14）視為同一次核對嘅漂移。"""
+    stem_a, nums_a = _address_parts(left)
+    stem_b, nums_b = _address_parts(right)
+    if not stem_a or not stem_b or not nums_a or not nums_b:
+        return False
+    if len(nums_a) != len(nums_b) or nums_a[:-1] != nums_b[:-1]:
+        return False
+    if abs(nums_a[-1] - nums_b[-1]) > 1:
+        return False
+    return stem_a in stem_b or stem_b in stem_a
+
+
+def _record_name_keys(record: dict) -> set[str]:
+    return {
+        key for key in (
+            _norm_key(record.get("name", "")),
+            _norm_key(record.get("name_zh", "")),
+            _norm_key(record.get("name_original", "")),
+        ) if key
+    }
+
+
+def _record_image_shas(record: dict) -> set[str]:
+    found = {str(sha) for sha in (record.get("image_shas") or []) if sha}
+    if record.get("image_sha"):
+        found.add(str(record["image_sha"]))
+    return found
+
+
+def names_match(left: dict, right: dict) -> bool:
+    keys_a = _record_name_keys(left)
+    keys_b = _record_name_keys(right)
+    if keys_a & keys_b:
+        return True
+    for key_a in keys_a:
+        for key_b in keys_b:
+            short, long = (key_a, key_b) if len(key_a) <= len(key_b) else (key_b, key_a)
+            if len(short) >= 4 and short in long:
+                return True
+    return False
+
+
+def same_favourite(left: dict, right: dict) -> bool:
+    """同名，或同一張截圖再核對出嚟嘅相近地址，都係同一張收藏卡。"""
+    if names_match(left, right):
+        return True
+    if not (_record_image_shas(left) & _record_image_shas(right)):
+        return False
+    return addresses_near(left.get("address") or "", right.get("address") or "")
+
+
 def _favourite_keys(fav: dict) -> set[str]:
     return {
         key for key in (
@@ -1297,11 +1406,13 @@ def present_itinerary(itinerary: dict, favourites: Iterable[dict] | None, *, all
         for stop in day.get("items") or []:
             fav = match_favourite(stop.get("place_name") or "", favourites)
             ai = fav is None
+            category = (fav or {}).get("category") or (fav or {}).get("model_category") or ""
             items.append({
                 **stop,
                 "ai": ai,
                 "hidden": ai and not allow_ai,
                 "added_by": (fav or {}).get("added_by") or "",
+                "activity": rewrite_activity(stop.get("place_name") or "", stop.get("activity") or "", category),
                 "opening_hours": public_fact((fav or {}).get("opening_hours") or stop.get("opening_hours")),
                 "rating": public_fact((fav or {}).get("rating") or stop.get("rating"), rating=True),
             })
