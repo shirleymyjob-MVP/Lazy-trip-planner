@@ -21,6 +21,7 @@ from urllib.parse import quote, urlencode
 import streamlit as st
 import streamlit.components.v1 as components
 
+import auth_gate
 import gemini_client
 import trip_core
 import trip_store
@@ -106,6 +107,9 @@ def _call_trip_core(name: str, *args, default):
 
 
 st.set_page_config(page_title="懶人出行 ✈️", page_icon="✈️", layout="centered")
+# 未登入只可睇登入頁。必須早過 build caption、init_state、以及任何分享行程讀寫。
+auth_gate.require_login()
+auth_gate.render_logout()
 # init 之後先畫頁尾的話，AttributeError 會令 UAT 睇唔到 SHA。
 st.caption(f"build: {_build_sha()}")
 st.markdown(

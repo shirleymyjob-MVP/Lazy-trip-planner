@@ -39,6 +39,30 @@
 
 成功的「開始分析」與「開始排行程」各計 1 次。核實地址不另計。失敗不計。
 
+## Google 登入（Phase 1）
+
+未登入的人只會見到登入頁，不會讀取或儲存行程。登入用 Streamlit 內建的 Google OIDC（`st.login` / `st.logout` / `st.user`）。會員身份是 ID token 的 `sub`，不會寫進行程檔。這階段**沒有**私人隔離：登入之後，舊的 `?share=` 連結仍然是同一份共用行程。
+
+登入 cookie 名稱是 `_streamlit_user`，有效期 **30 日**（Streamlit 1.66.1 寫死，不能改，也不跟 Google ID token 的 `exp`）。關掉瀏覽器再打開，30 日內會自動還原登入。`st.logout()` 只會登出這個應用程式；Google 沒有 `end_session_endpoint`，Google 帳戶本身仍會保持登入。
+
+`st.login()` 完成、取消或失敗之後，Streamlit 都會 302 回應用程式首頁 `/`，並開啟新 session。原本網址上的 `?share=` **不會**被帶過這次登入。已經登入的人直接打開 `?share=` 連結則不受影響。所以：未登入時先打開分享連結，登入完成後要再開一次同一條連結。
+
+Google OAuth 同意畫面必須 **發佈到正式環境（In production）**，不要留在 Testing，否則只有測試用戶名單內的人可以登入。
+
+### `[auth]` 密鑰名稱
+
+只在 `.streamlit/secrets.toml`（本機）或 Streamlit Cloud Secrets 填寫。不要提交真實密鑰。占位示例見 `.streamlit/secrets.toml.example`。
+
+| Key | 說明 |
+|---|---|
+| `redirect_uri` | 絕對網址，路徑以 `/oauth2callback` 結尾，例如 `https://<app-host>/oauth2callback`。本機預設埠是 `http://localhost:8501/oauth2callback` |
+| `cookie_secret` | 自行產生的長隨機字串，用來簽署身份 cookie |
+| `client_id` | Google OAuth 用戶端 ID |
+| `client_secret` | Google OAuth 用戶端密鑰 |
+| `server_metadata_url` | `https://accounts.google.com/.well-known/openid-configuration` |
+
+依賴：`Authlib>=1.3.2`（本專案鎖 `Authlib==1.9.2`）以及 `httpx`（Starlette OIDC client 需要；本專案鎖 `httpx==0.28.1`）。
+
 ## 部署設定（Streamlit Secrets）
 
 | Key | 必填 | 預設 | 用途 |
