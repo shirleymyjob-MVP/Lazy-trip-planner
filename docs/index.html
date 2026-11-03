@@ -1,0 +1,89 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>懶人出行</title>
+  <meta name="description" content="懶人出行（Lazy Trip Planner）測試階段說明與私隱政策。">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f0ea;
+      --card: #fffdfb;
+      --ink: #1c1917;
+      --muted: #44403c;
+      --line: #e6ddd3;
+      --accent: #9a3412;
+      --soft: #f8ebe6;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "PingFang TC", "PingFang HK", "Noto Sans CJK TC", "Microsoft JhengHei", "Heiti TC", sans-serif;
+      font-size: 1.0625rem;
+      line-height: 1.75;
+    }
+
+    main {
+      width: min(42rem, calc(100% - 2rem));
+      margin: 1.5rem auto;
+      padding: 1.75rem 1.25rem;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      box-shadow: 0 10px 30px rgba(68, 48, 28, 0.06);
+    }
+
+    h1 {
+      margin: 0 0 0.5rem;
+      font-size: clamp(1.8rem, 6vw, 2.25rem);
+      line-height: 1.25;
+    }
+
+    p { margin: 0.6rem 0; }
+
+    .muted { color: var(--muted); }
+
+    a {
+      color: var(--accent);
+      font-weight: 600;
+      text-underline-offset: 0.18em;
+    }
+
+    a:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
+    .policy {
+      display: inline-block;
+      margin-top: 0.75rem;
+      padding: 0.55rem 0.9rem;
+      background: var(--soft);
+      border-radius: 999px;
+    }
+
+    @media (max-width: 640px) {
+      main {
+        width: min(42rem, calc(100% - 1rem));
+        padding: 1.4rem 1rem;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>懶人出行</h1>
+    <p class="muted">Lazy Trip Planner 目前處於測試階段。</p>
+    <p><a class="policy" href="privacy/">私隱政策</a></p>
+  </main>
+</body>
+</html>
