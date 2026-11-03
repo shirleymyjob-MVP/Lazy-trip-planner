@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>私隱政策｜懶人出行</title>
+  <meta name="description" content="懶人出行（Lazy Trip Planner）測試階段私隱政策，說明 Google 登入、行程、收藏及圖片資料的處理方式。">
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4f0ea;
+      --card: #fffdfb;
+      --ink: #1c1917;
+      --muted: #44403c;
+      --line: #e6ddd3;
+      --accent: #9a3412;
+      --soft: #f8ebe6;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "PingFang TC", "PingFang HK", "Noto Sans CJK TC", "Microsoft JhengHei", "Heiti TC", sans-serif;
+      font-size: 1.0625rem;
+      line-height: 1.75;
+    }
+
+    a {
+      color: var(--accent);
+      text-underline-offset: 0.18em;
+    }
+
+    a:hover { text-decoration-thickness: 2px; }
+
+    a:focus-visible {
+      outline: 3px solid var(--accent);
+      outline-offset: 3px;
+      border-radius: 4px;
+    }
+
+    .wrap {
+      width: min(42rem, calc(100% - 2rem));
+      margin: 0 auto;
+      padding: 1.5rem 0 3rem;
+    }
+
+    header, main, footer {
+      background: var(--card);
+    }
+
+    header, footer {
+      padding: 1.5rem 1.25rem;
+    }
+
+    main { padding: 0.25rem 1.25rem 1.5rem; }
+
+    .sheet {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      overflow: hidden;
+      box-shadow: 0 10px 30px rgba(68, 48, 28, 0.06);
+    }
+
+    .brand {
+      margin: 0 0 0.75rem;
+      font-size: 0.95rem;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(1.8rem, 6vw, 2.25rem);
+      line-height: 1.25;
+      letter-spacing: 0.01em;
+    }
+
+    .updated {
+      margin: 0.75rem 0 0;
+      color: var(--muted);
+    }
+
+    h2 {
+      margin: 2rem 0 0.6rem;
+      font-size: 1.25rem;
+      line-height: 1.4;
+    }
+
+    p, ul { margin: 0.6rem 0; }
+
+    ul {
+      padding-left: 1.25rem;
+    }
+
+    li + li { margin-top: 0.35rem; }
+
+    code {
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 0.92em;
+      background: var(--soft);
+      padding: 0.1em 0.4em;
+      border-radius: 6px;
+      overflow-wrap: anywhere;
+    }
+
+    .note {
+      margin-top: 1rem;
+      padding: 0.9rem 1rem;
+      background: var(--soft);
+      border-radius: 12px;
+    }
+
+    footer {
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    footer p { margin: 0; }
+
+    @media (max-width: 640px) {
+      .wrap { width: min(42rem, calc(100% - 1rem)); }
+      header, footer { padding: 1.25rem 1rem; }
+      main { padding: 0 1rem 1.25rem; }
+      body { font-size: 1rem; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <article class="sheet">
+      <header>
+        <p class="brand"><a href="../">懶人出行</a></p>
+        <h1>私隱政策</h1>
+        <p class="updated">更新日期：<time datetime="2026-11-03">2026-11-03</time></p>
+      </header>
+      <main>
+        <p>本政策說明「懶人出行」（Lazy Trip Planner，下稱「本應用」）在測試階段如何處理與你有關的資料。本應用仍在測試，以下內容只描述現階段的實際情況。</p>
+
+        <section>
+          <h2>Google 登入</h2>
+          <p>使用 Google 帳戶登入時，本應用會要求下列權限：</p>
+          <ul>
+            <li><code>openid</code></li>
+            <li><code>email</code></li>
+            <li><code>profile</code></li>
+          </ul>
+          <p>這些權限用於確認登入身分，並取得 Google 帳戶的基本資料，例如電郵地址，以及個人檔案中的顯示名稱等資料（以 Google 實際回傳的內容為準）。</p>
+        </section>
+
+        <section>
+          <h2>你提供的資料</h2>
+          <p>你可以向本應用提供行程、收藏及圖片（例如地點截圖）。這些內容由你主動提交，用於整理想去的地方及安排行程。</p>
+        </section>
+
+        <section>
+          <h2>託管與資料處理</h2>
+          <p>本應用以 Streamlit 託管。處理你提供的資料時，本應用可能使用第三方人工智能服務，例如用於辨識圖片內容或產生行程建議。</p>
+        </section>
+
+        <section>
+          <h2>測試階段的現況</h2>
+          <div class="note">
+            <ul>
+              <li>現階段尚未完成以 Supabase 保存資料。</li>
+              <li>現階段尚未完成私人資料隔離。</li>
+              <li>持有分享連結並已登入的用戶，可能查看或修改同一份行程。</li>
+              <li>測試期間資料可能遺失。</li>
+            </ul>
+          </div>
+        </section>
+
+        <section>
+          <h2>不出售個人資料</h2>
+          <p>本應用不出售用戶的個人資料。</p>
+        </section>
+
+        <section>
+          <h2>查詢或刪除要求</h2>
+          <p>如需查詢你的個人資料，或要求刪除個人資料，請電郵 <a href="mailto:Shirley.myjob@gmail.com">Shirley.myjob@gmail.com</a>。你可以提出這些要求。本應用目前沒有自動刪除功能。</p>
+        </section>
+      </main>
+      <footer>
+        <p>懶人出行 · 私隱政策 · 2026-11-03</p>
+      </footer>
+    </article>
+  </div>
+</body>
+</html>
