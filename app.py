@@ -48,6 +48,11 @@ OPENING_STEPS = getattr(
 PAYWALL_NOTE = getattr(trip_core, "PAYWALL_NOTE", "收費：待定")
 UNVERIFIED = getattr(trip_core, "UNVERIFIED", "未核實")
 SPARSE_COLLECTION_MIN = getattr(trip_core, "SPARSE_COLLECTION_MIN", 3)
+NEARBY_UNVERIFIED_NOTE = getattr(
+    trip_core,
+    "NEARBY_UNVERIFIED_NOTE",
+    "附近暫時未能核實真實高評分地點，未有加入建議。",
+)
 FAVOURITE_CATEGORIES = getattr(
     trip_core,
     "FAVOURITE_CATEGORIES",
@@ -311,8 +316,6 @@ st.markdown(
         object-fit: cover !important;
         border-radius: 8px !important;
       }
-      div[class*="st-key-edit_"],
-      div[class*="st-key-rename_open_"],
       div[class*="st-key-zoom_"] {
         position: absolute !important;
         z-index: 3;
@@ -323,11 +326,7 @@ st.markdown(
         overflow: hidden !important;
         margin: 0 !important;
       }
-      div[class*="st-key-edit_"],
-      div[class*="st-key-rename_open_"] { top: 4px; right: 4px; }
       div[class*="st-key-zoom_"] { top: 4px; left: 4px; }
-      div[class*="st-key-edit_"] button,
-      div[class*="st-key-rename_open_"] button,
       div[class*="st-key-zoom_"] button {
         min-height: 28px !important;
         height: 28px !important;
@@ -336,6 +335,34 @@ st.markdown(
         font-size: 14px !important;
         line-height: 1 !important;
         border-radius: 8px !important;
+      }
+      /* 只定位鉛筆掣。表單欄位唔好再用 edit_ 前綴，否則會被收成 32px 而撳唔到。 */
+      div[class*="st-key-card_edit_"],
+      div[class*="st-key-card_rename_"] {
+        position: absolute !important;
+        z-index: 8 !important;
+        top: 4px !important;
+        right: 4px !important;
+        width: auto !important;
+        max-width: 64px !important;
+        height: auto !important;
+        max-height: none !important;
+        overflow: visible !important;
+        margin: 0 !important;
+        pointer-events: auto !important;
+      }
+      div[class*="st-key-card_edit_"] button,
+      div[class*="st-key-card_rename_"] button {
+        min-height: 32px !important;
+        height: 32px !important;
+        width: 36px !important;
+        padding: 0 !important;
+        font-size: 14px !important;
+        line-height: 1 !important;
+        border-radius: 8px !important;
+        pointer-events: auto !important;
+        position: relative !important;
+        z-index: 9 !important;
       }
       div[class*="st-key-zoom_thumb_"] {
         position: absolute !important;
@@ -401,6 +428,14 @@ st.markdown(
       div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"] p,
       div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"] p {
         margin: 0 !important;
+      }
+      div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"],
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"] {
+        pointer-events: none !important;
+      }
+      div[data-testid="stLayoutWrapper"]:has(.mini-card) [data-testid="stMarkdown"] a,
+      div[data-testid="stVerticalBlockBorderWrapper"]:has(.mini-card) [data-testid="stMarkdown"] a {
+        pointer-events: auto !important;
       }
       div[class*="st-key-mobile_fix"] {
         height: 0 !important;
@@ -1199,14 +1234,20 @@ def _ensure_fav_id(place: dict) -> str:
 def _favourite_record(place: dict, item: dict) -> dict:
     name = (place.get("name_zh") or place.get("name") or "").strip()
     original = (place.get("name") or name).strip()
+    locked_label = str(place.get("fav_category") or "").strip()
+    category_locked = bool(place.get("category_locked")) and locked_label in FAVOURITE_CATEGORIES
     record = {
         "id": _ensure_fav_id(place),
         "source_item": item.get("id") or "",
         "name": name or original,
         "name_zh": place.get("name_zh") or "",
         "name_original": original,
-        "category": _call_trip_core("favourite_category", place, default="其他"),
-        "model_category": _call_trip_core("model_category", place, default=place.get("category") or "other"),
+        "category": locked_label if category_locked else _call_trip_core("favourite_category", place, default="其他"),
+        "model_category": (
+            place.get("category") or _model_for_label(locked_label)
+            if category_locked
+            else _call_trip_core("model_category", place, default=place.get("category") or "other")
+        ),
         "regions": _call_trip_core("place_regions", place, item, default=[]),
         "address": (place.get("address") or "").strip(),
         "opening_hours": (place.get("opening_hours") or "").strip(),
@@ -1214,7 +1255,7 @@ def _favourite_record(place: dict, item: dict) -> dict:
         "hours_on_image": (place.get("hours_on_image") or "").strip(),
         "rating_on_image": (place.get("rating_on_image") or "").strip(),
         "added_by": (item.get("added_by") or "").strip() or "旅人",
-        "edited": False,
+        "edited": category_locked,
         "address_on_image": (place.get("address_on_image") or "").strip(),
         "added_at": time.time(),
     }
@@ -1558,16 +1599,158 @@ def _drop_started_favourites(item_ids: set[str]) -> None:
         _drop_favourites_for(item_id)
 
 
-def _apply_manual_name(item: dict, name: str) -> None:
-    place = trip_core.seed_place(name, area=item.get("city") or "", category="other")
+def _model_for_label(label: str) -> str:
+    fn = getattr(trip_core, "model_category_for_label", None)
+    if callable(fn):
+        try:
+            return str(fn(label))
+        except Exception:
+            logger.exception("model_category_for_label failed")
+    return "other"
+
+
+def _clean_region_choice(chosen) -> list[str]:
+    if isinstance(chosen, str):
+        chosen = [chosen]
+    regions: list[str] = []
+    for name in chosen or []:
+        cleaned = str(name or "").strip()
+        if not cleaned or cleaned == trip_core.UNSORTED_REGION or cleaned in regions:
+            continue
+        regions.append(cleaned)
+    return regions
+
+
+def _visible_category(place: dict) -> str:
+    locked = str(place.get("fav_category") or "").strip()
+    if place.get("category_locked") and locked in FAVOURITE_CATEGORIES:
+        return locked
+    try:
+        return str(trip_core.favourite_category(place))
+    except Exception:
+        logger.exception("favourite_category failed")
+        return locked or "其他"
+
+
+def _write_place_classification(place: dict, item: dict | None, *, name: str, category: str, regions: list[str]) -> None:
+    label = category if category in FAVOURITE_CATEGORIES else "其他"
+    place["name"] = name
+    place["name_zh"] = name
+    place["fav_category"] = label
+    place["category"] = _model_for_label(label)
+    place["category_locked"] = True
+    place["area"] = "、".join(regions)
+    if item is None:
+        return
+    if regions:
+        item["regions"] = list(regions)
+        item["city"] = regions[0]
+        item["region_confidence"] = trip_core.REGION_MANUAL
+    elif item.get("region_confidence") != trip_core.REGION_MANUAL:
+        _apply_region(item)
+
+
+def _write_fav_classification(fav: dict, *, name: str, category: str, regions: list[str]) -> None:
+    label = category if category in FAVOURITE_CATEGORIES else (fav.get("category") or "其他")
+    fav["name"] = name
+    fav["name_zh"] = name
+    fav["name_original"] = name
+    fav["category"] = label
+    fav["model_category"] = _model_for_label(label)
+    fav["regions"] = list(regions) or [trip_core.UNSORTED_REGION]
+    fav["edited"] = True
+
+
+def _matching_favourite(place: dict, name: str) -> dict | None:
+    fav_id = place.get("fav_id")
+    for fav in st.session_state.get("favourites") or []:
+        if fav_id and fav.get("id") == fav_id:
+            return fav
+    for fav in st.session_state.get("favourites") or []:
+        if _same_favourite(fav, {"name": name, "name_zh": name, "address": place.get("address") or ""}):
+            return fav
+    return None
+
+
+def _source_place(fav: dict) -> tuple[dict | None, dict | None]:
+    for item in st.session_state.get("inbox") or []:
+        if item.get("id") != fav.get("source_item"):
+            continue
+        places = list(item.get("places") or [])
+        for place in places:
+            if place.get("fav_id") == fav.get("id"):
+                return item, place
+        if len(places) == 1:
+            return item, places[0]
+    return None, None
+
+
+def _apply_saved_place(item: dict, place: dict, *, name: str, category: str, regions: list[str]) -> None:
+    _write_place_classification(place, item, name=name, category=category, regions=regions)
+    fav = _matching_favourite(place, name)
+    if fav is None:
+        _publish_favourites()
+        fav = _matching_favourite(place, name)
+    if fav is not None:
+        _write_fav_classification(fav, name=name, category=category, regions=regions)
+        place["fav_id"] = fav.get("id") or place.get("fav_id")
+
+
+def _apply_manual_name(item: dict, name: str, *, category: str = "其他", area: str = "") -> None:
+    regions = _clean_region_choice([area] if area else [])
+    label = category if category in FAVOURITE_CATEGORIES else "其他"
+    place = trip_core.seed_place(
+        name,
+        area="、".join(regions) or (item.get("city") or ""),
+        category=_model_for_label(label),
+    )
     if not place:
         return
     _ensure_fav_id(place)
+    place["fav_category"] = label
+    place["category_locked"] = True
     item["places"] = [place]
     item["analysis"] = "done"
     item["facts"] = "pending"
     item["warning"] = ""
-    _apply_region(item)
+    if regions:
+        item["regions"] = list(regions)
+        item["city"] = regions[0]
+        item["region_confidence"] = trip_core.REGION_MANUAL
+    else:
+        _apply_region(item)
+
+
+def _create_manual_item(name: str, category: str, area: str) -> None:
+    regions = _clean_region_choice([area] if area else [])
+    label = category if category in FAVOURITE_CATEGORIES else "其他"
+    number = st.session_state.next_image_num
+    st.session_state.next_image_num = number + 1
+    item = {
+        "id": uuid.uuid4().hex,
+        "label": f"手動 {number}",
+        "image": b"",
+        "remark": "",
+        "status": "未排程",
+        "analysis": "done",
+        "facts": "done",
+        "batch": False,
+        "places": [],
+        "city": regions[0] if regions else "",
+        "regions": list(regions),
+        "region_confidence": trip_core.REGION_MANUAL if regions else trip_core.REGION_LOW,
+        "warning": "",
+        "added_by": _viewer_name(),
+        "added_at": time.time(),
+    }
+    place = trip_core.seed_place(name, area="、".join(regions), category=_model_for_label(label))
+    if not place:
+        return
+    _ensure_fav_id(place)
+    place["fav_category"] = label
+    place["category_locked"] = True
+    item["places"] = [place]
+    st.session_state.inbox = list(st.session_state.inbox) + [item]
 
 
 def _places_from_favourites(favs: list[dict]) -> list[dict]:
@@ -1603,9 +1786,7 @@ def _favourite_destination(favs: list[dict]) -> str:
     return "日本"
 
 
-def _allow_ai_suggestions(favs: list[dict]) -> bool:
-    if len(favs) >= SPARSE_COLLECTION_MIN:
-        return False
+def _allow_ai_suggestions(_favs: list[dict]) -> bool:
     return bool(st.session_state.get("allow_ai", True))
 
 
@@ -1756,11 +1937,16 @@ def _place_mini(item: dict, place: dict | None, *, status: str = "", who: str = 
     if place:
         _keep_printed_facts(place)
         title = (place.get("name_zh") or place.get("name") or title).strip() or title
+        category = _visible_category(place)
         try:
-            tags = [str(region) for region in (trip_core.place_regions(place, item) or []) if region]
+            regions = [str(region) for region in (trip_core.place_regions(place, item) or []) if region]
         except Exception:
             logger.exception("place_regions failed")
-            tags = []
+            regions = []
+        tags = [category] if category else []
+        for region in regions:
+            if region not in tags:
+                tags.append(region)
         if str(place.get("address") or "").strip():
             address = trip_core.public_fact(place.get("address"))
         if str(place.get("opening_hours") or "").strip():
@@ -1844,6 +2030,114 @@ def _card_columns():
     return st.columns([1, 5], vertical_alignment="top")
 
 
+def _widget_default(key: str, value) -> None:
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+
+def _render_classification_fields(
+    *,
+    name_key: str,
+    category_key: str,
+    region_key: str,
+    name: str,
+    category: str,
+    regions: list[str],
+) -> None:
+    label = category if category in FAVOURITE_CATEGORIES else "其他"
+    current = _clean_region_choice(regions)
+    _widget_default(name_key, name)
+    _widget_default(category_key, label)
+    _widget_default(region_key, current)
+    if st.session_state.get(category_key) not in FAVOURITE_CATEGORIES:
+        st.session_state[category_key] = label
+    selected = _clean_region_choice(st.session_state.get(region_key) or [])
+    options = list(dict.fromkeys([*selected, *current, *trip_core.QUICK_REGION_FIXES]))
+    if region_key not in st.session_state:
+        st.session_state[region_key] = [item for item in current if item in options]
+    else:
+        kept = [item for item in selected if item in options]
+        if kept != selected:
+            st.session_state[region_key] = kept
+    st.text_input("店名", key=name_key)
+    st.selectbox("分類", list(FAVOURITE_CATEGORIES), key=category_key)
+    st.pills("地區（可多選）", options, selection_mode="multi", key=region_key)
+
+
+def _read_classification(name_key: str, category_key: str, region_key: str) -> tuple[str, str, list[str]]:
+    name = (st.session_state.get(name_key) or "").strip()
+    category = st.session_state.get(category_key) or "其他"
+    if category not in FAVOURITE_CATEGORIES:
+        category = "其他"
+    return name, category, _clean_region_choice(st.session_state.get(region_key) or [])
+
+
+def _render_item_editor(item: dict) -> None:
+    places = list(item.get("places") or [])
+    if not places:
+        st.caption("這張卡未有地點可以修改。")
+        return
+    for index, place in enumerate(places):
+        suffix = f"{item['id']}_{index}"
+        name_key = f"item_name_{suffix}"
+        category_key = f"item_cat_{suffix}"
+        region_key = f"item_regions_{suffix}"
+        current_name = (place.get("name_zh") or place.get("name") or "").strip()
+        try:
+            current_regions = [
+                str(region) for region in (trip_core.place_regions(place, item) or [])
+                if region and region != trip_core.UNSORTED_REGION
+            ]
+        except Exception:
+            logger.exception("place_regions failed")
+            current_regions = _clean_region_choice(item.get("regions") or [])
+        _render_classification_fields(
+            name_key=name_key,
+            category_key=category_key,
+            region_key=region_key,
+            name=current_name,
+            category=_visible_category(place),
+            regions=current_regions,
+        )
+        if st.button("儲存", key=f"item_save_{suffix}", type="primary"):
+            name, category, regions = _read_classification(name_key, category_key, region_key)
+            if not name:
+                st.warning("請輸入店名")
+            else:
+                _apply_saved_place(item, place, name=name, category=category, regions=regions)
+                st.session_state.renaming_id = None
+                _publish_favourites()
+                st.rerun()
+
+
+def _render_manual_adder(scope: str) -> None:
+    open_key = f"manual_add_open_{scope}"
+    if st.button("手動新增", key=f"manual_add_btn_{scope}"):
+        st.session_state[open_key] = not st.session_state.get(open_key)
+        st.rerun()
+    if not st.session_state.get(open_key):
+        return
+    st.caption("填寫店名、分類及地區。選擇地區後就不會留在未分類。")
+    name = st.text_input("店名", key=f"manual_add_name_{scope}", placeholder="輸入店名")
+    category = st.selectbox("分類", list(FAVOURITE_CATEGORIES), key=f"manual_add_cat_{scope}")
+    area = st.selectbox(
+        "地區",
+        list(trip_core.QUICK_REGION_FIXES),
+        index=None,
+        placeholder="選擇地區",
+        key=f"manual_add_area_{scope}",
+    )
+    if st.button("加入收藏", key=f"manual_add_save_{scope}", type="primary"):
+        cleaned = (name or "").strip()
+        if not cleaned:
+            st.warning("請輸入店名")
+            return
+        _create_manual_item(cleaned, category or "其他", area or "")
+        st.session_state[open_key] = False
+        _publish_favourites()
+        st.rerun()
+
+
 def _render_collect_card(item: dict) -> None:
     status = _collect_status(item)
     who = _collect_who(item)
@@ -1878,7 +2172,7 @@ def _render_collect_card(item: dict) -> None:
         elif status == COLLECT_STATUS_RUNNING:
             st.caption("正在識別截圖…")
         elif status == COLLECT_STATUS_FAIL:
-            st.caption(item.get("warning") or "認唔到店名。畫面有大字店名就可以手動輸入。")
+            st.caption(item.get("warning") or "未能辨識店名。可以手動輸入店名，並選擇分類及地區。")
             if st.button("重試", key=f"retry_{item['id']}"):
                 item["places"] = []
                 item["facts"] = ""
@@ -1889,33 +2183,36 @@ def _render_collect_card(item: dict) -> None:
                 st.session_state.manual_id = item["id"]
                 st.rerun()
             if st.session_state.get("manual_id") == item["id"]:
-                manual = st.text_input("店舖名稱", key=f"manual_name_{item['id']}", placeholder="輸入正確店名")
+                st.caption("除了店名，請一併選擇分類及地區，避免留在未分類。")
+                manual = st.text_input("店名", key=f"manual_name_{item['id']}", placeholder="輸入正確店名")
+                manual_cat = st.selectbox("分類", list(FAVOURITE_CATEGORIES), key=f"manual_cat_{item['id']}")
+                manual_area = st.selectbox(
+                    "地區",
+                    list(trip_core.QUICK_REGION_FIXES),
+                    index=None,
+                    placeholder="選擇地區",
+                    key=f"manual_area_{item['id']}",
+                )
                 if st.button("確認店名", key=f"manual_ok_{item['id']}", type="primary"):
-                    if (manual or "").strip():
-                        _apply_manual_name(item, manual.strip())
-                        st.session_state.manual_id = None
-                        st.rerun()
-                    else:
+                    cleaned = (manual or "").strip()
+                    if not cleaned:
                         st.warning("請輸入店名")
+                    else:
+                        _apply_manual_name(
+                            item,
+                            cleaned,
+                            category=manual_cat or "其他",
+                            area=manual_area or "",
+                        )
+                        st.session_state.manual_id = None
+                        _publish_favourites()
+                        st.rerun()
         elif status == COLLECT_STATUS_DONE:
-            if st.button("✎", key=f"rename_open_{item['id']}", help="改名"):
+            if st.button("✎", key=f"card_rename_{item['id']}"):
                 st.session_state.renaming_id = item["id"]
                 st.rerun()
             if st.session_state.get("renaming_id") == item["id"]:
-                renamed = st.text_input("店舖名稱", key=f"rename_name_{item['id']}")
-                if st.button("儲存店名", key=f"rename_ok_{item['id']}", type="primary"):
-                    cleaned = (renamed or "").strip()
-                    if cleaned and item.get("places"):
-                        place = item["places"][0]
-                        place["name"] = cleaned
-                        place["name_zh"] = cleaned
-                        for fav in st.session_state.favourites:
-                            if fav.get("id") == place.get("fav_id"):
-                                fav["name"] = cleaned
-                                fav["edited"] = True
-                        st.session_state.renaming_id = None
-                        _publish_favourites()
-                        st.rerun()
+                _render_item_editor(item)
 
 
 def _render_collect() -> None:
@@ -1941,6 +2238,8 @@ def _render_collect() -> None:
         st.caption("分析完成後會顯示在這裡，並加入收藏。")
     for item in _newest_first(done):
         _render_collect_card(item)
+    st.markdown('<div class="section-label">手動新增</div>', unsafe_allow_html=True)
+    _render_manual_adder("collect")
     if st.button("查看我的收藏 →", type="primary", key="to_collection"):
         _go("C")
 
@@ -1973,9 +2272,6 @@ def _render_favourite(fav: dict) -> None:
         source = next((item for item in st.session_state.inbox if item.get("id") == fav.get("source_item")), None)
         image = source.get("image") if isinstance(source, dict) else None
         _zoom_button(image, f"fav_{fav['id']}")
-        if st.button("✎", key=f"edit_{fav['id']}", help="編輯"):
-            st.session_state.editing_fav = fav["id"]
-            st.rerun()
         tags = [str(fav.get("category") or "其他")]
         for region in fav.get("regions") or []:
             if region and region not in tags:
@@ -1996,37 +2292,49 @@ def _render_favourite(fav: dict) -> None:
             ),
             unsafe_allow_html=True,
         )
+        if st.button("✎", key=f"card_edit_{fav['id']}"):
+            st.session_state.editing_fav = fav["id"]
+            st.session_state.pop(f"fav_name_{fav['id']}", None)
+            st.session_state.pop(f"fav_cat_{fav['id']}", None)
+            st.session_state.pop(f"fav_regions_{fav['id']}", None)
+            st.rerun()
         if st.session_state.get("editing_fav") == fav["id"]:
-                options = list(dict.fromkeys([*(fav.get("regions") or []), *trip_core.QUICK_REGION_FIXES]))
-                region_key = f"edit_regions_{fav['id']}"
-                if region_key not in st.session_state:
-                    st.session_state[region_key] = list(fav.get("regions") or [])
-                st.pills("地區（可多選）", options, selection_mode="multi", key=region_key)
-                cat_key = f"edit_cat_{fav['id']}"
-                if cat_key not in st.session_state:
-                    st.session_state[cat_key] = fav.get("category") or "其他"
-                st.selectbox("類別", list(FAVOURITE_CATEGORIES), key=cat_key)
-                save_col, remove_col = st.columns(2)
-                with save_col:
-                    if st.button("儲存", key=f"save_{fav['id']}", type="primary"):
-                        chosen = st.session_state.get(region_key) or []
-                        if isinstance(chosen, str):
-                            chosen = [chosen]
-                        fav["regions"] = list(chosen) or fav.get("regions") or [trip_core.UNSORTED_REGION]
-                        fav["category"] = st.session_state.get(cat_key) or fav.get("category")
-                        fav["edited"] = True
+            name_key = f"fav_name_{fav['id']}"
+            category_key = f"fav_cat_{fav['id']}"
+            region_key = f"fav_regions_{fav['id']}"
+            _render_classification_fields(
+                name_key=name_key,
+                category_key=category_key,
+                region_key=region_key,
+                name=fav.get("name") or "",
+                category=fav.get("category") or "其他",
+                regions=list(fav.get("regions") or []),
+            )
+            save_col, remove_col = st.columns(2)
+            with save_col:
+                if st.button("儲存", key=f"save_{fav['id']}", type="primary"):
+                    name, category, regions = _read_classification(name_key, category_key, region_key)
+                    if not name:
+                        st.warning("請輸入店名")
+                    else:
+                        _write_fav_classification(fav, name=name, category=category, regions=regions)
+                        source_item, place = _source_place(fav)
+                        if place is not None:
+                            _write_place_classification(
+                                place, source_item, name=name, category=category, regions=regions,
+                            )
                         st.session_state.editing_fav = None
                         st.rerun()
-                with remove_col:
-                    if st.button("移除", key=f"remove_{fav['id']}"):
-                        removed = list(st.session_state.get("removed_fav_ids") or [])
-                        removed.append(fav["id"])
-                        st.session_state.removed_fav_ids = removed
-                        st.session_state.favourites = [
-                            row for row in st.session_state.favourites if row.get("id") != fav["id"]
-                        ]
-                        st.session_state.editing_fav = None
-                        st.rerun()
+            with remove_col:
+                if st.button("移除", key=f"remove_{fav['id']}"):
+                    removed = list(st.session_state.get("removed_fav_ids") or [])
+                    removed.append(fav["id"])
+                    st.session_state.removed_fav_ids = removed
+                    st.session_state.favourites = [
+                        row for row in st.session_state.favourites if row.get("id") != fav["id"]
+                    ]
+                    st.session_state.editing_fav = None
+                    st.rerun()
 
 
 def _render_collection() -> None:
@@ -2037,10 +2345,11 @@ def _render_collection() -> None:
     )
     _render_invite()
     favs = list(st.session_state.get("favourites") or [])
+    _render_manual_adder("collection")
     if not favs:
-        st.info("尚未有收藏。請先在「收集」分析截圖，或手動輸入店名。")
+        st.info("尚未有收藏。請先在「收集」分析截圖，或按「手動新增」。")
     else:
-        st.caption("右側 ✎ 可改地區、類別或移除。")
+        st.caption("右側 ✎ 可改店名、分類、地區或移除。")
         visible = _filtered_favourites()
         if not visible:
             st.caption("此篩選暫時沒有地點。")
@@ -2079,23 +2388,23 @@ def _render_plan() -> None:
         captions=[blurb for _name, blurb in TRIP_STYLES],
         key="trip_style",
     )
-    allow_ai = _allow_ai_suggestions(favs)
     if len(favs) < SPARSE_COLLECTION_MIN:
-        st.markdown("**目前收藏的地方較少，是否需要 AI 協助建議其他地點？**")
-        yes_col, no_col = st.columns(2)
-        with yes_col:
-            if st.button("需要", key="ai_yes", type="primary" if st.session_state.get("allow_ai", True) else "secondary"):
-                st.session_state.allow_ai = True
-                st.rerun()
-        with no_col:
-            if st.button(
-                "不用，只用我的收藏",
-                key="ai_no",
-                type="primary" if not st.session_state.get("allow_ai", True) else "secondary",
-            ):
-                st.session_state.allow_ai = False
-                st.rerun()
-        allow_ai = bool(st.session_state.get("allow_ai", True))
+        st.caption("目前收藏的地方較少，可以讓 AI 建議附近可核實的地點。")
+    st.markdown("**是否需要 AI 協助建議其他地點？**")
+    yes_col, no_col = st.columns(2)
+    with yes_col:
+        if st.button("需要", key="ai_yes", type="primary" if st.session_state.get("allow_ai", True) else "secondary"):
+            st.session_state.allow_ai = True
+            st.rerun()
+    with no_col:
+        if st.button(
+            "不用，只用我的收藏",
+            key="ai_no",
+            type="primary" if not st.session_state.get("allow_ai", True) else "secondary",
+        ):
+            st.session_state.allow_ai = False
+            st.rerun()
+    allow_ai = _allow_ai_suggestions(favs)
     has_date = bool(st.session_state.get("start_date"))
     can_plan = bool(API_KEY) and remaining_quota() > 0 and has_date and (bool(favs) or allow_ai)
     if not has_date:
@@ -2152,7 +2461,7 @@ def _render_plan() -> None:
                 preferences=request["preferences"],
                 party=request["party"],
             )
-            itinerary = _enrich_suggested_stops(itinerary, places, status)
+            itinerary = _enrich_suggested_stops(itinerary, places, status, allow_ai=allow_ai)
         except gemini_client.GeminiError as err:
             plan_error = str(err)
             status.update(label=f"排行程失敗：{plan_error}", state="error")
@@ -2204,18 +2513,38 @@ def _suggested_seeds(itinerary: dict, known_places: list[dict]) -> list[dict]:
     return seeds
 
 
-def _itinerary_has_generic_suggestion(itinerary: dict, known_places: list[dict]) -> bool:
-    for day in itinerary.get("days") or []:
-        for stop in day.get("items") or []:
-            if trip_core.match_place(stop, known_places):
-                continue
-            if trip_core.generic_suggestion_name(stop.get("place_name") or ""):
-                return True
-    return False
+def _verified_nearby(places: list[dict]) -> list[dict]:
+    kept: list[dict] = []
+    for place in places or []:
+        if not isinstance(place, dict):
+            continue
+        name = ""
+        try:
+            name = trip_core.strip_ai_label(place.get("name_zh") or place.get("name") or "")
+        except Exception:
+            logger.exception("strip_ai_label failed")
+            name = str(place.get("name_zh") or place.get("name") or "")
+        if trip_core.generic_suggestion_name(name):
+            continue
+        if not trip_core.suggestion_is_verifiable(place):
+            continue
+        kept.append(place)
+    return kept
 
 
-def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -> dict:
-    """真實店名先核對資料。空殼名改搵錨點附近嘅真實店，搵唔到就唔插。"""
+def _append_verified_nearby(itinerary: dict, known_places: list[dict], nearby: list[dict]) -> dict:
+    fn = getattr(trip_core, "append_verifiable_nearby", None)
+    if not callable(fn):
+        return itinerary
+    try:
+        return fn(itinerary, known_places, nearby)
+    except Exception:
+        logger.exception("append_verifiable_nearby failed")
+        return itinerary
+
+
+def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status, *, allow_ai: bool = False) -> dict:
+    """真實店名先核對資料。允許 AI 時，用收藏做錨點主動加入可核實嘅附近店。"""
     seeds = _suggested_seeds(itinerary, known_places)
     enriched: list[dict] = []
     if seeds:
@@ -2227,8 +2556,8 @@ def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -
             enriched = []
     attached = trip_core.attach_place_facts(itinerary, list(known_places) + list(enriched or []))
     nearby: list[dict] = []
-    if _itinerary_has_generic_suggestion(attached, known_places):
-        status.write("搵收藏地點附近的真實高評分餐廳或景點。")
+    if allow_ai:
+        status.write("正在搜尋收藏地點附近、可核實的高評分餐廳或景點。")
         try:
             found = gemini_client.suggest_nearby(
                 _client(),
@@ -2237,11 +2566,16 @@ def _enrich_suggested_stops(itinerary: dict, known_places: list[dict], status) -
                 limit=4,
                 use_maps=USE_MAPS,
             )
-            nearby = list(getattr(found, "places", None) or [])
+            nearby = _verified_nearby(list(getattr(found, "places", None) or []))
         except Exception:  # noqa: BLE001
             logger.exception("Nearby suggestion lookup failed")
             nearby = []
-    return trip_core.replace_generic_suggestions(attached, known_places, nearby)
+    replaced = trip_core.replace_generic_suggestions(attached, known_places, nearby if allow_ai else [])
+    if allow_ai:
+        replaced = _append_verified_nearby(replaced, known_places, nearby)
+        if not nearby:
+            replaced = {**replaced, "suggestion_note": NEARBY_UNVERIFIED_NOTE}
+    return replaced
 
 
 _WALK_RE = re.compile(r"步行|走路|徒歩|行路")
@@ -2398,6 +2732,8 @@ def _render_results() -> None:
     )
     st.subheader(shown.get("title") or "行程結果")
     st.markdown(f'<div class="style-banner">已按「{style}」安排</div>', unsafe_allow_html=True)
+    if shown.get("suggestion_note"):
+        st.caption(str(shown["suggestion_note"]))
     days = shown.get("days") or []
     labels = [f"Day {index}" for index, _day in enumerate(days, start=1)]
     visible: list[dict] = []

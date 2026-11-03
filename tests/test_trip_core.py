@@ -1295,6 +1295,47 @@ def test_generic_ai_shells_are_replaced_by_verified_nearby_places():
     assert dropped["days"][0]["items"] == []
 
 
+def test_verified_nearby_places_are_appended_and_shells_are_not():
+    known = [{"name": "太宰府天滿宮", "name_zh": "太宰府天滿宮"}]
+    real = {
+        "name": "一蘭 天神店",
+        "name_zh": "一蘭 天神店",
+        "category": "restaurant",
+        "area": "天神",
+        "address": "福岡市中央區天神2-1-1",
+        "opening_hours": "11:00-22:00",
+        "rating": "4.3/5",
+        "notes": "天神站附近，有公開評分。",
+    }
+    shell = {
+        "name": "天神網紅餐廳",
+        "name_zh": "天神網紅餐廳",
+        "address": "福岡市中央區",
+        "opening_hours": "11:00-21:00",
+        "rating": "4.9/5",
+    }
+    base = {
+        "title": "福岡一日",
+        "days": [{"day": 1, "area": "福岡", "items": [
+            {
+                "time": "09:00", "place_name": "太宰府天滿宮", "activity": "參拜",
+                "is_meal": False, "maps_query": "太宰府天滿宮",
+            },
+        ]}],
+    }
+    shown = trip_core.append_verifiable_nearby(base, known, [shell, real])
+    names = [item["place_name"] for item in shown["days"][0]["items"]]
+    assert names == ["太宰府天滿宮", "一蘭 天神店"]
+    added = shown["days"][0]["items"][1]
+    assert added["address"] == "福岡市中央區天神2-1-1"
+    assert added["maps_query"] == "一蘭 天神店 福岡市中央區天神2-1-1"
+    assert "網紅" not in added["activity"]
+    again = trip_core.append_verifiable_nearby(shown, known, [real, shell])
+    assert [item["place_name"] for item in again["days"][0]["items"]] == names
+    assert trip_core.model_category_for_label("美食") == "restaurant"
+    assert trip_core.model_category_for_label("美容") == "salon"
+
+
 def test_garbled_ai_stop_is_dropped_and_cloned_days_go_blank():
     assert trip_core.garbled_place_name("Café Del ม")
     assert not trip_core.garbled_place_name("kchiara")
