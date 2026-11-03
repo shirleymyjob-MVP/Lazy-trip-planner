@@ -192,7 +192,7 @@ def test_failed_analysis_can_retry_or_take_a_manual_name():
         return_value=gemini_client.AnalysisResult(_facts(), []),
     ) as enrich:
         _button(at, "手動輸入店名").click().run()
-        name = [box for box in at.text_input if box.label == "店舖名稱"][0]
+        name = [box for box in at.text_input if box.label == "店名"][0]
         name.input("太宰府天滿宮").run()
         _button(at, "確認店名").click().run()
     assert not at.exception
@@ -230,13 +230,18 @@ def test_collection_card_colors_me_and_friend_then_edits_region():
     _button(at, "✎").click().run()
     region = [pill for pill in at.pills if "地區" in pill.proto.label][0]
     region.set_value(["太宰府", "福岡"]).run()
-    _select(at, "類別").set_value("文化體驗").run()
+    _select(at, "分類").set_value("文化體驗").run()
+    renamed = [box for box in at.text_input if box.label == "店名"][0]
+    renamed.input("太宰府天滿宮（本殿）").run()
     _button(at, "儲存").click().run()
     assert not at.exception
     saved = at.session_state["favourites"][0]
     assert saved["edited"] is True
+    assert saved["name"] == "太宰府天滿宮（本殿）"
     assert saved["category"] == "文化體驗"
     assert "福岡" in saved["regions"] and "太宰府" in saved["regions"]
+    assert "太宰府天滿宮（本殿）" in _page(at)
+    assert "文化體驗" in _page(at)
     _button(at, "✎").click().run()
     remove = [button for button in at.button if button.label == "移除"][0]
     remove.click().run()
@@ -315,7 +320,7 @@ def test_plan_failure_does_not_spend_a_turn():
     at.session_state["start_date"] = date(2026, 11, 14)
     at.session_state["favourites"] = [_fav(), _fav(id="b", name="一蘭"), _fav(id="c", name="福岡塔")]
     at.run()
-    assert "是否需要 AI 協助" not in _page(at)
+    assert "是否需要 AI 協助" in _page(at)
     message = "AI 回應太慢（已自動重試）。請少傳幾張圖，或者過一陣再試。"
     with mock.patch.object(gemini_client, "make_client", return_value=object()), \
          mock.patch.object(gemini_client, "generate_itinerary", side_effect=gemini_client.GeminiError(message)):
@@ -1110,3 +1115,213 @@ def test_favourites_keep_unstamped_order_and_pencil_stays_a_button():
     assert page.index("先加入") < page.index("後加入")
     assert any(button.label == "✎" for button in at.button)
     assert not any("編輯" == button.label for button in at.button)
+
+
+def test_processed_card_edit_updates_name_category_and_area():
+    image = _png("red")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "B"
+    at.session_state["inbox"] = [{
+        "id": "done1",
+        "image": image,
+        "analysis": "done",
+        "facts": "done",
+        "places": [{
+            "fav_id": "fav-done",
+            "name": "舊店名",
+            "name_zh": "舊店名",
+            "category": "shop",
+            "area": "福岡",
+            "address": "福岡市博多區",
+            "opening_hours": "11:00-20:00",
+            "rating": "4.0/5",
+        }],
+        "regions": ["福岡"],
+        "city": "福岡",
+        "region_confidence": "高",
+        "added_by": "旅人",
+        "remark": "",
+        "batch": False,
+        "added_at": 5,
+    }]
+    at.session_state["favourites"] = [_fav(
+        id="fav-done",
+        source_item="done1",
+        name="舊店名",
+        name_original="舊店名",
+        category="購物",
+        model_category="shop",
+        regions=["福岡"],
+    )]
+    at.run()
+    assert not at.exception
+    _button(at, "✎").click().run()
+    [box for box in at.text_input if box.label == "店名"][0].input("新店名").run()
+    _select(at, "分類").set_value("景點").run()
+    region = [pill for pill in at.pills if "地區" in pill.proto.label][0]
+    region.set_value(["大阪"]).run()
+    _button(at, "儲存").click().run()
+    assert not at.exception
+    place = at.session_state["inbox"][0]["places"][0]
+    assert place["name"] == "新店名"
+    assert place["fav_category"] == "景點"
+    assert place["category_locked"] is True
+    fav = next(row for row in at.session_state["favourites"] if row["id"] == "fav-done")
+    assert fav["name"] == "新店名"
+    assert fav["category"] == "景點"
+    assert fav["edited"] is True
+    assert "大阪" in fav["regions"]
+    page = _page(at)
+    assert "新店名" in page
+    assert "景點" in page
+    assert "大阪" in page
+
+
+def test_unrecognised_item_can_choose_category_and_area():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "B"
+    at.run()
+    at.file_uploader[0].upload("blur.png", _png("white"), "image/png").run()
+    with mock.patch.object(
+        gemini_client, "recognize_names",
+        side_effect=gemini_client.GeminiError("測試失敗"),
+    ):
+        _button(at, "開始分析").click().run()
+    _button(at, "手動輸入店名").click().run()
+    assert any(box.label == "分類" for box in at.selectbox)
+    assert any(box.label == "地區" for box in at.selectbox)
+    [box for box in at.text_input if box.label == "店名"][0].input("一蘭 天神店").run()
+    _select(at, "分類").set_value("美食").run()
+    _select(at, "地區").set_value("福岡").run()
+    with mock.patch.object(
+        gemini_client, "enrich_places",
+        return_value=gemini_client.AnalysisResult([{
+            "name": "一蘭 天神店",
+            "name_zh": "一蘭 天神店",
+            "category": "restaurant",
+            "area": "福岡",
+            "address": "福岡市中央區天神",
+            "opening_hours": "11:00-22:00",
+            "rating": "4.2/5",
+        }], []),
+    ):
+        _button(at, "確認店名").click().run()
+    assert not at.exception
+    fav = at.session_state["favourites"][0]
+    assert fav["name"] == "一蘭 天神店"
+    assert fav["category"] == "美食"
+    assert "福岡" in fav["regions"]
+    assert trip_core.UNSORTED_REGION not in (fav.get("regions") or [])
+    assert trip_core.UNSORTED_REGION not in _page(at)
+
+
+def test_manual_add_sets_name_category_and_area():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.session_state["screen"] = "C"
+    at.run()
+    _button(at, "手動新增").click().run()
+    [box for box in at.text_input if box.label == "店名"][0].input("太宰府天滿宮").run()
+    _select(at, "分類").set_value("景點").run()
+    _select(at, "地區").set_value("福岡").run()
+    _button(at, "加入收藏").click().run()
+    assert not at.exception
+    fav = at.session_state["favourites"][0]
+    assert fav["name"] == "太宰府天滿宮"
+    assert fav["category"] == "景點"
+    assert fav["edited"] is True
+    assert fav["regions"] == ["福岡"]
+    page = _page(at)
+    assert "太宰府天滿宮" in page
+    assert "景點" in page
+    assert "福岡" in page
+    assert trip_core.UNSORTED_REGION not in page
+
+
+def test_ai_toggle_stays_visible_and_nearby_suggestions_are_verified():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "D"
+    at.session_state["start_date"] = date(2026, 11, 14)
+    at.session_state["allow_ai"] = True
+    at.session_state["favourites"] = [
+        _fav(id="a", name="太宰府天滿宮"),
+        _fav(id="b", name="一蘭", name_original="一蘭", category="美食", model_category="restaurant"),
+        _fav(id="c", name="福岡塔", name_original="福岡塔", category="景點", model_category="attraction"),
+    ]
+    at.run()
+    assert "是否需要 AI 協助" in _page(at)
+    assert any(button.label == "需要" for button in at.button)
+    assert any(button.label == "不用，只用我的收藏" for button in at.button)
+    fake = {
+        "title": "福岡3日遊",
+        "days": [{"day": 1, "area": "福岡", "items": [
+            {
+                "time": "09:00", "place_name": "太宰府天滿宮", "activity": "參拜。",
+                "is_meal": False, "maps_query": "太宰府天滿宮", "transit": "",
+            },
+        ]}],
+        "tips": [],
+    }
+    nearby = gemini_client.AnalysisResult([
+        {
+            "name": "大濠公園",
+            "name_zh": "大濠公園",
+            "category": "attraction",
+            "area": "福岡",
+            "address": "福岡市中央區大濠公園1-2",
+            "opening_hours": "09:00-18:00",
+            "rating": "4.4/5",
+            "notes": "公園可以散步。",
+        },
+        {
+            "name": "天神網紅餐廳",
+            "name_zh": "天神網紅餐廳",
+            "category": "restaurant",
+            "area": "天神",
+            "address": "福岡市",
+            "opening_hours": "11:00-21:00",
+            "rating": "4.9/5",
+        },
+    ], [])
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=fake), \
+         mock.patch.object(gemini_client, "suggest_nearby", return_value=nearby) as nearby_call:
+        _button(at, "開始排行程").click().run()
+    assert not at.exception
+    assert nearby_call.call_count == 1
+    anchors = nearby_call.call_args.args[2]
+    assert any("太宰府天滿宮" in (place.get("name") or "") for place in anchors)
+    page = _page(at)
+    assert "大濠公園" in page
+    assert "天神網紅餐廳" not in page
+    assert "打卡熱點" not in page
+    assert page.count("Google 地圖") >= 2
+    assert "maps/search" in page
+    assert trip_core.NEARBY_UNVERIFIED_NOTE not in page
+    saved = [item["place_name"] for item in at.session_state["itinerary"]["days"][0]["items"]]
+    assert saved == ["太宰府天滿宮", "大濠公園"]
+
+    empty = AppTest.from_file(APP, default_timeout=30)
+    empty.secrets["GEMINI_API_KEY"] = "fake"
+    empty.session_state["screen"] = "D"
+    empty.session_state["start_date"] = date(2026, 11, 14)
+    empty.session_state["allow_ai"] = True
+    empty.session_state["favourites"] = [_fav()]
+    empty.run()
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=fake), \
+         mock.patch.object(
+             gemini_client, "suggest_nearby",
+             return_value=gemini_client.AnalysisResult([{
+                 "name": "市中心打卡熱點",
+                 "address": "福岡市",
+                 "rating": "4.8/5",
+                 "opening_hours": "10:00-18:00",
+             }], []),
+         ):
+        _button(empty, "開始排行程").click().run()
+    assert not empty.exception
+    assert "市中心打卡熱點" not in _page(empty)
+    assert trip_core.NEARBY_UNVERIFIED_NOTE in _page(empty)

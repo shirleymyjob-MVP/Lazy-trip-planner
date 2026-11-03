@@ -37,6 +37,7 @@ OPENING_STEPS = (
 HAPPY_PATH_CAPTION = HERO_LINE
 PAYWALL_NOTE = "收費：待定"
 UNVERIFIED = "未核實"
+NEARBY_UNVERIFIED_NOTE = "附近暫時未能核實真實高評分地點，未有加入建議。"
 SELF_ATTRIBUTION = "我"
 SELF_COLOR = "#4A90D9"
 FRIEND_COLOR = "#8A8A8A"
@@ -513,6 +514,23 @@ def collect_status(item: dict) -> str:
     if item.get("facts") == "pending":
         return COLLECT_STATUS_VERIFYING
     return COLLECT_STATUS_DONE
+
+
+def model_category_for_label(label: str) -> str:
+    """收藏分類（美食、景點…）對應排行程用嘅類別。"""
+    mapping = {
+        "美食": "restaurant",
+        "景點": "attraction",
+        "購物": "shop",
+        "美容": "salon",
+        "文化體驗": "attraction",
+        "自然／戶外": "attraction",
+        "其他": "other",
+    }
+    cleaned = _clean_str(label)
+    if cleaned in mapping:
+        return mapping[cleaned]
+    return normalize_category(cleaned)
 
 
 def favourite_category(place: dict) -> str:
@@ -1037,8 +1055,8 @@ def replace_generic_suggestions(
             items.append({
                 **cloned,
                 "place_name": name,
-                "activity": _clean_str(place.get("notes")) or "順路可以去呢間附近、有公開資料嘅店。",
-                "maps_query": " ".join(part for part in (name, address or area) if part),
+                "activity": _suggestion_activity(place),
+                "maps_query": _suggestion_maps_query(name, address, area),
                 "address": address,
                 "opening_hours": _clean_str(place.get("opening_hours")),
                 "rating": _clean_str(place.get("rating")),
@@ -1046,6 +1064,106 @@ def replace_generic_suggestions(
                 "is_meal": bool(cloned.get("is_meal")) or place.get("category") in {"restaurant", "cafe", "dessert"},
             })
         days.append({**day, "items": items})
+    return {**itinerary, "days": days}
+
+
+def _suggestion_activity(place: dict) -> str:
+    notes = _clean_str(place.get("notes"))
+    if not notes or generic_suggestion_name(notes) or _GENERIC_SUGGESTION_RE.search(notes):
+        return "鄰近收藏地點，評分與地址可核實。"
+    return notes
+
+
+def _suggestion_maps_query(name: str, address: str, area: str) -> str:
+    return " ".join(part for part in (name, address or area) if part)
+
+
+def _clock_minutes(value: str) -> int | None:
+    match = re.search(r"(\d{1,2})\s*[:：]\s*(\d{2})", value or "")
+    if not match:
+        return None
+    hour = int(match.group(1))
+    minute = int(match.group(2))
+    if hour > 23 or minute > 59:
+        return None
+    return hour * 60 + minute
+
+
+def _suggestion_time(items: Iterable[dict]) -> str:
+    last = 15 * 60
+    for item in items or []:
+        found = _clock_minutes(str(item.get("time") or ""))
+        if found is not None:
+            last = found
+    last = min(last + 90, 21 * 60)
+    return f"{last // 60:02d}:{last % 60:02d}"
+
+
+def _day_for_suggestion(days: list[dict], place: dict, index: int) -> dict:
+    area = _clean_str(place.get("area"))
+    token = area.split(",")[0].split("、")[0].strip()
+    if token:
+        for day in days:
+            blob = " ".join(
+                _clean_str(part)
+                for part in (
+                    day.get("area"),
+                    *(stop.get("area") or "" for stop in day.get("items") or []),
+                    *(stop.get("place_name") or "" for stop in day.get("items") or []),
+                )
+            )
+            if token in blob:
+                return day
+    return days[index % len(days)]
+
+
+def append_verifiable_nearby(
+    itinerary: dict,
+    known_places: Iterable[dict] | None,
+    nearby_places: Iterable[dict] | None,
+) -> dict:
+    """把已核實、又未出現喺行程入面嘅附近店加做建議站。空殼名同核實唔到嘅一律唔加。"""
+    known = list(known_places or [])
+    days_in = list(itinerary.get("days") or [])
+    if not days_in:
+        return {**itinerary, "days": []}
+    days = [{**day, "items": [dict(stop) for stop in day.get("items") or []]} for day in days_in]
+    existing: set[str] = set()
+    for day in days:
+        for stop in day["items"]:
+            key = _norm_key(strip_ai_label(stop.get("place_name") or ""))
+            if key:
+                existing.add(key)
+    extras: list[dict] = []
+    for place in nearby_places or []:
+        if not isinstance(place, dict) or not suggestion_is_verifiable(place):
+            continue
+        name = strip_ai_label(place.get("name_zh") or place.get("name") or "")
+        key = _norm_key(name)
+        if not key or key in existing or generic_suggestion_name(name):
+            continue
+        if match_place({"place_name": name}, known):
+            continue
+        existing.add(key)
+        extras.append({**place, "name": place.get("name") or name, "name_zh": name})
+    for index, place in enumerate(extras):
+        day = _day_for_suggestion(days, place, index)
+        name = strip_ai_label(place.get("name_zh") or place.get("name") or "")
+        address = _clean_str(place.get("address"))
+        area = _clean_str(place.get("area")) or _clean_str(day.get("area"))
+        category = normalize_category(place.get("category"))
+        day["items"].append({
+            "time": _suggestion_time(day["items"]),
+            "place_name": name,
+            "activity": _suggestion_activity(place),
+            "is_meal": category in {"restaurant", "cafe", "dessert"},
+            "maps_query": _suggestion_maps_query(name, address, area),
+            "transit": "",
+            "address": address,
+            "opening_hours": _clean_str(place.get("opening_hours")),
+            "rating": _clean_str(place.get("rating")),
+            "area": area,
+        })
     return {**itinerary, "days": days}
 
 
