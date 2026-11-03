@@ -14,8 +14,40 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 APP = os.path.join(ROOT, "app.py")
 
+import pytest
+
+import auth_gate  # noqa: E402
 import gemini_client  # noqa: E402
 import trip_core  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _signed_in_member(monkeypatch):
+    """既有畫面測試以已登入會員身份跑。
+
+    AppTest 的 LocalScriptRunner 把 st.user 寫死，公開 API 不能設 is_logged_in。
+    這裡只係測試替身，應用程式本身沒有訪客旁路。
+    """
+    monkeypatch.setattr(auth_gate, "_authlib_ready", lambda: True)
+    monkeypatch.setattr(
+        auth_gate,
+        "_auth_section",
+        lambda: {
+            "redirect_uri": "http://localhost:8501/oauth2callback",
+            "cookie_secret": "test-cookie-secret",
+            "client_id": "test-client-id",
+            "client_secret": "test-client-secret",
+            "server_metadata_url": auth_gate.GOOGLE_SERVER_METADATA_URL,
+        },
+    )
+    monkeypatch.setattr(
+        "streamlit.user_info._get_user_info",
+        lambda: {
+            "is_logged_in": True,
+            "sub": "test-member-sub",
+            "email_verified": True,
+        },
+    )
 
 
 def _png(color: str) -> bytes:
@@ -89,6 +121,7 @@ def test_opening_shows_the_four_steps_and_build_without_a_paywall():
         assert step in page
     assert any("build:" in caption.value for caption in at.caption)
     assert any("AI 服務未設定好" in error.value for error in at.error)
+    assert any(button.label == "登出" for button in at.button)
     start = _button(at, "開始收集想去的地方")
     assert not start.disabled
     assert not any(button.label == "開始排行程" for button in at.button)
