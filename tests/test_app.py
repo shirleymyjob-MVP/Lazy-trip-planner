@@ -1,5 +1,6 @@
 """Streamlit AppTest：新流程用 mock 代替真 Gemini。"""
 import hashlib
+import inspect
 import io
 import json
 import os
@@ -395,6 +396,7 @@ def test_same_member_reloads_screenshot_and_share_query_is_ignored():
     at.run()
     assert at.query_params.get("share") == "abc123def456"
     assert "share_token" not in at.session_state
+    _button(at, "新增行程").click().run()
     with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("no analyze")):
         at.file_uploader[0].upload("shared.png", _png("red"), "image/png").run()
     assert at.session_state["inbox"][0]["added_by"] == "Ada"
@@ -1423,6 +1425,7 @@ def test_share_query_does_not_open_another_members_trip(monkeypatch, memory_supa
     assert at.session_state.get("trip_id") != created["id"]
     assert at.query_params.get("share") == "abc123def456"
     assert "share_token" not in at.session_state
+    assert [row for row in memory_supabase.rows if row.get("owner_sub") == "user-b"] == []
     path = f"user-a/{created['id']}/{item_id}.jpg"
     assert memory_supabase.objects[path] == b"\xff\xd8secret"
     holder["sub"] = "user-a"
@@ -1430,13 +1433,20 @@ def test_share_query_does_not_open_another_members_trip(monkeypatch, memory_supa
     assert loaded["inbox"][0]["places"][0]["name"] == "秘密拉麵"
 
 
-def test_trip_switcher_stops_at_the_configured_cap(monkeypatch):
+def test_trip_switcher_stops_at_the_configured_cap(monkeypatch, memory_supabase):
     monkeypatch.setenv("MAX_TRIPS_PER_USER", "2")
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.run()
     assert not at.exception
+    assert memory_supabase.inserts == []
+    assert "你仲未有行程" in _page(at)
+    assert any(button.label == "新增行程" for button in at.button)
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    assert len(memory_supabase.inserts) == 1
     assert any("行程 1" in button.label for button in at.button)
+    assert any(button.label == "新增行程" for button in at.button)
     _button(at, "新增行程").click().run()
     assert not at.exception
     labels = [button.label for button in at.button]
@@ -1444,6 +1454,7 @@ def test_trip_switcher_stops_at_the_configured_cap(monkeypatch):
     assert any("行程 2" in label for label in labels)
     assert "新增行程" not in labels
     assert "每位會員最多可儲存 2 個行程" in _page(at)
+    assert len(memory_supabase.inserts) == 2
 
 
 def test_image_cap_stops_extra_uploads(monkeypatch):
@@ -1503,9 +1514,16 @@ def test_supabase_secrets_are_enough_and_stay_off_the_page(monkeypatch):
     at.run()
     assert not at.exception
     assert "行程儲存未設定好" not in _joined(at.error)
+    assert any(button.label == "新增行程" for button in at.button)
+    assert not any("行程 1" in button.label for button in at.button)
+    blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption))
+    assert "secret-value-from-secrets" not in blob
+    assert "test-service-role-key" not in blob
+    _button(at, "新增行程").click().run()
+    assert not at.exception
     assert any("行程 1" in button.label for button in at.button)
     assert not any(button.label == "新增行程" for button in at.button)
-    blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption))
+    blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption) + list(at.info) + list(at.success))
     assert "secret-value-from-secrets" not in blob
     assert "test-service-role-key" not in blob
 
@@ -1528,3 +1546,421 @@ def test_connection_failure_refuses_without_leaking_or_local_files(monkeypatch, 
     assert "db.internal" not in text
     assert "開始收集想去的地方" not in [button.label for button in at.button]
     assert not (tmp_path / "data").exists()
+
+
+_UNSAVED_NOTICE = "尚未儲存。按「新增行程」之後先會保留。"
+
+
+def _feedback(at: AppTest) -> str:
+    blocks = list(at.error) + list(at.warning) + list(at.info) + list(at.success) + list(at.caption)
+    return "\n".join(block.value for block in blocks)
+
+
+def _saved_messages(text: str) -> bool:
+    return "已儲存" in text or "儲存成功" in text or "已保存" in text
+
+
+def test_new_account_load_does_not_create_a_trip(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    for _ in range(3):
+        at.run()
+    assert not at.exception
+    assert memory_supabase.inserts == []
+    assert memory_supabase.rows == []
+    assert at.session_state.get("trip_id") in ("", None)
+    assert list(at.session_state.get("trip_catalog") or []) == []
+    assert "你仲未有行程" in _page(at)
+    assert any(button.label == "新增行程" for button in at.button)
+    assert not any("行程 1" in button.label for button in at.button)
+    assert "開始收集想去的地方" in [button.label for button in at.button]
+    assert not list(at.success)
+    assert not _saved_messages(_feedback(at))
+
+
+def test_create_trip_once_stays_one_across_reruns(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    assert memory_supabase.inserts == []
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    assert len(memory_supabase.rows) == 1
+    assert len(memory_supabase.inserts) == 1
+    trip_id = at.session_state["trip_id"]
+    assert trip_id
+    for _ in range(3):
+        at.run()
+    assert not at.exception
+    assert len(memory_supabase.rows) == 1
+    assert len(memory_supabase.inserts) == 1
+    assert at.session_state["trip_id"] == trip_id
+    assert any("行程 1" in button.label for button in at.button)
+
+
+def test_create_trip_replay_and_reentry_insert_once(monkeypatch, memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    at.session_state["_skip_next_create"] = True
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    assert memory_supabase.inserts == []
+    assert at.session_state.get("_skip_next_create") in (False, None, "")
+
+    real = trip_store.create_trip
+    state = {"n": 0}
+
+    def wrapped():
+        state["n"] += 1
+        if state["n"] > 1:
+            raise AssertionError("create_trip re-entered")
+        created = real()
+        fn = None
+        frame = inspect.currentframe()
+        while frame:
+            if "_create_new_trip" in frame.f_globals:
+                fn = frame.f_globals["_create_new_trip"]
+                break
+            frame = frame.f_back
+        assert fn is not None
+        fn()
+        return created
+
+    monkeypatch.setattr(trip_store, "create_trip", wrapped)
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    assert state["n"] == 1
+    assert len(memory_supabase.rows) == 1
+    assert len(memory_supabase.inserts) == 1
+
+
+def test_existing_member_loads_own_trips_unchanged(monkeypatch, memory_supabase):
+    holder = {"sub": "user-a"}
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: holder["sub"])
+    image = b"\xff\xd8osaka-photo"
+    item_id = "cd" * 16
+    first = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": first["id"],
+        "title": "大阪",
+        "inbox": [{
+            "id": item_id,
+            "label": "截圖 1",
+            "remark": "",
+            "status": "未排程",
+            "analysis": "done",
+            "facts": "done",
+            "places": [{"name": "秘密拉麵", "name_zh": "秘密拉麵"}],
+            "added_by": "旅人",
+            "image": image,
+        }],
+        "favourites": [_fav(id="fav-osaka", name="秘密拉麵")],
+        "members": ["旅人"],
+        "itinerary": None,
+    })
+    second = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": second["id"],
+        "title": "京都",
+        "inbox": [],
+        "favourites": [_fav(id="fav-kyoto", name="清水寺")],
+        "members": ["旅人"],
+        "itinerary": None,
+    })
+    before = {
+        row["id"]: json.dumps(row["payload"], ensure_ascii=False, sort_keys=True)
+        for row in memory_supabase.rows
+    }
+    stamps = {row["id"]: row["updated_at"] for row in memory_supabase.rows}
+    inserts_before = len(memory_supabase.inserts)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["trip_id"] = second["id"]
+    at.session_state["screen"] = "C"
+    at.run()
+    for _ in range(2):
+        at.run()
+    assert not at.exception
+    assert len(memory_supabase.inserts) == inserts_before
+    assert at.session_state["trip_id"] == second["id"]
+    labels = [button.label for button in at.button]
+    assert any(label.startswith("京都") and "目前" in label for label in labels)
+    assert any(label == "大阪" or label.startswith("大阪") for label in labels)
+    assert "清水寺" in _page(at)
+    assert "秘密拉麵" not in _page(at)
+    after = {
+        row["id"]: json.dumps(row["payload"], ensure_ascii=False, sort_keys=True)
+        for row in memory_supabase.rows
+    }
+    assert after == before
+    assert {row["id"]: row["updated_at"] for row in memory_supabase.rows} == stamps
+    assert memory_supabase.objects[f"user-a/{first['id']}/{item_id}.jpg"] == image
+    assert not list(at.success)
+
+
+def _inbox_rows(memory_supabase):
+    return [
+        row for row in memory_supabase.rows
+        if (row.get("payload") or {}).get("kind") == "inbox"
+    ]
+
+
+def test_collection_inbox_saves_without_a_trip_and_adopt_clears_it(monkeypatch, memory_supabase):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "B"
+    at.run()
+    for _ in range(2):
+        at.run()
+    assert not at.exception
+    assert memory_supabase.inserts == []
+    assert trip_store.list_trips() == []
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("no analyze")):
+        at.file_uploader[0].upload("place.png", _png("red"), "image/png").run()
+    assert not at.exception
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert trip_store.list_trips() == []
+    assert "你仲未有行程" in _page(at)
+    assert not any("行程 1" in button.label for button in at.button)
+    assert _UNSAVED_NOTICE not in _feedback(at)
+    assert not list(at.success)
+    assert not _saved_messages(_feedback(at))
+    image = at.session_state["inbox"][0]["image"]
+    item_id = at.session_state["inbox"][0]["id"]
+    inbox_id = _inbox_rows(memory_supabase)[0]["id"]
+    assert memory_supabase.objects[f"test-member-sub/{inbox_id}/{item_id}.jpg"] == image
+    for _ in range(2):
+        at.run()
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert len(trip_store.list_trips()) == 0
+
+    fresh = AppTest.from_file(APP, default_timeout=30)
+    fresh.secrets["GEMINI_API_KEY"] = "fake"
+    fresh.session_state["screen"] = "B"
+    fresh.run()
+    assert not fresh.exception
+    assert fresh.session_state["inbox"][0]["image"] == image
+    assert fresh.session_state.get("trip_id") in ("", None)
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert _UNSAVED_NOTICE not in _feedback(fresh)
+    _button(fresh, "查看我的收藏 →").click().run()
+    assert fresh.session_state["screen"] == "C"
+    _button(fresh, "新增行程").click().run()
+    assert not fresh.exception
+    assert _inbox_rows(memory_supabase) == []
+    assert len(trip_store.list_trips()) == 1
+    trip_id = fresh.session_state["trip_id"]
+    assert trip_id != inbox_id
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded.get("kind") != "inbox"
+    assert loaded["inbox"][0]["image"] == image
+    assert memory_supabase.objects[f"test-member-sub/{trip_id}/{item_id}.jpg"] == image
+    assert f"test-member-sub/{inbox_id}/{item_id}.jpg" not in memory_supabase.objects
+    assert not list(fresh.success)
+    assert not _saved_messages(_feedback(fresh))
+    for _ in range(2):
+        fresh.run()
+    assert len(trip_store.list_trips()) == 1
+    assert _inbox_rows(memory_supabase) == []
+
+
+def test_inbox_save_failure_is_an_error_not_success(monkeypatch, memory_supabase):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+
+    def boom(_snapshot):
+        raise trip_store.TripStoreError("行程內容未能儲存，請稍後再試。")
+
+    monkeypatch.setattr(trip_store, "save_collection_inbox", boom)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "C"
+    at.session_state["favourites"] = [_fav(name="秘密拉麵")]
+    at.session_state["inbox"] = [{
+        "id": "ef" * 16,
+        "label": "截圖 1",
+        "image": b"\xff\xd8pending-photo",
+        "remark": "",
+        "status": "未排程",
+        "analysis": "done",
+        "facts": "done",
+        "places": [{"name": "秘密拉麵", "name_zh": "秘密拉麵"}],
+        "added_by": "旅人",
+    }]
+    at.run()
+    assert not at.exception
+    text = _feedback(at)
+    assert "行程內容未能儲存，請稍後再試。" in _joined(at.error)
+    assert _UNSAVED_NOTICE not in text
+    assert not list(at.success)
+    assert not _saved_messages(text)
+    assert at.session_state["favourites"][0]["name"] == "秘密拉麵"
+    assert at.session_state["inbox"][0]["image"] == b"\xff\xd8pending-photo"
+    assert memory_supabase.rows == []
+    assert memory_supabase.objects == {}
+    assert "你仲未有行程" in _page(at)
+    assert any("我的收藏" in block.value for block in at.subheader)
+
+
+def test_cross_user_load_does_not_create_or_leak(monkeypatch, memory_supabase):
+    holder = {"sub": "user-a"}
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: holder["sub"])
+    image = b"\xff\xd8user-a-only"
+    item_id = "aa" * 16
+    created = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "title": "甲的行程",
+        "inbox": [{
+            "id": item_id,
+            "label": "截圖 1",
+            "remark": "",
+            "status": "未排程",
+            "analysis": "done",
+            "places": [{"name": "秘密拉麵", "name_zh": "秘密拉麵"}],
+            "added_by": "Ada",
+            "image": image,
+        }],
+        "favourites": [_fav(id="secret", name="秘密拉麵")],
+        "itinerary": None,
+    })
+    before = json.dumps(memory_supabase.rows[0]["payload"], ensure_ascii=False, sort_keys=True)
+    stamp = memory_supabase.rows[0]["updated_at"]
+    holder["sub"] = "user-b"
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "C"
+    at.session_state["trip_id"] = created["id"]
+    at.run()
+    for _ in range(2):
+        at.run()
+    assert not at.exception
+    assert [row for row in memory_supabase.rows if row.get("owner_sub") == "user-b"] == []
+    assert at.session_state.get("trip_id") in ("", None)
+    assert "秘密拉麵" not in _page(at)
+    assert "你仲未有行程" in _page(at)
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    own = [row for row in memory_supabase.rows if row.get("owner_sub") == "user-b"]
+    assert len(own) == 1
+    blob = json.dumps(own[0]["payload"], ensure_ascii=False)
+    assert "秘密拉麵" not in blob
+    assert at.session_state["trip_id"] == own[0]["id"]
+    assert at.session_state["trip_id"] != created["id"]
+    holder["sub"] = "user-a"
+    kept = next(row for row in memory_supabase.rows if row["id"] == created["id"])
+    assert kept["updated_at"] == stamp
+    assert json.dumps(kept["payload"], ensure_ascii=False, sort_keys=True) == before
+    assert memory_supabase.objects[f"user-a/{created['id']}/{item_id}.jpg"] == image
+    loaded = trip_store.load_trip(created["id"])
+    assert loaded["inbox"][0]["places"][0]["name"] == "秘密拉麵"
+
+
+def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypatch, memory_supabase, caplog):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    image = b"\xff\xd8cleanup-pending"
+    item_id = "ab" * 8
+    trip_store.save_collection_inbox({
+        "title": "收藏",
+        "inbox": [{
+            "id": item_id,
+            "label": "截圖 1",
+            "remark": "",
+            "status": "未排程",
+            "analysis": "done",
+            "facts": "done",
+            "places": [{"name": "嚴島神社", "name_zh": "嚴島神社"}],
+            "added_by": "旅人",
+            "image": image,
+        }],
+        "favourites": [{"id": "fav", "name": "嚴島神社"}],
+        "itinerary": None,
+    })
+    inbox_id = trip_store.collection_inbox_id()
+    real_remove = trip_store._remove_owned
+
+    def flaky(owner, paths):
+        if any(inbox_id in path for path in paths):
+            raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+        return real_remove(owner, paths)
+
+    monkeypatch.setattr(trip_store, "_remove_owned", flaky)
+    caplog.set_level("WARNING", logger="lazy_trip_planner.store")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "C"
+    at.run()
+    assert not at.exception
+    assert at.session_state.get("trip_id") in ("", None)
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    trip_id = at.session_state["trip_id"]
+    assert trip_id and trip_id != inbox_id
+    assert len(trip_store.list_trips()) == 1
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded["inbox"][0]["image"] == image
+    assert loaded["inbox"][0]["id"] == item_id
+    warning = _joined(at.warning)
+    assert "新行程已儲存。舊收集匣暫時未清理，唔使再新增。" in warning
+    feedback = _feedback(at)
+    assert "請再試一次" not in feedback
+    assert "收藏未能完成整理" not in feedback
+    assert "請再試一次" not in _joined(at.error)
+    pending_logs = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("Collection inbox cleanup pending")
+    ]
+    assert any(
+        message == f"Collection inbox cleanup pending inbox={inbox_id} trip={trip_id} (TripStoreError)"
+        for message in pending_logs
+    )
+    assert all("test-member-sub" not in message for message in pending_logs)
+    assert all(image.hex() not in message for message in pending_logs)
+
+    item = at.session_state["inbox"][0]
+    item["remark"] = "改過備註"
+    at.session_state[f"remark_{item['id']}"] = "改過備註"
+    at.session_state["last_digest"] = ""
+    at.run()
+    assert trip_store.load_trip(trip_id)["inbox"][0]["remark"] == "改過備註"
+    edited_stamp = trip_store.load_trip(trip_id)["updated_at"]
+    _button(at, "新增行程").click().run()
+    assert len(trip_store.list_trips()) == 1
+    assert at.session_state["trip_id"] == trip_id
+    kept = trip_store.load_trip(trip_id)
+    assert kept["inbox"][0]["remark"] == "改過備註"
+    assert kept["inbox"][0]["image"] == image
+    assert kept["updated_at"] == edited_stamp
+    at.run()
+    assert len(trip_store.list_trips()) == 1
+    assert trip_store.load_trip(trip_id)["inbox"][0]["remark"] == "改過備註"
+    assert trip_store.load_trip(trip_id)["updated_at"] == edited_stamp
+    assert "請再試一次" not in _feedback(at)
+
+    before_objects = dict(memory_supabase.objects)
+    fresh = AppTest.from_file(APP, default_timeout=30)
+    fresh.secrets["GEMINI_API_KEY"] = "fake"
+    fresh.session_state["screen"] = "C"
+    fresh.run()
+    assert not fresh.exception
+    assert fresh.session_state["trip_id"] == trip_id
+    assert fresh.session_state.get("collection_inbox_id") in ("", None)
+    assert fresh.session_state["inbox"][0]["remark"] == "改過備註"
+    assert fresh.session_state["inbox"][0]["image"] == image
+    assert [row["id"] for row in trip_store.list_trips()] == [trip_id]
+    assert trip_store.collection_inbox_id() == inbox_id
+    assert inbox_id not in [row["id"] for row in fresh.session_state.get("trip_catalog") or []]
+    assert "你仲未有行程" not in _page(fresh)
+    assert memory_supabase.objects == before_objects
+    assert len([row for row in memory_supabase.rows if row.get("id") != inbox_id]) == 1
+
+    monkeypatch.setattr(trip_store, "_remove_owned", real_remove)
+    trip_store.release_adopted_collection_inbox()
+    assert trip_store.load_collection_inbox() is None
+    assert trip_store.has_pending_collection_inbox() is False
+    final = trip_store.load_trip(trip_id)
+    assert final["inbox"][0]["remark"] == "改過備註"
+    assert final["inbox"][0]["image"] == image
+    assert len(trip_store.list_trips()) == 1

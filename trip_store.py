@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from collections.abc import Mapping
 from datetime import datetime, timezone
@@ -42,6 +43,13 @@ MSG_IMAGE_DENIED = "找不到這張圖片，或者你沒有權限。"
 MSG_NOT_IMAGE = "只可以儲存圖片。"
 MSG_TOO_BIG = "圖片太大，單張上限是 10MB。"
 MSG_CONTENT = "行程內容未能儲存，請稍後再試。"
+MSG_INBOX_KEEP = "收藏未能完成整理，原有收藏仍然保留。請再試一次。"
+
+# 收藏匣用現有 trips 列。沒有 kind、或者 kind 不是 inbox，都當普通行程。
+KIND_INBOX = "inbox"
+
+_owner_locks_guard = threading.Lock()
+_owner_locks: dict[str, threading.Lock] = {}
 
 _SUB_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
 _ITEM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
@@ -80,9 +88,9 @@ def images_cap_message() -> str:
 
 
 def list_trips() -> list[dict]:
-    """回傳目前會員自己的行程摘要（不含圖片）。"""
+    """回傳目前會員自己的行程摘要（不含圖片，亦不含收藏匣）。"""
     owner = _require_owner()
-    rows = _select_owned(owner)
+    rows = _trip_rows(_select_owned(owner))
     summaries = []
     for index, row in enumerate(rows, start=1):
         payload = _payload_dict(row)
@@ -98,7 +106,7 @@ def list_trips() -> list[dict]:
 
 def create_trip() -> dict:
     owner = _require_owner()
-    rows = _select_owned(owner)
+    rows = _trip_rows(_select_owned(owner))
     cap = max_trips()
     if len(rows) >= cap:
         raise TripStoreError(trips_cap_message())
@@ -122,30 +130,91 @@ def create_trip() -> dict:
     }
 
 
+def load_collection_inbox() -> dict | None:
+    """讀取收藏匣。沒有就回傳 None，唔會新增列。"""
+    owner = _require_owner()
+    row = _collection_inbox_row(owner)
+    if row is None:
+        return None
+    return _load_owned_row(owner, row)
+
+
+def collection_inbox_id() -> str:
+    """目前會員的收藏匣 id。沒有就係空字串，唔會新增。"""
+    owner = _require_owner()
+    row = _collection_inbox_row(owner)
+    if row is None:
+        return ""
+    return str(row.get("id") or "")
+
+
+def save_collection_inbox(snapshot: dict) -> str:
+    """寫入收藏匣。未有列先至建立，而且同一會員最多一列。"""
+    owner = _require_owner()
+    if not isinstance(snapshot, dict):
+        raise TripStoreError(MSG_CONTENT)
+    with _owner_lock(owner):
+        inbox_id = _ensure_collection_inbox_locked(owner)
+        copied = dict(snapshot)
+        copied["trip_id"] = inbox_id
+        return _write_snapshot(owner, inbox_id, copied, kind=KIND_INBOX)
+
+
+def adopt_collection_inbox(snapshot: dict) -> dict:
+    """開一個普通行程，複製收藏匣的內容同圖片，核對成功先清收藏匣。
+
+    任何複製步驟失敗都會刪走新行程，以及只屬於新行程路徑的圖片。
+    收藏匣同佢的圖片保持原狀。清理失敗亦唔會刪走仍被收藏匣引用的圖片。
+    """
+    owner = _require_owner()
+    if not isinstance(snapshot, dict):
+        raise TripStoreError(MSG_CONTENT)
+    with _owner_lock(owner):
+        return _adopt_collection_inbox_locked(owner, snapshot)
+
+
+def has_pending_collection_inbox() -> bool:
+    """收藏匣已蓋章指向一個行程，但尚未清理。不會新增列。"""
+    owner = _require_owner()
+    inbox = _collection_inbox_row(owner)
+    if inbox is None:
+        return False
+    return bool(str(_payload_dict(inbox).get("promoted_trip_id") or ""))
+
+
+def release_adopted_collection_inbox() -> None:
+    """收藏匣已經成功複製到行程時，再試一次清理。未複製過就什麼都不做。
+
+    清理失敗只記日誌，不向呼叫方拋出，也不覆蓋已複製的行程。
+    """
+    owner = _require_owner()
+    with _owner_lock(owner):
+        inbox = _collection_inbox_row(owner)
+        if inbox is None:
+            return
+        promoted = str(_payload_dict(inbox).get("promoted_trip_id") or "")
+        if not promoted:
+            return
+        try:
+            promoted = _validate_trip_id(promoted)
+            row = _owned_row(owner, promoted)
+        except TripStoreError:
+            return
+        if _is_collection_inbox(row):
+            return
+        try:
+            _delete_collection_inbox(owner, str(inbox.get("id") or ""))
+        except TripStoreError:
+            return
+
+
 def load_trip(trip_id: str) -> dict:
     owner = _require_owner()
     trip_id = _validate_trip_id(trip_id)
     row = _owned_row(owner, trip_id)
-    payload = _payload_dict(row)
-    inbox = []
-    for item in payload.get("inbox") or []:
-        if not isinstance(item, dict):
-            continue
-        copied = dict(item)
-        item_id = str(copied.get("id") or "")
-        if copied.get("has_image"):
-            path = _object_path(owner, trip_id, item_id)
-            copied["image"] = _download_owned(owner, path)
-        else:
-            copied["image"] = b""
-        inbox.append(copied)
-    loaded = dict(payload)
-    loaded["inbox"] = inbox
-    loaded["trip_id"] = trip_id
-    loaded["title"] = str(payload.get("title") or "").strip() or "行程"
-    loaded["updated_at"] = _stamp(row.get("updated_at"))
-    loaded.pop("owner_sub", None)
-    return loaded
+    if _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    return _load_owned_row(owner, row)
 
 
 def save_trip(snapshot: dict) -> str:
@@ -154,43 +223,7 @@ def save_trip(snapshot: dict) -> str:
     if not isinstance(snapshot, dict):
         raise TripStoreError(MSG_DENIED)
     trip_id = _validate_trip_id(str(snapshot.get("trip_id") or ""))
-    row = _owned_row(owner, trip_id)
-    previous = _payload_dict(row)
-    inbox_out = []
-    new_images: list[tuple[str, bytes]] = []
-    seen_ids: set[str] = set()
-    for item in snapshot.get("inbox") or []:
-        if not isinstance(item, dict):
-            raise TripStoreError(MSG_CONTENT)
-        item_id = _validate_item_id(str(item.get("id") or ""))
-        if item_id in seen_ids:
-            raise TripStoreError(MSG_CONTENT)
-        seen_ids.add(item_id)
-        image = item.get("image") or b""
-        if image:
-            if not isinstance(image, (bytes, bytearray)):
-                raise TripStoreError(MSG_NOT_IMAGE)
-            blob = bytes(image)
-            _validate_image(blob)
-            new_images.append((item_id, blob))
-        slim = _slim_item(item)
-        slim["has_image"] = bool(image)
-        inbox_out.append(slim)
-    old_ids = _image_ids(previous)
-    new_ids = {item_id for item_id, _blob in new_images}
-    others = count_images(excluding_trip_id=trip_id)
-    if others + len(new_ids) > max_images():
-        raise TripStoreError(images_cap_message())
-    payload = _snapshot_payload(snapshot, inbox_out)
-    for item_id, blob in new_images:
-        path = _object_path(owner, trip_id, item_id)
-        _upload_owned(owner, path, blob)
-    updated = _update_owned(owner, trip_id, payload)
-    removed = old_ids - new_ids
-    for item_id in removed:
-        path = _object_path(owner, trip_id, item_id)
-        _remove_owned(owner, [path])
-    return _stamp(updated.get("updated_at"))
+    return _write_snapshot(owner, trip_id, snapshot, kind=None)
 
 
 def delete_trip(trip_id: str) -> None:
@@ -237,18 +270,379 @@ def delete_image_path(path: str) -> None:
 
 def count_images(*, excluding_trip_id: str | None = None) -> int:
     owner = _require_owner()
-    excluded = ""
+    excluded: set[str] = set()
     if excluding_trip_id:
         try:
-            excluded = _validate_trip_id(excluding_trip_id)
+            excluded.add(_validate_trip_id(excluding_trip_id))
         except TripStoreError:
-            excluded = ""
+            pass
+    return _count_images(owner, excluded)
+
+
+def _owner_lock(owner: str) -> threading.Lock:
+    with _owner_locks_guard:
+        lock = _owner_locks.get(owner)
+        if lock is None:
+            lock = threading.Lock()
+            _owner_locks[owner] = lock
+        return lock
+
+
+def _is_collection_inbox(row: Mapping[str, Any]) -> bool:
+    return _payload_dict(row).get("kind") == KIND_INBOX
+
+
+def _trip_rows(rows: list[dict]) -> list[dict]:
+    return [row for row in rows if not _is_collection_inbox(row)]
+
+
+def _collection_inbox_row(owner: str) -> dict | None:
+    found = [row for row in _select_owned(owner) if _is_collection_inbox(row)]
+    if not found:
+        return None
+    found.sort(key=lambda row: _stamp(row.get("created_at")))
+    return found[0]
+
+
+def _ensure_collection_inbox_locked(owner: str) -> str:
+    existing = _collection_inbox_row(owner)
+    if existing is not None:
+        return str(existing.get("id") or "")
+    inbox_id = str(uuid.uuid4())
+    now = _now()
+    payload = _empty_payload("收藏")
+    payload["kind"] = KIND_INBOX
+    record = {
+        "id": inbox_id,
+        "owner_sub": owner,
+        "payload": payload,
+        "created_at": now,
+        "updated_at": now,
+    }
+    inserted = _insert_owned(owner, record)
+    return str(inserted.get("id") or inbox_id)
+
+
+def _count_images(owner: str, excluded: set[str]) -> int:
     total = 0
     for row in _select_owned(owner):
-        if excluded and str(row.get("id")) == excluded:
+        if str(row.get("id") or "") in excluded:
             continue
         total += len(_image_ids(_payload_dict(row)))
     return total
+
+
+def _stage_items(snapshot: dict) -> tuple[list[dict], list[tuple[str, bytes]]]:
+    inbox_out = []
+    new_images: list[tuple[str, bytes]] = []
+    seen_ids: set[str] = set()
+    for item in snapshot.get("inbox") or []:
+        if not isinstance(item, dict):
+            raise TripStoreError(MSG_CONTENT)
+        item_id = _validate_item_id(str(item.get("id") or ""))
+        if item_id in seen_ids:
+            raise TripStoreError(MSG_CONTENT)
+        seen_ids.add(item_id)
+        image = item.get("image") or b""
+        if image:
+            if not isinstance(image, (bytes, bytearray)):
+                raise TripStoreError(MSG_NOT_IMAGE)
+            blob = bytes(image)
+            _validate_image(blob)
+            new_images.append((item_id, blob))
+        slim = _slim_item(item)
+        slim["has_image"] = bool(image)
+        inbox_out.append(slim)
+    return inbox_out, new_images
+
+
+def _write_snapshot(
+    owner: str,
+    trip_id: str,
+    snapshot: dict,
+    *,
+    kind: str | None,
+    exclude_ids: set[str] | None = None,
+) -> str:
+    row = _owned_row(owner, trip_id)
+    if kind == KIND_INBOX and not _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    if kind != KIND_INBOX and _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    previous = _payload_dict(row)
+    inbox_out, new_images = _stage_items(snapshot)
+    old_ids = _image_ids(previous)
+    new_ids = {item_id for item_id, _blob in new_images}
+    excluded = {trip_id}
+    if exclude_ids:
+        excluded.update(exclude_ids)
+    others = _count_images(owner, excluded)
+    if others + len(new_ids) > max_images():
+        raise TripStoreError(images_cap_message())
+    payload = _snapshot_payload(snapshot, inbox_out)
+    if kind == KIND_INBOX:
+        payload["kind"] = KIND_INBOX
+        promoted = str(previous.get("promoted_trip_id") or "")
+        if promoted:
+            payload["promoted_trip_id"] = promoted
+    uploaded: list[str] = []
+    try:
+        for item_id, blob in new_images:
+            path = _object_path(owner, trip_id, item_id)
+            _upload_owned(owner, path, blob)
+            uploaded.append(path)
+        updated = _update_owned(owner, trip_id, payload)
+    except TripStoreError:
+        if kind == KIND_INBOX and not old_ids and uploaded:
+            _rollback_paths(owner, trip_id, uploaded)
+        raise
+    removed = old_ids - new_ids
+    for item_id in removed:
+        path = _object_path(owner, trip_id, item_id)
+        _remove_owned(owner, [path])
+    return _stamp(updated.get("updated_at"))
+
+
+def _load_owned_row(owner: str, row: dict) -> dict:
+    trip_id = _validate_trip_id(str(row.get("id") or ""))
+    payload = _payload_dict(row)
+    inbox = []
+    for item in payload.get("inbox") or []:
+        if not isinstance(item, dict):
+            continue
+        copied = dict(item)
+        item_id = str(copied.get("id") or "")
+        if copied.get("has_image"):
+            path = _object_path(owner, trip_id, item_id)
+            copied["image"] = _download_owned(owner, path)
+        else:
+            copied["image"] = b""
+        inbox.append(copied)
+    loaded = dict(payload)
+    loaded["inbox"] = inbox
+    loaded["trip_id"] = trip_id
+    loaded["title"] = str(payload.get("title") or "").strip() or "行程"
+    loaded["updated_at"] = _stamp(row.get("updated_at"))
+    loaded.pop("owner_sub", None)
+    return loaded
+
+
+def _verify_copied_trip(owner: str, trip_id: str, images: list[tuple[str, bytes]], payload: dict) -> None:
+    row = _owned_row(owner, trip_id)
+    if _is_collection_inbox(row):
+        raise TripStoreError(MSG_CONTENT)
+    saved = _payload_dict(row)
+    if saved.get("kind") == KIND_INBOX:
+        raise TripStoreError(MSG_CONTENT)
+    if [item.get("id") for item in saved.get("inbox") or []] != [item.get("id") for item in payload.get("inbox") or []]:
+        raise TripStoreError(MSG_CONTENT)
+    if _image_ids(saved) != {item_id for item_id, _blob in images}:
+        raise TripStoreError(MSG_CONTENT)
+    if saved.get("favourites") != payload.get("favourites"):
+        raise TripStoreError(MSG_CONTENT)
+    for item_id, blob in images:
+        path = _object_path(owner, trip_id, item_id)
+        if _download_owned(owner, path) != blob:
+            raise TripStoreError(MSG_CONTENT)
+
+
+def _rollback_paths(owner: str, trip_id: str, uploaded: list[str]) -> None:
+    prefix = f"{owner}/{trip_id}/"
+    safe = [
+        path for path in uploaded
+        if isinstance(path, str) and path.startswith(prefix) and path.count("/") == 2
+    ]
+    if not safe:
+        return
+    try:
+        _remove_owned(owner, safe)
+    except TripStoreError:
+        logger.warning("Rollback of new trip images failed")
+
+
+def _rollback_created_trip(owner: str, trip_id: str, uploaded: list[str]) -> None:
+    _rollback_paths(owner, trip_id, uploaded)
+    try:
+        _delete_owned(owner, trip_id)
+    except TripStoreError:
+        logger.warning("Rollback of new trip row failed")
+
+
+def _stamp_promoted(owner: str, inbox_id: str, trip_id: str) -> None:
+    row = _owned_row(owner, inbox_id)
+    if not _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    payload = dict(_payload_dict(row))
+    payload["kind"] = KIND_INBOX
+    payload["promoted_trip_id"] = trip_id
+    _update_owned(owner, inbox_id, payload)
+
+
+def _only_inbox_paths(owner: str, inbox_id: str, paths: list[str]) -> list[str]:
+    """只留 `{owner}/{inbox_id}/{item}.jpg`。新行程路徑唔可以清。"""
+    prefix = f"{owner}/{inbox_id}/"
+    safe: list[str] = []
+    for path in paths:
+        if (
+            isinstance(path, str)
+            and path.startswith(prefix)
+            and path.count("/") == 2
+            and path.endswith(".jpg")
+        ):
+            safe.append(path)
+    return safe
+
+
+def _log_inbox_cleanup_pending(inbox_id: str, trip_id: str, exc: BaseException) -> None:
+    logger.warning(
+        "Collection inbox cleanup pending inbox=%s trip=%s (%s)",
+        inbox_id,
+        trip_id,
+        type(exc).__name__,
+    )
+
+
+def _delete_collection_inbox(owner: str, inbox_id: str) -> None:
+    """清收藏匣。失敗時原列同圖片仍然可以讀到。"""
+    row = _owned_row(owner, inbox_id)
+    if not _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    inbox_id = _validate_trip_id(str(row.get("id") or inbox_id))
+    payload = _payload_dict(row)
+    promoted = str(payload.get("promoted_trip_id") or "")
+    stored: list[tuple[str, bytes]] = []
+    for item_id in _image_ids(payload):
+        path = _object_path(owner, inbox_id, item_id)
+        stored.append((path, _download_owned(owner, path)))
+    stored = [
+        (path, blob)
+        for path, blob in stored
+        if path in _only_inbox_paths(owner, inbox_id, [path])
+    ]
+    paths = [path for path, _blob in stored]
+    removed = False
+    try:
+        if paths:
+            _remove_owned(owner, paths)
+            removed = True
+        _delete_owned(owner, inbox_id)
+    except TripStoreError as err:
+        if removed:
+            for path, blob in stored:
+                try:
+                    _upload_owned(owner, path, blob)
+                except TripStoreError:
+                    logger.warning("Restoring collection inbox image failed")
+        _log_inbox_cleanup_pending(inbox_id, promoted, err)
+        raise TripStoreError(MSG_INBOX_KEEP) from err
+
+
+def _trip_summary(owner: str, trip_id: str) -> dict:
+    row = _owned_row(owner, trip_id)
+    payload = _payload_dict(row)
+    return {
+        "id": str(row.get("id") or trip_id),
+        "title": str(payload.get("title") or "").strip() or "行程",
+        "created_at": _stamp(row.get("created_at")),
+        "updated_at": _stamp(row.get("updated_at")),
+    }
+
+
+def _resume_promoted_inbox(owner: str, inbox_id: str, promoted: str, _snapshot: dict) -> dict:
+    """已蓋章的收藏匣只再試清理，唔好覆寫已經複製好的行程。"""
+    summary = _trip_summary(owner, promoted)
+    try:
+        _delete_collection_inbox(owner, inbox_id)
+    except TripStoreError:
+        summary["inbox_cleanup_pending"] = True
+        return summary
+    summary["inbox_cleanup_pending"] = False
+    return summary
+
+
+def _adopt_collection_inbox_locked(owner: str, snapshot: dict) -> dict:
+    inbox = _collection_inbox_row(owner)
+    inbox_id = str(inbox.get("id") or "") if inbox else ""
+    if inbox is not None:
+        promoted = str(_payload_dict(inbox).get("promoted_trip_id") or "")
+        if promoted:
+            try:
+                promoted = _validate_trip_id(promoted)
+                row = _owned_row(owner, promoted)
+            except TripStoreError:
+                promoted = ""
+            else:
+                if not _is_collection_inbox(row):
+                    return _resume_promoted_inbox(owner, inbox_id, promoted, snapshot)
+    created = _insert_trip_for_adopt(owner)
+    new_id = str(created["id"])
+    copied = dict(snapshot)
+    copied["trip_id"] = new_id
+    copied["title"] = created["title"]
+    inbox_out, images = _stage_items(copied)
+    others = _count_images(owner, {new_id, inbox_id} - {""})
+    if others + len(images) > max_images():
+        _rollback_created_trip(owner, new_id, [])
+        raise TripStoreError(images_cap_message())
+    payload = _snapshot_payload(copied, inbox_out)
+    payload.pop("kind", None)
+    payload.pop("promoted_trip_id", None)
+    uploaded: list[str] = []
+    stamped = False
+    try:
+        for item_id, blob in images:
+            path = _object_path(owner, new_id, item_id)
+            _upload_owned(owner, path, blob)
+            uploaded.append(path)
+        updated = _update_owned(owner, new_id, payload)
+        _verify_copied_trip(owner, new_id, images, payload)
+        if inbox_id:
+            _stamp_promoted(owner, inbox_id, new_id)
+            stamped = True
+            try:
+                _delete_collection_inbox(owner, inbox_id)
+            except TripStoreError:
+                return _adopted_summary(created, payload, updated, pending=True)
+    except TripStoreError:
+        if not stamped:
+            _rollback_created_trip(owner, new_id, uploaded)
+            raise
+        raise
+    return _adopted_summary(created, payload, updated, pending=False)
+
+
+def _adopted_summary(created: dict, payload: dict, updated: dict, *, pending: bool) -> dict:
+    return {
+        "id": str(created["id"]),
+        "title": str(payload.get("title") or created["title"]),
+        "created_at": created.get("created_at") or "",
+        "updated_at": _stamp(updated.get("updated_at")),
+        "inbox_cleanup_pending": pending,
+    }
+
+
+def _insert_trip_for_adopt(owner: str) -> dict:
+    rows = _trip_rows(_select_owned(owner))
+    if len(rows) >= max_trips():
+        raise TripStoreError(trips_cap_message())
+    trip_id = str(uuid.uuid4())
+    title = f"行程 {len(rows) + 1}"
+    now = _now()
+    record = {
+        "id": trip_id,
+        "owner_sub": owner,
+        "payload": _empty_payload(title),
+        "created_at": now,
+        "updated_at": now,
+    }
+    inserted = _insert_owned(owner, record)
+    payload = _payload_dict(inserted)
+    return {
+        "id": str(inserted.get("id") or trip_id),
+        "title": str(payload.get("title") or title),
+        "created_at": _stamp(inserted.get("created_at")),
+        "updated_at": _stamp(inserted.get("updated_at")),
+    }
 
 
 def digest(snapshot: dict) -> str:
