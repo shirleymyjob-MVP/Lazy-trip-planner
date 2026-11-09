@@ -661,6 +661,71 @@ def test_cleanup_failure_keeps_the_new_trip_and_does_not_overwrite_it(use_sub, m
     assert memory_supabase.objects == {f"user-a/{trip_id}/aa.jpg": image}
 
 
+def test_inbox_cleanup_only_removes_its_own_image_paths(use_sub, memory_supabase, monkeypatch):
+    use_sub("user-a")
+    first = b"\xff\xd8image-one"
+    second = b"\xff\xd8image-two"
+    snapshot = _collection_snapshot([
+        _item("aa", name="一", image=first),
+        _item("bb", name="二", image=second),
+    ])
+    trip_store.save_collection_inbox(snapshot)
+    inbox_id = trip_store.collection_inbox_id()
+    inbox_prefix = f"user-a/{inbox_id}/"
+    real_remove = trip_store._remove_owned
+    real_upload = trip_store._upload_owned
+    seen_removes: list[str] = []
+
+    def flaky(owner, paths):
+        seen_removes.extend(paths)
+        raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+
+    monkeypatch.setattr(trip_store, "_remove_owned", flaky)
+    adopted = trip_store.adopt_collection_inbox(snapshot)
+    trip_id = adopted["id"]
+    trip_prefix = f"user-a/{trip_id}/"
+    expected = {
+        f"{trip_prefix}aa.jpg": first,
+        f"{trip_prefix}bb.jpg": second,
+    }
+
+    def trip_images() -> dict[str, bytes]:
+        return {
+            path: blob for path, blob in memory_supabase.objects.items()
+            if path.startswith(trip_prefix)
+        }
+
+    assert trip_images() == expected
+    assert seen_removes
+    assert all(path.startswith(inbox_prefix) and path.count("/") == 2 for path in seen_removes)
+    assert all(not path.startswith(trip_prefix) for path in seen_removes)
+    assert memory_supabase.objects[f"{inbox_prefix}aa.jpg"] == first
+    assert memory_supabase.objects[f"{inbox_prefix}bb.jpg"] == second
+
+    cleanup_removes: list[str] = []
+    cleanup_uploads: list[str] = []
+
+    def watch_remove(owner, paths):
+        cleanup_removes.extend(paths)
+        return real_remove(owner, paths)
+
+    def watch_upload(owner, path, blob):
+        cleanup_uploads.append(path)
+        return real_upload(owner, path, blob)
+
+    monkeypatch.setattr(trip_store, "_remove_owned", watch_remove)
+    monkeypatch.setattr(trip_store, "_upload_owned", watch_upload)
+    trip_store.release_adopted_collection_inbox()
+    assert trip_images() == expected
+    assert cleanup_removes
+    assert all(path.startswith(inbox_prefix) and not path.startswith(trip_prefix) for path in cleanup_removes)
+    assert all(path.startswith(inbox_prefix) and not path.startswith(trip_prefix) for path in cleanup_uploads)
+    assert f"{inbox_prefix}aa.jpg" not in memory_supabase.objects
+    assert f"{inbox_prefix}bb.jpg" not in memory_supabase.objects
+    assert trip_store.load_trip(trip_id)["inbox"][0]["image"] == first
+    assert trip_store.load_trip(trip_id)["inbox"][1]["image"] == second
+
+
 def test_other_member_cannot_read_or_change_collection_inbox(use_sub, memory_supabase):
     use_sub("user-a")
     image = b"\xff\xd8secret-inbox"

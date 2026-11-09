@@ -1939,6 +1939,23 @@ def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypat
     assert trip_store.load_trip(trip_id)["updated_at"] == edited_stamp
     assert "請再試一次" not in _feedback(at)
 
+    before_objects = dict(memory_supabase.objects)
+    fresh = AppTest.from_file(APP, default_timeout=30)
+    fresh.secrets["GEMINI_API_KEY"] = "fake"
+    fresh.session_state["screen"] = "C"
+    fresh.run()
+    assert not fresh.exception
+    assert fresh.session_state["trip_id"] == trip_id
+    assert fresh.session_state.get("collection_inbox_id") in ("", None)
+    assert fresh.session_state["inbox"][0]["remark"] == "改過備註"
+    assert fresh.session_state["inbox"][0]["image"] == image
+    assert [row["id"] for row in trip_store.list_trips()] == [trip_id]
+    assert trip_store.collection_inbox_id() == inbox_id
+    assert inbox_id not in [row["id"] for row in fresh.session_state.get("trip_catalog") or []]
+    assert "你仲未有行程" not in _page(fresh)
+    assert memory_supabase.objects == before_objects
+    assert len([row for row in memory_supabase.rows if row.get("id") != inbox_id]) == 1
+
     monkeypatch.setattr(trip_store, "_remove_owned", real_remove)
     trip_store.release_adopted_collection_inbox()
     assert trip_store.load_collection_inbox() is None

@@ -478,6 +478,21 @@ def _stamp_promoted(owner: str, inbox_id: str, trip_id: str) -> None:
     _update_owned(owner, inbox_id, payload)
 
 
+def _only_inbox_paths(owner: str, inbox_id: str, paths: list[str]) -> list[str]:
+    """只留 `{owner}/{inbox_id}/{item}.jpg`。新行程路徑唔可以清。"""
+    prefix = f"{owner}/{inbox_id}/"
+    safe: list[str] = []
+    for path in paths:
+        if (
+            isinstance(path, str)
+            and path.startswith(prefix)
+            and path.count("/") == 2
+            and path.endswith(".jpg")
+        ):
+            safe.append(path)
+    return safe
+
+
 def _log_inbox_cleanup_pending(inbox_id: str, trip_id: str, exc: BaseException) -> None:
     logger.warning(
         "Collection inbox cleanup pending inbox=%s trip=%s (%s)",
@@ -499,6 +514,11 @@ def _delete_collection_inbox(owner: str, inbox_id: str) -> None:
     for item_id in _image_ids(payload):
         path = _object_path(owner, inbox_id, item_id)
         stored.append((path, _download_owned(owner, path)))
+    stored = [
+        (path, blob)
+        for path, blob in stored
+        if path in _only_inbox_paths(owner, inbox_id, [path])
+    ]
     paths = [path for path, _blob in stored]
     removed = False
     try:
