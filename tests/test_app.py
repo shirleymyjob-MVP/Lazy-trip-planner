@@ -1399,6 +1399,7 @@ def test_share_query_does_not_open_another_members_trip(monkeypatch, memory_supa
     item_id = "ab" * 16
     trip_store.save_trip({
         "trip_id": created["id"],
+        "version": created["version"],
         "title": "甲的行程",
         "inbox": [{
             "id": item_id,
@@ -1644,6 +1645,7 @@ def test_existing_member_loads_own_trips_unchanged(monkeypatch, memory_supabase)
     first = trip_store.create_trip()
     trip_store.save_trip({
         "trip_id": first["id"],
+        "version": first["version"],
         "title": "大阪",
         "inbox": [{
             "id": item_id,
@@ -1663,6 +1665,7 @@ def test_existing_member_loads_own_trips_unchanged(monkeypatch, memory_supabase)
     second = trip_store.create_trip()
     trip_store.save_trip({
         "trip_id": second["id"],
+        "version": second["version"],
         "title": "京都",
         "inbox": [],
         "favourites": [_fav(id="fav-kyoto", name="清水寺")],
@@ -1812,6 +1815,7 @@ def test_cross_user_load_does_not_create_or_leak(monkeypatch, memory_supabase):
     created = trip_store.create_trip()
     trip_store.save_trip({
         "trip_id": created["id"],
+        "version": created["version"],
         "title": "甲的行程",
         "inbox": [{
             "id": item_id,
@@ -1964,3 +1968,61 @@ def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypat
     assert final["inbox"][0]["remark"] == "改過備註"
     assert final["inbox"][0]["image"] == image
     assert len(trip_store.list_trips()) == 1
+
+
+def test_remote_edit_keeps_unsaved_local_until_reload(monkeypatch, memory_supabase):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "user-a")
+    image = b"\xff\xd8keep-me"
+    item_id = "ab" * 8
+    created = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "version": created["version"],
+        "title": "大阪",
+        "inbox": [{
+            "id": item_id,
+            "label": "截圖 1",
+            "remark": "",
+            "status": "未排程",
+            "analysis": "done",
+            "facts": "done",
+            "places": [{"name": "秘密拉麵", "name_zh": "秘密拉麵"}],
+            "added_by": "旅人",
+            "image": image,
+        }],
+        "favourites": [_fav(id="fav-osaka", name="秘密拉麵")],
+        "members": ["旅人"],
+        "itinerary": None,
+    })
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["trip_id"] = created["id"]
+    at.session_state["screen"] = "C"
+    at.run()
+    assert not at.exception
+    assert at.session_state["trip_title"] == "大阪"
+    row = memory_supabase.rows[0]
+    payload = dict(row["payload"])
+    payload["title"] = "遠端已改"
+    row["payload"] = payload
+    row["version"] = int(row["version"]) + 1
+    row["updated_at"] = f"{row['updated_at']}-remote"
+    at.session_state["trip_title"] = "我未儲存"
+    at.session_state["last_digest"] = "local-dirty"
+    at.run()
+    assert not at.exception
+    assert at.session_state["trip_title"] == "我未儲存"
+    assert at.session_state["inbox"][0]["image"] == image
+    assert trip_store.MSG_CONFLICT in _joined(at.error)
+    assert any(button.label == "重新載入已儲存的行程" for button in at.button)
+    assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
+    assert memory_supabase.objects[f"user-a/{created['id']}/{item_id}.jpg"] == image
+    at.run()
+    assert at.session_state["trip_title"] == "我未儲存"
+    assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
+    _button(at, "重新載入已儲存的行程").click().run()
+    assert not at.exception
+    assert at.session_state["trip_title"] == "遠端已改"
+    assert not at.session_state.get("trip_conflict")
+    assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
+    assert memory_supabase.objects[f"user-a/{created['id']}/{item_id}.jpg"] == image
