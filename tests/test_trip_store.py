@@ -150,6 +150,7 @@ def test_save_and_load_round_trip_for_the_same_sub(use_sub, memory_supabase):
     snapshot["picks"] = {item_id: True}
     snapshot["owner_sub"] = "user-b"
     snapshot["storage_path"] = "user-b/nope/nope.jpg"
+    snapshot["version"] = created["version"]
     trip_store.save_trip(snapshot)
     loaded = trip_store.load_trip(created["id"])
     assert loaded["inbox"][0]["added_by"] == "Ada"
@@ -167,9 +168,12 @@ def test_save_and_load_round_trip_for_the_same_sub(use_sub, memory_supabase):
     assert options["upsert"] == "true"
     assert memory_supabase.buckets
     assert set(memory_supabase.buckets) == {"trip-images"}
+    assert loaded["version"] == 2
+    assert memory_supabase.rows[0]["version"] == 2
     assert memory_supabase.update_filters[-1] == {
         "id": created["id"],
         "owner_sub": "user-a",
+        "version": 1,
     }
     assert all(filt.get("owner_sub") == "user-a" for filt in memory_supabase.select_filters)
 
@@ -182,7 +186,9 @@ def test_user_cannot_read_modify_or_delete_another_users_trip(use_sub, memory_su
         created["id"],
         [_item(item_id, name="秘密拉麵", image=b"\xff\xd8secret-bytes")],
         title="甲的行程",
+        version=created["version"],
     ))
+    saved_version = memory_supabase.rows[0]["version"]
     uploads_before = list(memory_supabase.uploads)
     removes_before = list(memory_supabase.removes)
     path = f"user-a/{created['id']}/{item_id}.jpg"
@@ -211,6 +217,7 @@ def test_user_cannot_read_modify_or_delete_another_users_trip(use_sub, memory_su
 
     assert memory_supabase.uploads == uploads_before
     assert memory_supabase.removes == removes_before
+    assert memory_supabase.rows[0]["version"] == saved_version
     assert memory_supabase.objects[path] == b"\xff\xd8secret-bytes"
     assert [row["id"] for row in trip_store.list_trips()] != [created["id"]]
     assert trip_store.list_trips() == []
@@ -295,7 +302,7 @@ def test_same_sub_can_delete_only_own_image(use_sub, memory_supabase):
     trip_store.save_trip(_snap(created["id"], [
         _item(keep, image=b"\xff\xd8keep"),
         _item(drop, image=b"\xff\xd8drop"),
-    ]))
+    ], version=created["version"]))
     trip_store.delete_image(created["id"], drop)
     loaded = trip_store.load_trip(created["id"])
     images = {item["id"]: item["image"] for item in loaded["inbox"]}
@@ -320,13 +327,13 @@ def test_default_trip_cap_is_three_and_image_cap_is_fifty(use_sub, monkeypatch):
     assert len(trip_store.list_trips()) == 3
 
     images = [_item(f"i{index:02d}", image=b"\xff\xd8" + bytes([index])) for index in range(50)]
-    trip_store.save_trip(_snap(created[0]["id"], images, title="行程 1"))
+    trip_store.save_trip(_snap(created[0]["id"], images, title="行程 1", version=created[0]["version"]))
     loaded = trip_store.load_trip(created[0]["id"])
     assert len(loaded["inbox"]) == 50
     assert loaded["inbox"][49]["image"].startswith(b"\xff\xd8")
     too_many = images + [_item("i50", image=b"\xff\xd8overflow")]
     with pytest.raises(trip_store.TripStoreError) as image_denied:
-        trip_store.save_trip(_snap(created[0]["id"], too_many, title="行程 1"))
+        trip_store.save_trip(_snap(created[0]["id"], too_many, title="行程 1", version=loaded["version"]))
     assert "50" in str(image_denied.value)
     assert len(trip_store.load_trip(created[0]["id"])["inbox"]) == 50
 
@@ -349,13 +356,14 @@ def test_configurable_caps_count_across_trips(use_sub, monkeypatch):
     trip_store.save_trip(_snap(first["id"], [
         _item("aa", image=b"\xff\xd8aa"),
         _item("bb", image=b"\xff\xd8bb"),
-    ]))
-    trip_store.save_trip(_snap(second["id"], [_item("cc", image=b"\xff\xd8cc")], title="行程 2"))
+    ], version=first["version"]))
+    trip_store.save_trip(_snap(second["id"], [_item("cc", image=b"\xff\xd8cc")], title="行程 2", version=second["version"]))
+    second_version = trip_store.load_trip(second["id"])["version"]
     with pytest.raises(trip_store.TripStoreError) as image_denied:
         trip_store.save_trip(_snap(second["id"], [
             _item("cc", image=b"\xff\xd8cc"),
             _item("dd", image=b"\xff\xd8dd"),
-        ], title="行程 2"))
+        ], title="行程 2", version=second_version))
     assert "3" in str(image_denied.value)
     assert len(trip_store.load_trip(second["id"])["inbox"]) == 1
     assert trip_store.count_images() == 3
@@ -453,14 +461,17 @@ def test_collection_inbox_is_not_created_on_load_and_stays_singular(use_sub, mem
     assert memory_supabase.inserts == []
     item_id = "ab" * 8
     image = b"\xff\xd8inbox-photo"
-    trip_store.save_collection_inbox(_collection_snapshot(
+    first_inbox = _collection_snapshot(
         [_item(item_id, name="太宰府天滿宮", image=image)],
         favourites=[{"id": "fav1", "name": "太宰府天滿宮"}],
-    ))
-    trip_store.save_collection_inbox(_collection_snapshot(
+    )
+    trip_store.save_collection_inbox(first_inbox)
+    second_inbox = _collection_snapshot(
         [_item(item_id, name="太宰府天滿宮", image=image)],
         favourites=[{"id": "fav1", "name": "太宰府天滿宮"}],
-    ))
+    )
+    second_inbox["version"] = first_inbox["version"]
+    trip_store.save_collection_inbox(second_inbox)
     assert len(_inbox_rows(memory_supabase)) == 1
     assert len(memory_supabase.inserts) == 1
     assert trip_store.list_trips() == []
@@ -497,7 +508,12 @@ def test_collection_inbox_is_outside_the_trip_cap_and_inside_the_image_cap(use_s
     assert "1" in str(denied.value)
     assert len(trip_store.list_trips()) == 1
     with pytest.raises(trip_store.TripStoreError) as image_denied:
-        trip_store.save_trip(_snap(created["id"], [_item("cc", image=b"\xff\xd8cc")], title="行程 1"))
+        trip_store.save_trip(_snap(
+            created["id"],
+            [_item("cc", image=b"\xff\xd8cc")],
+            title="行程 1",
+            version=created["version"],
+        ))
     assert "2" in str(image_denied.value)
     assert trip_store.count_images() == 2
     assert len(_inbox_rows(memory_supabase)) == 1
@@ -576,10 +592,10 @@ def test_adopt_rolls_back_new_trip_objects_when_row_update_fails(use_sub, memory
     inbox_id = trip_store.collection_inbox_id()
     real = trip_store._update_owned
 
-    def flaky(owner, trip_id, payload):
+    def flaky(owner, trip_id, payload, expected_version):
         if payload.get("kind") != "inbox":
             raise trip_store.TripStoreError(trip_store.MSG_CONTENT)
-        return real(owner, trip_id, payload)
+        return real(owner, trip_id, payload, expected_version)
 
     monkeypatch.setattr(trip_store, "_update_owned", flaky)
     with pytest.raises(trip_store.TripStoreError) as failed:
@@ -769,6 +785,7 @@ def test_rows_without_kind_remain_normal_trips(use_sub, memory_supabase):
         "payload": {"title": "舊行程", "inbox": [], "favourites": []},
         "created_at": "t0",
         "updated_at": "t0",
+        "version": 1,
     })
     summaries = trip_store.list_trips()
     assert created["id"] in [row["id"] for row in summaries]
@@ -794,3 +811,195 @@ def test_store_and_app_do_not_embed_a_service_role_or_local_share_store():
     assert "eyJ" not in app
     assert "先複製邀請連結" not in app
     assert "邀請朋友一起收集" not in app
+
+
+def test_second_session_save_is_rejected_and_keeps_the_first(use_sub, memory_supabase):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    trip_id = created["id"]
+    trip_store.save_trip(_snap(
+        trip_id,
+        [_item("aa", image=b"\xff\xd8aa")],
+        version=created["version"],
+        title="原本",
+    ))
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded["version"] == 2
+    trip_store.save_trip(_snap(
+        trip_id,
+        [_item("aa", image=b"\xff\xd8aa"), _item("bb", image=b"\xff\xd8bb")],
+        version=loaded["version"],
+        title="先寫入",
+    ))
+    uploads_after_winner = len(memory_supabase.uploads)
+    with pytest.raises(trip_store.TripConflictError) as conflict:
+        trip_store.save_trip(_snap(
+            trip_id,
+            [_item("aa", image=b"\xff\xd8aa"), _item("cc", image=b"\xff\xd8cc")],
+            version=loaded["version"],
+            title="後寫入",
+        ))
+    assert conflict.value.args[0] == trip_store.MSG_CONFLICT
+    assert "user-a" not in str(conflict.value)
+    kept = trip_store.load_trip(trip_id)
+    assert kept["title"] == "先寫入"
+    assert kept["version"] == 3
+    assert [item["id"] for item in kept["inbox"]] == ["aa", "bb"]
+    assert [item["image"] for item in kept["inbox"]] == [b"\xff\xd8aa", b"\xff\xd8bb"]
+    assert memory_supabase.objects[f"user-a/{trip_id}/aa.jpg"] == b"\xff\xd8aa"
+    assert memory_supabase.objects[f"user-a/{trip_id}/bb.jpg"] == b"\xff\xd8bb"
+    assert f"user-a/{trip_id}/cc.jpg" not in memory_supabase.objects
+    assert len(memory_supabase.uploads) == uploads_after_winner
+    assert memory_supabase.update_filters[-1]["version"] == 2
+
+
+def test_unchanged_image_is_not_reuploaded_and_explicit_delete_follows_success(use_sub, memory_supabase):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    trip_id = created["id"]
+    trip_store.save_trip(_snap(
+        trip_id,
+        [_item("aa", image=b"\xff\xd8aa"), _item("bb", image=b"\xff\xd8bb")],
+        version=created["version"],
+    ))
+    uploads_after_create = len(memory_supabase.uploads)
+    loaded = trip_store.load_trip(trip_id)
+    loaded["title"] = "改標題"
+    loaded["inbox"] = [item for item in loaded["inbox"] if item["id"] == "aa"]
+    trip_store.save_trip(loaded)
+    assert len(memory_supabase.uploads) == uploads_after_create
+    assert memory_supabase.objects[f"user-a/{trip_id}/aa.jpg"] == b"\xff\xd8aa"
+    assert f"user-a/{trip_id}/bb.jpg" not in memory_supabase.objects
+    renamed = trip_store.load_trip(trip_id)
+    assert renamed["title"] == "改標題"
+    assert [item["id"] for item in renamed["inbox"]] == ["aa"]
+
+    replaced = trip_store.load_trip(trip_id)
+    replaced["inbox"][0]["image"] = b"\xff\xd8zz"
+    trip_store.save_trip(replaced)
+    assert memory_supabase.uploads[-1][0] == f"user-a/{trip_id}/aa.jpg"
+    assert memory_supabase.uploads[-1][1] == b"\xff\xd8zz"
+    assert memory_supabase.objects[f"user-a/{trip_id}/aa.jpg"] == b"\xff\xd8zz"
+    assert len(memory_supabase.uploads) == uploads_after_create + 1
+
+
+def test_missing_image_bytes_do_not_delete_a_stored_image(use_sub, memory_supabase):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    trip_id = created["id"]
+    trip_store.save_trip(_snap(
+        trip_id,
+        [_item("aa", image=b"\xff\xd8aa")],
+        version=created["version"],
+    ))
+    loaded = trip_store.load_trip(trip_id)
+    loaded["inbox"][0]["image"] = b""
+    loaded["title"] = "仍然有圖"
+    trip_store.save_trip(loaded)
+    assert memory_supabase.objects[f"user-a/{trip_id}/aa.jpg"] == b"\xff\xd8aa"
+    kept = trip_store.load_trip(trip_id)
+    assert kept["inbox"][0]["image"] == b"\xff\xd8aa"
+    assert kept["title"] == "仍然有圖"
+
+
+def test_failed_upload_update_and_conflict_leave_no_orphan(use_sub, memory_supabase, monkeypatch):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    trip_id = created["id"]
+    trip_store.save_trip(_snap(
+        trip_id,
+        [_item("aa", image=b"\xff\xd8aa")],
+        version=created["version"],
+    ))
+    base = trip_store.load_trip(trip_id)
+    aa_path = f"user-a/{trip_id}/aa.jpg"
+    bb_path = f"user-a/{trip_id}/bb.jpg"
+    real_upload = trip_store._upload_owned
+    real_update = trip_store._update_owned
+
+    def fail_new(owner, path, blob):
+        if path == bb_path:
+            raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+        return real_upload(owner, path, blob)
+
+    monkeypatch.setattr(trip_store, "_upload_owned", fail_new)
+    attempt = dict(base)
+    attempt["inbox"] = list(base["inbox"]) + [_item("bb", image=b"\xff\xd8bb")]
+    with pytest.raises(trip_store.TripStoreError) as upload_failed:
+        trip_store.save_trip(attempt)
+    assert upload_failed.value.args[0] == trip_store.MSG_UNAVAILABLE
+    assert bb_path not in memory_supabase.objects
+    assert memory_supabase.objects[aa_path] == b"\xff\xd8aa"
+    assert trip_store.load_trip(trip_id)["version"] == base["version"]
+
+    monkeypatch.setattr(trip_store, "_upload_owned", real_upload)
+
+    def fail_update(owner, row_id, payload, expected_version):
+        raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+
+    monkeypatch.setattr(trip_store, "_update_owned", fail_update)
+    dropping = dict(base)
+    dropping["inbox"] = []
+    dropping["version"] = base["version"]
+    with pytest.raises(trip_store.TripStoreError) as update_failed:
+        trip_store.save_trip(dropping)
+    assert update_failed.value.args[0] == trip_store.MSG_UNAVAILABLE
+    assert not isinstance(update_failed.value, trip_store.TripConflictError)
+    assert memory_supabase.objects[aa_path] == b"\xff\xd8aa"
+    assert trip_store.load_trip(trip_id)["version"] == base["version"]
+    assert [item["id"] for item in trip_store.load_trip(trip_id)["inbox"]] == ["aa"]
+
+    def lose_the_race(owner, row_id, payload, expected_version):
+        for row in memory_supabase.rows:
+            if row["id"] == row_id:
+                row["version"] = expected_version + 5
+        return real_update(owner, row_id, payload, expected_version)
+
+    monkeypatch.setattr(trip_store, "_update_owned", lose_the_race)
+    racing = dict(base)
+    racing["inbox"] = list(base["inbox"]) + [_item("bb", image=b"\xff\xd8bb")]
+    racing["version"] = base["version"]
+    with pytest.raises(trip_store.TripConflictError) as raced:
+        trip_store.save_trip(racing)
+    assert raced.value.args[0] == trip_store.MSG_CONFLICT
+    assert bb_path not in memory_supabase.objects
+    assert memory_supabase.objects[aa_path] == b"\xff\xd8aa"
+    kept = trip_store.load_trip(trip_id)
+    assert [item["id"] for item in kept["inbox"]] == ["aa"]
+    assert kept["inbox"][0]["image"] == b"\xff\xd8aa"
+
+
+def test_missing_version_refuses_without_writing(use_sub, memory_supabase):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    memory_supabase.rows[0].pop("version")
+    before = dict(memory_supabase.rows[0]["payload"])
+    updates = len(memory_supabase.update_filters)
+    with pytest.raises(trip_store.TripStoreError) as denied:
+        trip_store.save_trip(_snap(created["id"], title="被改寫", version=1))
+    assert denied.value.args[0] == trip_store.MSG_UNAVAILABLE
+    assert not isinstance(denied.value, trip_store.TripConflictError)
+    assert memory_supabase.rows[0]["payload"] == before
+    assert len(memory_supabase.update_filters) == updates
+    with pytest.raises(trip_store.TripStoreError) as listed:
+        trip_store.list_trips()
+    assert listed.value.args[0] == trip_store.MSG_UNAVAILABLE
+
+
+def test_explicit_image_clear_removes_only_after_update(use_sub, memory_supabase):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    trip_id = created["id"]
+    trip_store.save_trip(_snap(
+        trip_id,
+        [_item("aa", image=b"\xff\xd8aa")],
+        version=created["version"],
+    ))
+    loaded = trip_store.load_trip(trip_id)
+    loaded["inbox"][0]["image"] = b""
+    loaded["inbox"][0]["has_image"] = False
+    trip_store.save_trip(loaded)
+    assert f"user-a/{trip_id}/aa.jpg" not in memory_supabase.objects
+    cleared = trip_store.load_trip(trip_id)
+    assert cleared["inbox"][0]["image"] == b""
+    assert cleared["inbox"][0]["has_image"] is False

@@ -1037,7 +1037,96 @@ def _clear_storage_error(*, force: bool = False) -> None:
     st.session_state._storage_error_set = False
 
 
+_CONFLICT_RELOAD = "重新載入已儲存的行程"
+
+
+def _version_ready(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _remote_moved(remote_stamp: object, remote_version: object) -> bool:
+    seen_version = st.session_state.get("seen_version")
+    if _version_ready(seen_version):
+        if _version_ready(remote_version):
+            return seen_version != remote_version
+        return True
+    seen_stamp = str(st.session_state.get("seen_stamp") or "")
+    if seen_stamp and seen_stamp != str(remote_stamp or ""):
+        return True
+    return False
+
+
+def _unsaved_local_changes() -> bool:
+    last = str(st.session_state.get("last_digest") or "")
+    if not last:
+        return _session_has_trip_content()
+    try:
+        return trip_store.digest(_snapshot()) != last
+    except trip_store.TripStoreError:
+        return True
+
+
+def _hold_remote_conflict() -> None:
+    st.session_state.trip_conflict = True
+    _remember_storage_error(trip_store.MSG_CONFLICT)
+
+
+def _note_seen(loaded: dict, remote_stamp: object) -> None:
+    st.session_state.seen_stamp = loaded.get("updated_at") or remote_stamp or ""
+    if _version_ready(loaded.get("version")):
+        st.session_state.seen_version = loaded["version"]
+
+
+def _sync_remote_content(loaded: dict, remote_stamp: object, *, same: bool, force: bool, title: bool) -> None:
+    """遠端版本行前，而且本地有未儲存更改，就唔好自動覆蓋。"""
+    moved = _remote_moved(remote_stamp, loaded.get("version"))
+    if not force and same and not moved:
+        if not _version_ready(st.session_state.get("seen_version")):
+            _note_seen(loaded, remote_stamp)
+        if _unsaved_local_changes():
+            return
+        if str(st.session_state.get("seen_stamp") or "") == str(remote_stamp or ""):
+            return
+    elif not force and same and moved and _unsaved_local_changes():
+        _hold_remote_conflict()
+        return
+    if (
+        force
+        or not same
+        or moved
+        or _remote_has_trip_content(loaded)
+        or not _session_has_trip_content()
+    ):
+        if title:
+            st.session_state.trip_title = str(loaded.get("title") or "").strip() or "行程"
+        _apply_loaded_trip(loaded)
+        st.session_state.last_digest = trip_store.digest(_snapshot())
+        st.session_state.trip_conflict = False
+        _note_seen(loaded, remote_stamp)
+        return
+    st.session_state.last_digest = ""
+    st.session_state.trip_conflict = False
+    _note_seen(loaded, remote_stamp)
+
+
+def _render_trip_conflict() -> None:
+    if not st.session_state.get("trip_conflict"):
+        return
+    if st.session_state.get("_conflict_ui_rendered"):
+        return
+    st.session_state._conflict_ui_rendered = True
+    st.error(trip_store.MSG_CONFLICT)
+    st.caption("未撳「重新載入已儲存的行程」之前，你未儲存嘅更改會留喺呢度。")
+    if st.button(_CONFLICT_RELOAD, key="reload_conflict_trip"):
+        st.session_state.force_trip_reload = True
+        st.session_state.trip_conflict = False
+        st.rerun()
+
+
 def _render_storage_error() -> None:
+    _render_trip_conflict()
+    if st.session_state.get("trip_conflict"):
+        return
     message = str(st.session_state.get("trip_storage_error") or "").strip()
     if message:
         st.error(message)
@@ -1081,6 +1170,7 @@ def _load_shared_trip() -> None:
     st.session_state._create_done_this_run = False
     st.session_state._inbox_save_inflight = False
     st.session_state._storage_error_set = False
+    st.session_state._conflict_ui_rendered = False
     try:
         trip_store.release_adopted_collection_inbox()
     except trip_store.TripStoreError as err:
@@ -1095,7 +1185,7 @@ def _load_shared_trip() -> None:
         st.session_state.trip_catalog = []
         st.session_state.trip_id = ""
         st.session_state.loaded_trip_id = ""
-        st.session_state.pop("force_trip_reload", None)
+        force = bool(st.session_state.pop("force_trip_reload", False))
         try:
             loaded = trip_store.load_collection_inbox()
         except trip_store.TripStoreError as err:
@@ -1104,22 +1194,26 @@ def _load_shared_trip() -> None:
             st.session_state.collection_inbox_id = ""
             st.session_state.loaded_inbox_id = ""
             st.session_state.seen_stamp = ""
+            st.session_state.seen_version = None
             st.session_state.last_digest = ""
+            st.session_state.trip_conflict = False
             return
         inbox_id = str(loaded.get("trip_id") or "")
         st.session_state.collection_inbox_id = inbox_id
         remote_stamp = loaded.get("updated_at") or ""
+        same = st.session_state.get("loaded_inbox_id") == inbox_id
         if (
-            st.session_state.get("loaded_inbox_id") == inbox_id
-            and st.session_state.get("seen_stamp") == remote_stamp
+            not force
+            and same
+            and str(st.session_state.get("seen_stamp") or "") == str(remote_stamp)
+            and not _remote_moved(remote_stamp, loaded.get("version"))
         ):
+            if not _version_ready(st.session_state.get("seen_version")):
+                _note_seen(loaded, remote_stamp)
+            st.session_state.loaded_inbox_id = inbox_id
+            st.session_state.trip_conflict = False
             return
-        if _remote_has_trip_content(loaded) or not _session_has_trip_content():
-            _apply_loaded_trip(loaded)
-            st.session_state.last_digest = trip_store.digest(_snapshot())
-        else:
-            st.session_state.last_digest = ""
-        st.session_state.seen_stamp = remote_stamp
+        _sync_remote_content(loaded, remote_stamp, same=same, force=force, title=False)
         st.session_state.loaded_inbox_id = inbox_id
         return
     st.session_state.collection_inbox_id = ""
@@ -1137,24 +1231,34 @@ def _load_shared_trip() -> None:
     else:
         current = requested
     st.session_state.trip_id = current
-    remote_stamp = next(row["updated_at"] for row in trips if row["id"] == current)
+    remote = next(row for row in trips if row["id"] == current)
+    remote_stamp = remote.get("updated_at") or ""
+    same = st.session_state.get("loaded_trip_id") == current
     if (
         not force
-        and st.session_state.get("loaded_trip_id") == current
-        and st.session_state.get("seen_stamp") == remote_stamp
+        and same
+        and str(st.session_state.get("seen_stamp") or "") == str(remote_stamp)
+        and not _remote_moved(remote_stamp, remote.get("version"))
     ):
+        if not _version_ready(st.session_state.get("seen_version")):
+            if _version_ready(remote.get("version")):
+                st.session_state.seen_version = remote["version"]
+        st.session_state.trip_conflict = False
+        return
+    if (
+        not force
+        and same
+        and _remote_moved(remote_stamp, remote.get("version"))
+        and _unsaved_local_changes()
+    ):
+        # 已知版本唔同，唔好再下載遠端圖片，避免下載失敗擋住衝突提示。
+        _hold_remote_conflict()
         return
     try:
         loaded = trip_store.load_trip(current)
     except trip_store.TripStoreError as err:
         _storage_stop(str(err))
-    st.session_state.trip_title = loaded.get("title") or "行程"
-    if force or _remote_has_trip_content(loaded) or not _session_has_trip_content():
-        _apply_loaded_trip(loaded)
-        st.session_state.last_digest = trip_store.digest(_snapshot())
-    else:
-        st.session_state.last_digest = ""
-    st.session_state.seen_stamp = loaded.get("updated_at") or remote_stamp
+    _sync_remote_content(loaded, remote_stamp, same=same, force=force, title=True)
     st.session_state.loaded_trip_id = current
 
 
@@ -1170,7 +1274,7 @@ def _snapshot() -> dict:
     name = (st.session_state.get("display_name") or "旅人").strip() or "旅人"
     members = sorted({*(st.session_state.get("members") or []), name})
     st.session_state.members = members
-    return {
+    snapshot = {
         "trip_id": st.session_state.get("trip_id"),
         "title": st.session_state.get("trip_title") or "行程",
         "inbox": inbox,
@@ -1186,10 +1290,23 @@ def _snapshot() -> dict:
         "day_count": int(st.session_state.get("day_count") or 3),
         **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
     }
+    if _version_ready(st.session_state.get("seen_version")):
+        snapshot["version"] = st.session_state.seen_version
+    return snapshot
+
+
+def _remember_saved_version(snapshot: dict, stamp: str) -> None:
+    st.session_state.seen_stamp = stamp
+    if _version_ready(snapshot.get("version")):
+        st.session_state.seen_version = snapshot["version"]
+    st.session_state.trip_conflict = False
 
 
 def _persist_collection_inbox() -> bool:
     """未有行程時，有內容先寫入收藏匣。登入本身唔會開列。"""
+    if st.session_state.get("trip_conflict"):
+        _remember_storage_error(trip_store.MSG_CONFLICT)
+        return False
     has_inbox = bool(st.session_state.get("collection_inbox_id"))
     if not _session_has_trip_content() and not has_inbox:
         return True
@@ -1202,12 +1319,16 @@ def _persist_collection_inbox() -> bool:
         if current == st.session_state.get("last_digest") and has_inbox:
             _clear_storage_error()
             return True
-        st.session_state.seen_stamp = trip_store.save_collection_inbox(snapshot)
+        stamp = trip_store.save_collection_inbox(snapshot)
+        _remember_saved_version(snapshot, stamp)
         st.session_state.collection_inbox_id = trip_store.collection_inbox_id()
         st.session_state.loaded_inbox_id = st.session_state.collection_inbox_id
         st.session_state.last_digest = current
         _clear_storage_error(force=True)
         return True
+    except trip_store.TripConflictError:
+        _hold_remote_conflict()
+        return False
     except trip_store.TripStoreError as err:
         _remember_storage_error(str(err))
         return False
@@ -1218,8 +1339,11 @@ def _persist_collection_inbox() -> bool:
 def _persist_shared_trip() -> bool:
     """有行程而且寫入成功（或內容冇變）先回傳 True。
 
-    未有行程時改寫收藏匣。寫入失敗唔當成功。
+    未有行程時改寫收藏匣。寫入失敗唔當成功。版本衝突唔會覆蓋遠端。
     """
+    if st.session_state.get("trip_conflict"):
+        _remember_storage_error(trip_store.MSG_CONFLICT)
+        return False
     trip_id = str(st.session_state.get("trip_id") or "")
     if not trip_id:
         return _persist_collection_inbox()
@@ -1233,10 +1357,14 @@ def _persist_shared_trip() -> bool:
         _clear_storage_error()
         return True
     try:
-        st.session_state.seen_stamp = trip_store.save_trip(snapshot)
+        stamp = trip_store.save_trip(snapshot)
+    except trip_store.TripConflictError:
+        _hold_remote_conflict()
+        return False
     except trip_store.TripStoreError as err:
         _remember_storage_error(str(err))
         return False
+    _remember_saved_version(snapshot, stamp)
     st.session_state.last_digest = current
     st.session_state.loaded_trip_id = trip_id
     _clear_storage_error(force=True)
@@ -1280,6 +1408,9 @@ def _create_new_trip() -> None:
         st.session_state.loaded_inbox_id = ""
         st.session_state.loaded_trip_id = adopted["id"]
         st.session_state.seen_stamp = adopted.get("updated_at") or ""
+        if _version_ready(adopted.get("version")):
+            st.session_state.seen_version = adopted["version"]
+        st.session_state.trip_conflict = False
         st.session_state.last_digest = trip_store.digest(_snapshot())
         st.session_state.force_trip_reload = True
         _clear_storage_error(force=True)
@@ -1293,6 +1424,9 @@ def _create_new_trip() -> None:
     st.session_state._skip_next_create = True
     st.session_state.trip_id = created["id"]
     st.session_state.trip_title = created.get("title") or "行程"
+    if _version_ready(created.get("version")):
+        st.session_state.seen_version = created["version"]
+    st.session_state.trip_conflict = False
     st.session_state.force_trip_reload = True
     _clear_storage_error(force=True)
     st.rerun()
@@ -1302,6 +1436,7 @@ def _render_trip_switcher() -> None:
     replay = bool(st.session_state.get("_skip_next_create"))
     if replay:
         st.session_state._skip_next_create = False
+    _render_trip_conflict()
     catalog = list(st.session_state.get("trip_catalog") or [])
     st.caption("我的行程")
     _render_inbox_cleanup_warning()

@@ -1,4 +1,7 @@
-"""測試用 Supabase 替身。只存在測試，應用程式唔會因為環境變數改用佢。"""
+"""測試用 Supabase 替身。只存在測試，應用程式唔會因為環境變數改用佢。
+
+``eq`` 條件一齊先算命中，所以 ``version`` 比較交換會喺 0 行時拒絕更新。
+"""
 from __future__ import annotations
 
 from copy import deepcopy
