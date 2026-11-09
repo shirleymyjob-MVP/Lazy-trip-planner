@@ -1700,75 +1700,80 @@ def test_existing_member_loads_own_trips_unchanged(monkeypatch, memory_supabase)
     assert not list(at.success)
 
 
-def test_unsaved_session_is_not_reported_saved_until_create(monkeypatch, memory_supabase):
+def _inbox_rows(memory_supabase):
+    return [
+        row for row in memory_supabase.rows
+        if (row.get("payload") or {}).get("kind") == "inbox"
+    ]
+
+
+def test_collection_inbox_saves_without_a_trip_and_adopt_clears_it(monkeypatch, memory_supabase):
     monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
-    image = b"\xff\xd8\xe0unsaved-photo"
-    item_id = "ab" * 16
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.session_state["screen"] = "B"
-    at.session_state["inbox"] = [{
-        "id": item_id,
-        "label": "截圖 1",
-        "image": image,
-        "remark": "想去",
-        "status": "未排程",
-        "analysis": "done",
-        "facts": "done",
-        "batch": False,
-        "places": [{
-            "name": "太宰府天滿宮",
-            "name_zh": "太宰府天滿宮",
-            "category": "attraction",
-            "fav_id": "fav1",
-        }],
-        "city": "福岡",
-        "regions": ["福岡"],
-        "region_confidence": "高",
-        "warning": "",
-        "added_by": "旅人",
-        "added_at": 10,
-    }]
-    at.session_state["favourites"] = [_fav()]
     at.run()
-    assert not at.exception
-    assert memory_supabase.inserts == []
-    assert any("收集想去的地方" in block.value for block in at.subheader)
-    assert at.file_uploader
-    assert "太宰府天滿宮" in _page(at)
-    assert _UNSAVED_NOTICE in _joined(at.info)
-    assert not list(at.success)
-    assert not _saved_messages(_feedback(at))
-    _button(at, "查看我的收藏 →").click().run()
-    assert not at.exception
-    assert at.session_state["screen"] == "C"
-    assert any("我的收藏" in block.value for block in at.subheader)
-    assert "太宰府天滿宮" in _page(at)
-    assert _UNSAVED_NOTICE in _joined(at.info)
-    assert not list(at.success)
-    assert memory_supabase.rows == []
-    _button(at, "新增行程").click().run()
-    assert not at.exception
-    assert len(memory_supabase.rows) == 1
-    assert len(memory_supabase.inserts) == 1
-    trip_id = at.session_state["trip_id"]
-    loaded = trip_store.load_trip(trip_id)
-    assert loaded["inbox"][0]["image"] == image
-    assert loaded["inbox"][0]["places"][0]["name_zh"] == "太宰府天滿宮"
-    names = [fav.get("name") for fav in loaded["favourites"]]
-    assert "太宰府天滿宮" in names
-    assert memory_supabase.objects[f"test-member-sub/{trip_id}/{item_id}.jpg"] == image
-    assert _UNSAVED_NOTICE not in _joined(at.info)
-    assert not list(at.success)
-    assert not _saved_messages(_feedback(at))
     for _ in range(2):
         at.run()
-    assert len(memory_supabase.inserts) == 1
-    assert at.session_state["inbox"][0]["image"] == image
+    assert not at.exception
+    assert memory_supabase.inserts == []
+    assert trip_store.list_trips() == []
+    with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("no analyze")):
+        at.file_uploader[0].upload("place.png", _png("red"), "image/png").run()
+    assert not at.exception
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert trip_store.list_trips() == []
+    assert "你仲未有行程" in _page(at)
+    assert not any("行程 1" in button.label for button in at.button)
+    assert _UNSAVED_NOTICE not in _feedback(at)
+    assert not list(at.success)
+    assert not _saved_messages(_feedback(at))
+    image = at.session_state["inbox"][0]["image"]
+    item_id = at.session_state["inbox"][0]["id"]
+    inbox_id = _inbox_rows(memory_supabase)[0]["id"]
+    assert memory_supabase.objects[f"test-member-sub/{inbox_id}/{item_id}.jpg"] == image
+    for _ in range(2):
+        at.run()
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert len(trip_store.list_trips()) == 0
+
+    fresh = AppTest.from_file(APP, default_timeout=30)
+    fresh.secrets["GEMINI_API_KEY"] = "fake"
+    fresh.session_state["screen"] = "B"
+    fresh.run()
+    assert not fresh.exception
+    assert fresh.session_state["inbox"][0]["image"] == image
+    assert fresh.session_state.get("trip_id") in ("", None)
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert _UNSAVED_NOTICE not in _feedback(fresh)
+    _button(fresh, "查看我的收藏 →").click().run()
+    assert fresh.session_state["screen"] == "C"
+    _button(fresh, "新增行程").click().run()
+    assert not fresh.exception
+    assert _inbox_rows(memory_supabase) == []
+    assert len(trip_store.list_trips()) == 1
+    trip_id = fresh.session_state["trip_id"]
+    assert trip_id != inbox_id
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded.get("kind") != "inbox"
+    assert loaded["inbox"][0]["image"] == image
+    assert memory_supabase.objects[f"test-member-sub/{trip_id}/{item_id}.jpg"] == image
+    assert f"test-member-sub/{inbox_id}/{item_id}.jpg" not in memory_supabase.objects
+    assert not list(fresh.success)
+    assert not _saved_messages(_feedback(fresh))
+    for _ in range(2):
+        fresh.run()
+    assert len(trip_store.list_trips()) == 1
+    assert _inbox_rows(memory_supabase) == []
 
 
-def test_save_failure_is_an_error_not_success(monkeypatch, memory_supabase):
+def test_inbox_save_failure_is_an_error_not_success(monkeypatch, memory_supabase):
     monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+
+    def boom(_snapshot):
+        raise trip_store.TripStoreError("行程內容未能儲存，請稍後再試。")
+
+    monkeypatch.setattr(trip_store, "save_collection_inbox", boom)
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.session_state["screen"] = "C"
@@ -1785,27 +1790,18 @@ def test_save_failure_is_an_error_not_success(monkeypatch, memory_supabase):
         "added_by": "旅人",
     }]
     at.run()
-    assert _UNSAVED_NOTICE in _joined(at.info)
-    assert not list(at.success)
-
-    def boom(_snapshot):
-        raise trip_store.TripStoreError("行程內容未能儲存，請稍後再試。")
-
-    monkeypatch.setattr(trip_store, "save_trip", boom)
-    _button(at, "新增行程").click().run()
     assert not at.exception
     text = _feedback(at)
     assert "行程內容未能儲存，請稍後再試。" in _joined(at.error)
+    assert _UNSAVED_NOTICE not in text
     assert not list(at.success)
     assert not _saved_messages(text)
     assert at.session_state["favourites"][0]["name"] == "秘密拉麵"
     assert at.session_state["inbox"][0]["image"] == b"\xff\xd8pending-photo"
-    assert len(memory_supabase.rows) == 1
-    payload = memory_supabase.rows[0]["payload"]
-    assert payload.get("favourites") in ([], None)
-    assert payload.get("inbox") in ([], None)
+    assert memory_supabase.rows == []
     assert memory_supabase.objects == {}
-    assert memory_supabase.uploads == []
+    assert "你仲未有行程" in _page(at)
+    assert any("我的收藏" in block.value for block in at.subheader)
 
 
 def test_cross_user_load_does_not_create_or_leak(monkeypatch, memory_supabase):

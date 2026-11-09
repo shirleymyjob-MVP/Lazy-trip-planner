@@ -435,6 +435,264 @@ def test_missing_settings_invalid_url_and_logged_out_do_not_connect(use_sub, mon
     assert list(tmp_path.iterdir()) == []
 
 
+def _inbox_rows(memory_supabase):
+    return [row for row in memory_supabase.rows if (row.get("payload") or {}).get("kind") == "inbox"]
+
+
+def _collection_snapshot(inbox=None, **extra):
+    payload = _snap("00000000-0000-4000-8000-000000000000", inbox, **extra)
+    payload["title"] = extra.get("title", "收藏")
+    return payload
+
+
+def test_collection_inbox_is_not_created_on_load_and_stays_singular(use_sub, memory_supabase):
+    use_sub("user-a")
+    assert trip_store.load_collection_inbox() is None
+    assert trip_store.collection_inbox_id() == ""
+    assert trip_store.list_trips() == []
+    assert memory_supabase.inserts == []
+    item_id = "ab" * 8
+    image = b"\xff\xd8inbox-photo"
+    trip_store.save_collection_inbox(_collection_snapshot(
+        [_item(item_id, name="太宰府天滿宮", image=image)],
+        favourites=[{"id": "fav1", "name": "太宰府天滿宮"}],
+    ))
+    trip_store.save_collection_inbox(_collection_snapshot(
+        [_item(item_id, name="太宰府天滿宮", image=image)],
+        favourites=[{"id": "fav1", "name": "太宰府天滿宮"}],
+    ))
+    assert len(_inbox_rows(memory_supabase)) == 1
+    assert len(memory_supabase.inserts) == 1
+    assert trip_store.list_trips() == []
+    loaded = trip_store.load_collection_inbox()
+    assert loaded["inbox"][0]["image"] == image
+    assert loaded["favourites"][0]["name"] == "太宰府天滿宮"
+    inbox_id = loaded["trip_id"]
+    assert memory_supabase.objects[f"user-a/{inbox_id}/{item_id}.jpg"] == image
+    with pytest.raises(trip_store.TripStoreError) as denied:
+        trip_store.load_trip(inbox_id)
+    assert denied.value.args[0] == trip_store.MSG_DENIED
+    created = trip_store.create_trip()
+    assert created["title"] == "行程 1"
+    assert "kind" not in memory_supabase.rows[-1]["payload"]
+    assert len(trip_store.list_trips()) == 1
+    assert len(_inbox_rows(memory_supabase)) == 1
+
+
+def test_collection_inbox_is_outside_the_trip_cap_and_inside_the_image_cap(use_sub, memory_supabase, monkeypatch):
+    monkeypatch.setattr(trip_store, "_lookup_secret", lambda _path: None)
+    monkeypatch.setenv("MAX_TRIPS_PER_USER", "1")
+    monkeypatch.setenv("MAX_IMAGES_PER_USER", "2")
+    use_sub("user-a")
+    trip_store.save_collection_inbox(_collection_snapshot([
+        _item("aa", image=b"\xff\xd8aa"),
+        _item("bb", image=b"\xff\xd8bb"),
+    ]))
+    assert trip_store.count_images() == 2
+    assert trip_store.list_trips() == []
+    created = trip_store.create_trip()
+    assert created["title"] == "行程 1"
+    with pytest.raises(trip_store.TripStoreError) as denied:
+        trip_store.create_trip()
+    assert "1" in str(denied.value)
+    assert len(trip_store.list_trips()) == 1
+    with pytest.raises(trip_store.TripStoreError) as image_denied:
+        trip_store.save_trip(_snap(created["id"], [_item("cc", image=b"\xff\xd8cc")], title="行程 1"))
+    assert "2" in str(image_denied.value)
+    assert trip_store.count_images() == 2
+    assert len(_inbox_rows(memory_supabase)) == 1
+
+
+def test_adopt_collection_inbox_copies_then_clears(use_sub, memory_supabase):
+    use_sub("user-a")
+    item_id = "cd" * 8
+    image = b"\xff\xd8adopt-me"
+    snapshot = _collection_snapshot(
+        [_item(item_id, name="清水寺", image=image)],
+        favourites=[{"id": "favk", "name": "清水寺"}],
+    )
+    trip_store.save_collection_inbox(snapshot)
+    inbox_id = trip_store.collection_inbox_id()
+    adopted = trip_store.adopt_collection_inbox(snapshot)
+    assert adopted["title"] == "行程 1"
+    assert adopted["id"] != inbox_id
+    assert _inbox_rows(memory_supabase) == []
+    assert trip_store.load_collection_inbox() is None
+    loaded = trip_store.load_trip(adopted["id"])
+    assert loaded.get("kind") != "inbox"
+    assert loaded["inbox"][0]["image"] == image
+    assert loaded["favourites"][0]["name"] == "清水寺"
+    assert memory_supabase.objects == {f"user-a/{adopted['id']}/{item_id}.jpg": image}
+    assert len(trip_store.list_trips()) == 1
+
+
+def test_adopt_rolls_back_when_image_upload_fails_midway(use_sub, memory_supabase, monkeypatch):
+    use_sub("user-a")
+    first = _item("aa", name="一", image=b"\xff\xd8one")
+    second = _item("bb", name="二", image=b"\xff\xd8two")
+    snapshot = _collection_snapshot([first, second], favourites=[{"id": "f", "name": "一"}])
+    trip_store.save_collection_inbox(snapshot)
+    inbox_id = trip_store.collection_inbox_id()
+    inbox_paths = {
+        f"user-a/{inbox_id}/aa.jpg": b"\xff\xd8one",
+        f"user-a/{inbox_id}/bb.jpg": b"\xff\xd8two",
+    }
+    real = trip_store._upload_owned
+    calls = {"n": 0}
+
+    def flaky(owner, path, blob):
+        if inbox_id in path:
+            return real(owner, path, blob)
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+        return real(owner, path, blob)
+
+    monkeypatch.setattr(trip_store, "_upload_owned", flaky)
+    with pytest.raises(trip_store.TripStoreError) as failed:
+        trip_store.adopt_collection_inbox(snapshot)
+    assert failed.value.args[0] == trip_store.MSG_UNAVAILABLE
+    assert memory_supabase.objects == inbox_paths
+    assert [row["id"] for row in memory_supabase.rows] == [inbox_id]
+    assert trip_store.load_collection_inbox()["inbox"][0]["image"] == b"\xff\xd8one"
+    monkeypatch.setattr(trip_store, "_upload_owned", real)
+    adopted = trip_store.adopt_collection_inbox(snapshot)
+    assert len(trip_store.list_trips()) == 1
+    loaded = trip_store.load_trip(adopted["id"])
+    assert [item["id"] for item in loaded["inbox"]] == ["aa", "bb"]
+    assert [item["image"] for item in loaded["inbox"]] == [b"\xff\xd8one", b"\xff\xd8two"]
+    assert _inbox_rows(memory_supabase) == []
+    assert set(memory_supabase.objects) == {
+        f"user-a/{adopted['id']}/aa.jpg",
+        f"user-a/{adopted['id']}/bb.jpg",
+    }
+
+
+def test_adopt_rolls_back_new_trip_objects_when_row_update_fails(use_sub, memory_supabase, monkeypatch):
+    use_sub("user-a")
+    image = b"\xff\xd8update-fail"
+    snapshot = _collection_snapshot([_item("aa", image=image)])
+    trip_store.save_collection_inbox(snapshot)
+    inbox_id = trip_store.collection_inbox_id()
+    real = trip_store._update_owned
+
+    def flaky(owner, trip_id, payload):
+        if payload.get("kind") != "inbox":
+            raise trip_store.TripStoreError(trip_store.MSG_CONTENT)
+        return real(owner, trip_id, payload)
+
+    monkeypatch.setattr(trip_store, "_update_owned", flaky)
+    with pytest.raises(trip_store.TripStoreError) as failed:
+        trip_store.adopt_collection_inbox(snapshot)
+    assert failed.value.args[0] == trip_store.MSG_CONTENT
+    assert [row["id"] for row in memory_supabase.rows] == [inbox_id]
+    assert memory_supabase.objects == {f"user-a/{inbox_id}/aa.jpg": image}
+    monkeypatch.setattr(trip_store, "_update_owned", real)
+    adopted = trip_store.adopt_collection_inbox(snapshot)
+    assert len(memory_supabase.rows) == 1
+    assert memory_supabase.rows[0]["id"] == adopted["id"]
+    assert memory_supabase.objects == {f"user-a/{adopted['id']}/aa.jpg": image}
+
+
+def test_cleanup_failure_keeps_the_inbox_and_retry_does_not_duplicate(use_sub, memory_supabase, monkeypatch):
+    use_sub("user-a")
+    image = b"\xff\xd8keep-inbox"
+    snapshot = _collection_snapshot(
+        [_item("aa", name="嚴島", image=image)],
+        favourites=[{"id": "fav", "name": "嚴島"}],
+    )
+    trip_store.save_collection_inbox(snapshot)
+    inbox_id = trip_store.collection_inbox_id()
+    real_remove = trip_store._remove_owned
+
+    def flaky(owner, paths):
+        if any(inbox_id in path for path in paths):
+            raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+        return real_remove(owner, paths)
+
+    monkeypatch.setattr(trip_store, "_remove_owned", flaky)
+    with pytest.raises(trip_store.TripStoreError) as failed:
+        trip_store.adopt_collection_inbox(snapshot)
+    assert failed.value.args[0] == trip_store.MSG_INBOX_KEEP
+    assert memory_supabase.objects[f"user-a/{inbox_id}/aa.jpg"] == image
+    inbox = trip_store.load_collection_inbox()
+    assert inbox["inbox"][0]["image"] == image
+    assert inbox["favourites"][0]["name"] == "嚴島"
+    trips = trip_store.list_trips()
+    assert len(trips) == 1
+    trip_id = trips[0]["id"]
+    assert memory_supabase.objects[f"user-a/{trip_id}/aa.jpg"] == image
+    with pytest.raises(trip_store.TripStoreError):
+        trip_store.adopt_collection_inbox(snapshot)
+    assert len(trip_store.list_trips()) == 1
+    assert trip_store.load_collection_inbox()["inbox"][0]["image"] == image
+    monkeypatch.setattr(trip_store, "_remove_owned", real_remove)
+    again = trip_store.adopt_collection_inbox(snapshot)
+    assert again["id"] == trip_id
+    assert trip_store.load_collection_inbox() is None
+    assert len(trip_store.list_trips()) == 1
+    loaded = trip_store.load_trip(trip_id)
+    assert [item["id"] for item in loaded["inbox"]] == ["aa"]
+    assert loaded["inbox"][0]["image"] == image
+    assert memory_supabase.objects == {f"user-a/{trip_id}/aa.jpg": image}
+
+
+def test_other_member_cannot_read_or_change_collection_inbox(use_sub, memory_supabase):
+    use_sub("user-a")
+    image = b"\xff\xd8secret-inbox"
+    trip_store.save_collection_inbox(_collection_snapshot(
+        [_item("aa", name="秘密拉麵", image=image)],
+        favourites=[{"id": "secret", "name": "秘密拉麵"}],
+    ))
+    inbox_id = trip_store.collection_inbox_id()
+    path = f"user-a/{inbox_id}/aa.jpg"
+    use_sub("user-b")
+    assert trip_store.load_collection_inbox() is None
+    assert trip_store.collection_inbox_id() == ""
+    assert trip_store.list_trips() == []
+    with pytest.raises(trip_store.TripStoreError) as denied:
+        trip_store.load_trip(inbox_id)
+    assert denied.value.args[0] == trip_store.MSG_DENIED
+    assert "秘密" not in str(denied.value)
+    with pytest.raises(trip_store.TripStoreError):
+        trip_store.delete_trip(inbox_id)
+    with pytest.raises(trip_store.TripStoreError):
+        trip_store.delete_image_path(path)
+    with pytest.raises(trip_store.TripStoreError):
+        trip_store.save_trip(_snap(inbox_id, [_item("aa", name="被改寫", image=b"\xff\xd8hijack")]))
+    trip_store.save_collection_inbox(_collection_snapshot([_item("bb", name="乙的店", image=b"\xff\xd8b-only")]))
+    assert trip_store.collection_inbox_id() != inbox_id
+    assert memory_supabase.objects[path] == image
+    use_sub("user-a")
+    loaded = trip_store.load_collection_inbox()
+    assert loaded["inbox"][0]["image"] == image
+    assert loaded["favourites"][0]["name"] == "秘密拉麵"
+    assert loaded["trip_id"] == inbox_id
+
+
+def test_rows_without_kind_remain_normal_trips(use_sub, memory_supabase):
+    use_sub("user-a")
+    created = trip_store.create_trip()
+    assert "kind" not in memory_supabase.rows[0]["payload"]
+    memory_supabase.rows.append({
+        "id": "33333333-3333-4333-8333-333333333333",
+        "owner_sub": "user-a",
+        "payload": {"title": "舊行程", "inbox": [], "favourites": []},
+        "created_at": "t0",
+        "updated_at": "t0",
+    })
+    summaries = trip_store.list_trips()
+    assert created["id"] in [row["id"] for row in summaries]
+    assert "33333333-3333-4333-8333-333333333333" in [row["id"] for row in summaries]
+    assert all(row["title"] != "收藏" for row in summaries)
+    before = dict(memory_supabase.rows[0]["payload"])
+    updated = memory_supabase.rows[0]["updated_at"]
+    trip_store.load_collection_inbox()
+    trip_store.release_adopted_collection_inbox()
+    assert memory_supabase.rows[0]["payload"] == before
+    assert memory_supabase.rows[0]["updated_at"] == updated
+
+
 def test_store_and_app_do_not_embed_a_service_role_or_local_share_store():
     store = Path(trip_store.__file__).read_text(encoding="utf-8")
     app = Path(trip_store.__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")

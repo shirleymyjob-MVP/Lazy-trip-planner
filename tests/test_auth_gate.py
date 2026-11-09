@@ -292,6 +292,11 @@ def _block_store(monkeypatch, tmp_path):
         "delete_image",
         "delete_image_path",
         "count_images",
+        "load_collection_inbox",
+        "save_collection_inbox",
+        "adopt_collection_inbox",
+        "release_adopted_collection_inbox",
+        "collection_inbox_id",
     ):
         monkeypatch.setattr(trip_store, name, fail)
 

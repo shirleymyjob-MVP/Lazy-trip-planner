@@ -1020,7 +1020,6 @@ def _remote_has_trip_content(loaded: dict) -> bool:
     return False
 
 
-_UNSAVED_TRIP_NOTICE = "尚未儲存。按「新增行程」之後先會保留。"
 _EMPTY_TRIPS_NOTE = "你仲未有行程"
 
 
@@ -1043,32 +1042,53 @@ def _render_storage_error() -> None:
         st.error(message)
 
 
-def _render_unsaved_trip_notice() -> None:
-    """未有行程時，收集同收藏仍然可以用，但要講明仲未寫入儲存。"""
-    if str(st.session_state.get("trip_id") or ""):
-        return
-    if not _session_has_trip_content():
-        return
-    st.info(_UNSAVED_TRIP_NOTICE)
-
-
 def _load_shared_trip() -> None:
     # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _skip_next_create。
     st.session_state._create_done_this_run = False
+    st.session_state._inbox_save_inflight = False
     st.session_state._storage_error_set = False
+    try:
+        trip_store.release_adopted_collection_inbox()
+    except trip_store.TripStoreError as err:
+        _remember_storage_error(str(err))
     try:
         trips = trip_store.list_trips()
     except trip_store.TripStoreError as err:
         _storage_stop(str(err))
     if not trips:
-        # 唔好自動開行程。清空 id，但留低今次 session 已收集的內容。
+        # 唔好自動開行程。有收藏匣先讀，沒有就唔好新增。
         st.session_state.trip_catalog = []
         st.session_state.trip_id = ""
         st.session_state.loaded_trip_id = ""
-        st.session_state.seen_stamp = ""
-        st.session_state.last_digest = ""
         st.session_state.pop("force_trip_reload", None)
+        try:
+            loaded = trip_store.load_collection_inbox()
+        except trip_store.TripStoreError as err:
+            _storage_stop(str(err))
+        if loaded is None:
+            st.session_state.collection_inbox_id = ""
+            st.session_state.loaded_inbox_id = ""
+            st.session_state.seen_stamp = ""
+            st.session_state.last_digest = ""
+            return
+        inbox_id = str(loaded.get("trip_id") or "")
+        st.session_state.collection_inbox_id = inbox_id
+        remote_stamp = loaded.get("updated_at") or ""
+        if (
+            st.session_state.get("loaded_inbox_id") == inbox_id
+            and st.session_state.get("seen_stamp") == remote_stamp
+        ):
+            return
+        if _remote_has_trip_content(loaded) or not _session_has_trip_content():
+            _apply_loaded_trip(loaded)
+            st.session_state.last_digest = trip_store.digest(_snapshot())
+        else:
+            st.session_state.last_digest = ""
+        st.session_state.seen_stamp = remote_stamp
+        st.session_state.loaded_inbox_id = inbox_id
         return
+    st.session_state.collection_inbox_id = ""
+    st.session_state.loaded_inbox_id = ""
     st.session_state.trip_catalog = [
         {"id": row["id"], "title": row.get("title") or "行程"} for row in trips
     ]
@@ -1133,14 +1153,41 @@ def _snapshot() -> dict:
     }
 
 
+def _persist_collection_inbox() -> bool:
+    """未有行程時，有內容先寫入收藏匣。登入本身唔會開列。"""
+    has_inbox = bool(st.session_state.get("collection_inbox_id"))
+    if not _session_has_trip_content() and not has_inbox:
+        return True
+    if st.session_state.get("_inbox_save_inflight"):
+        return False
+    st.session_state._inbox_save_inflight = True
+    try:
+        snapshot = _snapshot()
+        current = trip_store.digest(snapshot)
+        if current == st.session_state.get("last_digest") and has_inbox:
+            _clear_storage_error()
+            return True
+        st.session_state.seen_stamp = trip_store.save_collection_inbox(snapshot)
+        st.session_state.collection_inbox_id = trip_store.collection_inbox_id()
+        st.session_state.loaded_inbox_id = st.session_state.collection_inbox_id
+        st.session_state.last_digest = current
+        _clear_storage_error(force=True)
+        return True
+    except trip_store.TripStoreError as err:
+        _remember_storage_error(str(err))
+        return False
+    finally:
+        st.session_state._inbox_save_inflight = False
+
+
 def _persist_shared_trip() -> bool:
     """有行程而且寫入成功（或內容冇變）先回傳 True。
 
-    未有 trip_id 唔算儲存成功：呼叫方唔好當成已寫入。
+    未有行程時改寫收藏匣。寫入失敗唔當成功。
     """
     trip_id = str(st.session_state.get("trip_id") or "")
     if not trip_id:
-        return False
+        return _persist_collection_inbox()
     try:
         snapshot = _snapshot()
         current = trip_store.digest(snapshot)
@@ -1177,6 +1224,26 @@ def _create_new_trip() -> None:
     current = str(st.session_state.get("trip_id") or "")
     if current and not _persist_shared_trip():
         return
+    if not current and (
+        _session_has_trip_content() or st.session_state.get("collection_inbox_id")
+    ):
+        try:
+            adopted = trip_store.adopt_collection_inbox(_snapshot())
+        except trip_store.TripStoreError as err:
+            _remember_storage_error(str(err))
+            return
+        st.session_state._skip_next_create = True
+        st.session_state.trip_id = adopted["id"]
+        st.session_state.trip_title = adopted.get("title") or "行程"
+        st.session_state.collection_inbox_id = ""
+        st.session_state.loaded_inbox_id = ""
+        st.session_state.loaded_trip_id = adopted["id"]
+        st.session_state.seen_stamp = adopted.get("updated_at") or ""
+        st.session_state.last_digest = trip_store.digest(_snapshot())
+        st.session_state.force_trip_reload = True
+        _clear_storage_error(force=True)
+        st.rerun()
+        return
     try:
         created = trip_store.create_trip()
     except trip_store.TripStoreError as err:
@@ -1185,26 +1252,6 @@ def _create_new_trip() -> None:
     st.session_state._skip_next_create = True
     st.session_state.trip_id = created["id"]
     st.session_state.trip_title = created.get("title") or "行程"
-    if not current and _session_has_trip_content():
-        try:
-            snapshot = _snapshot()
-            stamp = trip_store.save_trip(snapshot)
-        except trip_store.TripStoreError as err:
-            # 行程列已開，但內容未寫入。唔好用空白行程蓋過今次 session。
-            st.session_state.last_digest = ""
-            st.session_state.loaded_trip_id = ""
-            st.session_state.seen_stamp = ""
-            st.session_state.force_trip_reload = False
-            _remember_storage_error(str(err))
-            st.rerun()
-            return
-        st.session_state.seen_stamp = stamp
-        st.session_state.last_digest = trip_store.digest(snapshot)
-        st.session_state.loaded_trip_id = created["id"]
-        st.session_state.force_trip_reload = False
-        _clear_storage_error(force=True)
-        st.rerun()
-        return
     st.session_state.force_trip_reload = True
     _clear_storage_error(force=True)
     st.rerun()
@@ -1226,7 +1273,6 @@ def _render_trip_switcher() -> None:
             if st.button(label, key=f"switch_trip_{row['id']}"):
                 if row.get("id") != current:
                     _activate_trip(row["id"])
-    _render_unsaved_trip_notice()
     cap = trip_store.max_trips()
     if len(catalog) >= cap:
         st.caption(f"每位會員最多可儲存 {cap} 個行程。")
@@ -1237,8 +1283,10 @@ def _render_trip_switcher() -> None:
 
 def _image_room() -> int:
     trip_id = str(st.session_state.get("trip_id") or "")
+    inbox_id = str(st.session_state.get("collection_inbox_id") or "")
+    exclude = trip_id or inbox_id
     try:
-        used = trip_store.count_images(excluding_trip_id=trip_id or None)
+        used = trip_store.count_images(excluding_trip_id=exclude or None)
     except trip_store.TripStoreError as err:
         st.error(str(err))
         return 0
