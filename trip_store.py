@@ -173,8 +173,20 @@ def adopt_collection_inbox(snapshot: dict) -> dict:
         return _adopt_collection_inbox_locked(owner, snapshot)
 
 
+def has_pending_collection_inbox() -> bool:
+    """收藏匣已蓋章指向一個行程，但尚未清理。不會新增列。"""
+    owner = _require_owner()
+    inbox = _collection_inbox_row(owner)
+    if inbox is None:
+        return False
+    return bool(str(_payload_dict(inbox).get("promoted_trip_id") or ""))
+
+
 def release_adopted_collection_inbox() -> None:
-    """收藏匣已經成功複製到行程時，再試一次清理。未複製過就什麼都不做。"""
+    """收藏匣已經成功複製到行程時，再試一次清理。未複製過就什麼都不做。
+
+    清理失敗只記日誌，不向呼叫方拋出，也不覆蓋已複製的行程。
+    """
     owner = _require_owner()
     with _owner_lock(owner):
         inbox = _collection_inbox_row(owner)
@@ -190,7 +202,10 @@ def release_adopted_collection_inbox() -> None:
             return
         if _is_collection_inbox(row):
             return
-        _delete_collection_inbox(owner, str(inbox.get("id") or ""))
+        try:
+            _delete_collection_inbox(owner, str(inbox.get("id") or ""))
+        except TripStoreError:
+            return
 
 
 def load_trip(trip_id: str) -> dict:
@@ -463,6 +478,15 @@ def _stamp_promoted(owner: str, inbox_id: str, trip_id: str) -> None:
     _update_owned(owner, inbox_id, payload)
 
 
+def _log_inbox_cleanup_pending(inbox_id: str, trip_id: str, exc: BaseException) -> None:
+    logger.warning(
+        "Collection inbox cleanup pending inbox=%s trip=%s (%s)",
+        inbox_id,
+        trip_id,
+        type(exc).__name__,
+    )
+
+
 def _delete_collection_inbox(owner: str, inbox_id: str) -> None:
     """清收藏匣。失敗時原列同圖片仍然可以讀到。"""
     row = _owned_row(owner, inbox_id)
@@ -470,21 +494,26 @@ def _delete_collection_inbox(owner: str, inbox_id: str) -> None:
         raise TripStoreError(MSG_DENIED)
     inbox_id = _validate_trip_id(str(row.get("id") or inbox_id))
     payload = _payload_dict(row)
+    promoted = str(payload.get("promoted_trip_id") or "")
     stored: list[tuple[str, bytes]] = []
     for item_id in _image_ids(payload):
         path = _object_path(owner, inbox_id, item_id)
         stored.append((path, _download_owned(owner, path)))
     paths = [path for path, _blob in stored]
-    if paths:
-        _remove_owned(owner, paths)
+    removed = False
     try:
+        if paths:
+            _remove_owned(owner, paths)
+            removed = True
         _delete_owned(owner, inbox_id)
     except TripStoreError as err:
-        for path, blob in stored:
-            try:
-                _upload_owned(owner, path, blob)
-            except TripStoreError:
-                logger.warning("Restoring collection inbox image failed")
+        if removed:
+            for path, blob in stored:
+                try:
+                    _upload_owned(owner, path, blob)
+                except TripStoreError:
+                    logger.warning("Restoring collection inbox image failed")
+        _log_inbox_cleanup_pending(inbox_id, promoted, err)
         raise TripStoreError(MSG_INBOX_KEEP) from err
 
 
@@ -499,24 +528,16 @@ def _trip_summary(owner: str, trip_id: str) -> dict:
     }
 
 
-def _resume_promoted_inbox(owner: str, inbox_id: str, promoted: str, snapshot: dict) -> dict:
-    """上次複製已核對，但收藏匣未清走。唔好再開第二個行程。"""
-    inbox_out, images = _stage_items(snapshot)
-    payload = _snapshot_payload(snapshot, inbox_out)
-    payload.pop("kind", None)
-    payload.pop("promoted_trip_id", None)
+def _resume_promoted_inbox(owner: str, inbox_id: str, promoted: str, _snapshot: dict) -> dict:
+    """已蓋章的收藏匣只再試清理，唔好覆寫已經複製好的行程。"""
+    summary = _trip_summary(owner, promoted)
     try:
-        _verify_copied_trip(owner, promoted, images, payload)
+        _delete_collection_inbox(owner, inbox_id)
     except TripStoreError:
-        copied = dict(snapshot)
-        copied["trip_id"] = promoted
-        copied["title"] = _trip_summary(owner, promoted)["title"]
-        _write_snapshot(owner, promoted, copied, kind=None, exclude_ids={inbox_id})
-        inbox_out, images = _stage_items(copied)
-        payload = _snapshot_payload(copied, inbox_out)
-        _verify_copied_trip(owner, promoted, images, payload)
-    _delete_collection_inbox(owner, inbox_id)
-    return _trip_summary(owner, promoted)
+        summary["inbox_cleanup_pending"] = True
+        return summary
+    summary["inbox_cleanup_pending"] = False
+    return summary
 
 
 def _adopt_collection_inbox_locked(owner: str, snapshot: dict) -> dict:
@@ -558,17 +579,25 @@ def _adopt_collection_inbox_locked(owner: str, snapshot: dict) -> dict:
         if inbox_id:
             _stamp_promoted(owner, inbox_id, new_id)
             stamped = True
-            _delete_collection_inbox(owner, inbox_id)
-    except TripStoreError as err:
+            try:
+                _delete_collection_inbox(owner, inbox_id)
+            except TripStoreError:
+                return _adopted_summary(created, payload, updated, pending=True)
+    except TripStoreError:
         if not stamped:
             _rollback_created_trip(owner, new_id, uploaded)
             raise
-        raise TripStoreError(MSG_INBOX_KEEP) from err
+        raise
+    return _adopted_summary(created, payload, updated, pending=False)
+
+
+def _adopted_summary(created: dict, payload: dict, updated: dict, *, pending: bool) -> dict:
     return {
-        "id": new_id,
+        "id": str(created["id"]),
         "title": str(payload.get("title") or created["title"]),
         "created_at": created.get("created_at") or "",
         "updated_at": _stamp(updated.get("updated_at")),
+        "inbox_cleanup_pending": pending,
     }
 
 

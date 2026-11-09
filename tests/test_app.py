@@ -1856,3 +1856,94 @@ def test_cross_user_load_does_not_create_or_leak(monkeypatch, memory_supabase):
     assert memory_supabase.objects[f"user-a/{created['id']}/{item_id}.jpg"] == image
     loaded = trip_store.load_trip(created["id"])
     assert loaded["inbox"][0]["places"][0]["name"] == "秘密拉麵"
+
+
+def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypatch, memory_supabase, caplog):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    image = b"\xff\xd8cleanup-pending"
+    item_id = "ab" * 8
+    trip_store.save_collection_inbox({
+        "title": "收藏",
+        "inbox": [{
+            "id": item_id,
+            "label": "截圖 1",
+            "remark": "",
+            "status": "未排程",
+            "analysis": "done",
+            "facts": "done",
+            "places": [{"name": "嚴島神社", "name_zh": "嚴島神社"}],
+            "added_by": "旅人",
+            "image": image,
+        }],
+        "favourites": [{"id": "fav", "name": "嚴島神社"}],
+        "itinerary": None,
+    })
+    inbox_id = trip_store.collection_inbox_id()
+    real_remove = trip_store._remove_owned
+
+    def flaky(owner, paths):
+        if any(inbox_id in path for path in paths):
+            raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE)
+        return real_remove(owner, paths)
+
+    monkeypatch.setattr(trip_store, "_remove_owned", flaky)
+    caplog.set_level("WARNING", logger="lazy_trip_planner.store")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "C"
+    at.run()
+    assert not at.exception
+    assert at.session_state.get("trip_id") in ("", None)
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    trip_id = at.session_state["trip_id"]
+    assert trip_id and trip_id != inbox_id
+    assert len(trip_store.list_trips()) == 1
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded["inbox"][0]["image"] == image
+    assert loaded["inbox"][0]["id"] == item_id
+    warning = _joined(at.warning)
+    assert "新行程已儲存。舊收集匣暫時未清理，唔使再新增。" in warning
+    feedback = _feedback(at)
+    assert "請再試一次" not in feedback
+    assert "收藏未能完成整理" not in feedback
+    assert "請再試一次" not in _joined(at.error)
+    pending_logs = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("Collection inbox cleanup pending")
+    ]
+    assert any(
+        message == f"Collection inbox cleanup pending inbox={inbox_id} trip={trip_id} (TripStoreError)"
+        for message in pending_logs
+    )
+    assert all("test-member-sub" not in message for message in pending_logs)
+    assert all(image.hex() not in message for message in pending_logs)
+
+    item = at.session_state["inbox"][0]
+    item["remark"] = "改過備註"
+    at.session_state[f"remark_{item['id']}"] = "改過備註"
+    at.session_state["last_digest"] = ""
+    at.run()
+    assert trip_store.load_trip(trip_id)["inbox"][0]["remark"] == "改過備註"
+    edited_stamp = trip_store.load_trip(trip_id)["updated_at"]
+    _button(at, "新增行程").click().run()
+    assert len(trip_store.list_trips()) == 1
+    assert at.session_state["trip_id"] == trip_id
+    kept = trip_store.load_trip(trip_id)
+    assert kept["inbox"][0]["remark"] == "改過備註"
+    assert kept["inbox"][0]["image"] == image
+    assert kept["updated_at"] == edited_stamp
+    at.run()
+    assert len(trip_store.list_trips()) == 1
+    assert trip_store.load_trip(trip_id)["inbox"][0]["remark"] == "改過備註"
+    assert trip_store.load_trip(trip_id)["updated_at"] == edited_stamp
+    assert "請再試一次" not in _feedback(at)
+
+    monkeypatch.setattr(trip_store, "_remove_owned", real_remove)
+    trip_store.release_adopted_collection_inbox()
+    assert trip_store.load_collection_inbox() is None
+    assert trip_store.has_pending_collection_inbox() is False
+    final = trip_store.load_trip(trip_id)
+    assert final["inbox"][0]["remark"] == "改過備註"
+    assert final["inbox"][0]["image"] == image
+    assert len(trip_store.list_trips()) == 1

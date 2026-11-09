@@ -1021,6 +1021,7 @@ def _remote_has_trip_content(loaded: dict) -> bool:
 
 
 _EMPTY_TRIPS_NOTE = "你仲未有行程"
+_INBOX_CLEANUP_WARNING = "新行程已儲存。舊收集匣暫時未清理，唔使再新增。"
 
 
 def _remember_storage_error(message: str) -> None:
@@ -1042,6 +1043,39 @@ def _render_storage_error() -> None:
         st.error(message)
 
 
+def _render_inbox_cleanup_warning() -> None:
+    message = str(st.session_state.get("inbox_cleanup_warning") or "").strip()
+    if message:
+        st.warning(message)
+
+
+def _clear_inbox_cleanup_warning_if_done() -> None:
+    if not st.session_state.get("inbox_cleanup_warning"):
+        return
+    try:
+        pending = trip_store.has_pending_collection_inbox()
+    except trip_store.TripStoreError:
+        return
+    if not pending:
+        st.session_state.inbox_cleanup_warning = ""
+
+
+def _stop_for_pending_inbox() -> bool:
+    """已蓋章但未清理時，唔好再開一個行程。"""
+    try:
+        pending = trip_store.has_pending_collection_inbox()
+    except trip_store.TripStoreError as err:
+        _remember_storage_error(str(err))
+        return True
+    if not pending:
+        return False
+    trip_store.release_adopted_collection_inbox()
+    _clear_inbox_cleanup_warning_if_done()
+    if st.session_state.get("inbox_cleanup_warning") or trip_store.has_pending_collection_inbox():
+        st.session_state.inbox_cleanup_warning = _INBOX_CLEANUP_WARNING
+    return True
+
+
 def _load_shared_trip() -> None:
     # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _skip_next_create。
     st.session_state._create_done_this_run = False
@@ -1051,6 +1085,7 @@ def _load_shared_trip() -> None:
         trip_store.release_adopted_collection_inbox()
     except trip_store.TripStoreError as err:
         _remember_storage_error(str(err))
+    _clear_inbox_cleanup_warning_if_done()
     try:
         trips = trip_store.list_trips()
     except trip_store.TripStoreError as err:
@@ -1224,6 +1259,8 @@ def _create_new_trip() -> None:
     current = str(st.session_state.get("trip_id") or "")
     if current and not _persist_shared_trip():
         return
+    if _stop_for_pending_inbox():
+        return
     if not current and (
         _session_has_trip_content() or st.session_state.get("collection_inbox_id")
     ):
@@ -1233,6 +1270,10 @@ def _create_new_trip() -> None:
             _remember_storage_error(str(err))
             return
         st.session_state._skip_next_create = True
+        if adopted.get("inbox_cleanup_pending"):
+            st.session_state.inbox_cleanup_warning = _INBOX_CLEANUP_WARNING
+        else:
+            st.session_state.inbox_cleanup_warning = ""
         st.session_state.trip_id = adopted["id"]
         st.session_state.trip_title = adopted.get("title") or "行程"
         st.session_state.collection_inbox_id = ""
@@ -1263,6 +1304,7 @@ def _render_trip_switcher() -> None:
         st.session_state._skip_next_create = False
     catalog = list(st.session_state.get("trip_catalog") or [])
     st.caption("我的行程")
+    _render_inbox_cleanup_warning()
     if not catalog:
         st.caption(_EMPTY_TRIPS_NOTE)
     else:

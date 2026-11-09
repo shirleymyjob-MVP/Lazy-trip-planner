@@ -297,6 +297,7 @@ def _block_store(monkeypatch, tmp_path):
         "adopt_collection_inbox",
         "release_adopted_collection_inbox",
         "collection_inbox_id",
+        "has_pending_collection_inbox",
     ):
         monkeypatch.setattr(trip_store, name, fail)
 

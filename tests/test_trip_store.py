@@ -594,7 +594,7 @@ def test_adopt_rolls_back_new_trip_objects_when_row_update_fails(use_sub, memory
     assert memory_supabase.objects == {f"user-a/{adopted['id']}/aa.jpg": image}
 
 
-def test_cleanup_failure_keeps_the_inbox_and_retry_does_not_duplicate(use_sub, memory_supabase, monkeypatch):
+def test_cleanup_failure_keeps_the_new_trip_and_does_not_overwrite_it(use_sub, memory_supabase, monkeypatch, caplog):
     use_sub("user-a")
     image = b"\xff\xd8keep-inbox"
     snapshot = _collection_snapshot(
@@ -611,29 +611,53 @@ def test_cleanup_failure_keeps_the_inbox_and_retry_does_not_duplicate(use_sub, m
         return real_remove(owner, paths)
 
     monkeypatch.setattr(trip_store, "_remove_owned", flaky)
-    with pytest.raises(trip_store.TripStoreError) as failed:
-        trip_store.adopt_collection_inbox(snapshot)
-    assert failed.value.args[0] == trip_store.MSG_INBOX_KEEP
+    caplog.set_level("WARNING", logger="lazy_trip_planner.store")
+    adopted = trip_store.adopt_collection_inbox(snapshot)
+    assert adopted["inbox_cleanup_pending"] is True
+    assert adopted["id"] != inbox_id
+    trip_id = adopted["id"]
     assert memory_supabase.objects[f"user-a/{inbox_id}/aa.jpg"] == image
-    inbox = trip_store.load_collection_inbox()
-    assert inbox["inbox"][0]["image"] == image
-    assert inbox["favourites"][0]["name"] == "嚴島"
-    trips = trip_store.list_trips()
-    assert len(trips) == 1
-    trip_id = trips[0]["id"]
     assert memory_supabase.objects[f"user-a/{trip_id}/aa.jpg"] == image
-    with pytest.raises(trip_store.TripStoreError):
-        trip_store.adopt_collection_inbox(snapshot)
-    assert len(trip_store.list_trips()) == 1
-    assert trip_store.load_collection_inbox()["inbox"][0]["image"] == image
-    monkeypatch.setattr(trip_store, "_remove_owned", real_remove)
-    again = trip_store.adopt_collection_inbox(snapshot)
-    assert again["id"] == trip_id
-    assert trip_store.load_collection_inbox() is None
-    assert len(trip_store.list_trips()) == 1
     loaded = trip_store.load_trip(trip_id)
-    assert [item["id"] for item in loaded["inbox"]] == ["aa"]
     assert loaded["inbox"][0]["image"] == image
+    assert loaded["favourites"][0]["name"] == "嚴島"
+    pending_logs = [
+        record.getMessage() for record in caplog.records
+        if record.getMessage().startswith("Collection inbox cleanup pending")
+    ]
+    assert pending_logs == [
+        f"Collection inbox cleanup pending inbox={inbox_id} trip={trip_id} (TripStoreError)"
+    ]
+    assert "user-a" not in pending_logs[0]
+    assert "supabase" not in pending_logs[0].lower()
+
+    edited = trip_store.load_trip(trip_id)
+    edited["favourites"] = [{"id": "fav", "name": "已修改"}]
+    edited["trip_id"] = trip_id
+    trip_store.save_trip(edited)
+    stamped = trip_store.load_trip(trip_id)["updated_at"]
+    edited_name = trip_store.load_trip(trip_id)["favourites"][0]["name"]
+    again = trip_store.adopt_collection_inbox(_collection_snapshot(
+        [_item("aa", name="覆蓋", image=b"\xff\xd8other")],
+        favourites=[{"id": "fav", "name": "覆蓋"}],
+    ))
+    assert again["id"] == trip_id
+    assert again["inbox_cleanup_pending"] is True
+    assert len(trip_store.list_trips()) == 1
+    kept = trip_store.load_trip(trip_id)
+    assert kept["favourites"][0]["name"] == edited_name
+    assert kept["inbox"][0]["image"] == image
+    assert kept["updated_at"] == stamped
+    assert trip_store.load_collection_inbox()["inbox"][0]["image"] == image
+
+    monkeypatch.setattr(trip_store, "_remove_owned", real_remove)
+    trip_store.release_adopted_collection_inbox()
+    assert trip_store.load_collection_inbox() is None
+    assert trip_store.has_pending_collection_inbox() is False
+    assert len(trip_store.list_trips()) == 1
+    final = trip_store.load_trip(trip_id)
+    assert final["favourites"][0]["name"] == "已修改"
+    assert final["inbox"][0]["image"] == image
     assert memory_supabase.objects == {f"user-a/{trip_id}/aa.jpg": image}
 
 
