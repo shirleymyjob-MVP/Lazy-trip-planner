@@ -228,16 +228,43 @@ def test_login_failure_does_not_surface_exception_text(monkeypatch):
     assert "secret.internal" not in text
 
 
-def test_render_logout_is_a_small_button(monkeypatch):
+def test_render_logout_keeps_label_and_calls_st_logout(monkeypatch):
+    """登出仍然係 st.logout，而且唔再塞入 1/7 窄欄。"""
     fake = _fake_st()
-    column = mock.Mock()
-    fake.columns.return_value = (mock.Mock(), column)
-    column.__enter__ = mock.Mock(return_value=column)
-    column.__exit__ = mock.Mock(return_value=False)
     monkeypatch.setattr(auth_gate, "st", fake)
     auth_gate.render_logout()
+    fake.columns.assert_not_called()
     fake.button.assert_called_once()
-    assert fake.button.call_args.args[0] == "登出"
+    args, kwargs = fake.button.call_args
+    assert args[0] == "登出"
+    assert kwargs["key"] == "auth_logout"
+    assert kwargs["on_click"] is auth_gate._do_logout
+    assert kwargs["width"] == "content"
+    kwargs["on_click"]()
+    fake.logout.assert_called_once()
+
+
+def test_logout_failure_still_asks_to_retry_without_leaking(monkeypatch):
+    fake = _fake_st()
+    monkeypatch.setattr(auth_gate, "st", fake)
+    fake.logout.side_effect = RuntimeError("secret end_session_endpoint")
+    auth_gate._do_logout()
+    assert fake.session_state[auth_gate._LOGOUT_ERROR_KEY] is True
+    auth_gate.render_logout()
+    text = _shown(fake)
+    assert "登出未完成，請再試一次。" in text
+    assert "end_session" not in text
+    assert "登出" in text
+
+
+def test_logout_layout_is_not_a_narrow_column():
+    source = open(auth_gate.__file__, encoding="utf-8").read()
+    body = source.split("def render_logout", 1)[1].split("\ndef ", 1)[0]
+    code = body.split('"""', 2)[-1]
+    assert "st.columns" not in code
+    assert "[6, 1]" not in code
+    assert 'key="auth_logout"' in code
+    assert "登出" in code
 
 
 def test_gate_call_is_before_trip_loading():

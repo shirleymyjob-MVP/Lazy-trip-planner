@@ -256,6 +256,50 @@ st.markdown(
         padding-right: 0.7rem !important;
         overflow-x: hidden;
       }
+      /* 登出掣。頁頂 padding 只有 0.6rem，但 Streamlit header 高 3.75rem、
+         不透明而且會接收點擊（Deploy／Fork 同選單）。舊的 columns([6, 1])
+         再被下面 stColumn min-width:0 壓成約 45px，「登出」會摺到只剩「登」。
+         保留原本 2.5rem 的空位，等 build 行唔好縮上 header 底；
+         掣本身放到 header 下面、內容欄右側，完整兩個字，手機可點。 */
+      div.st-key-auth_logout {
+        position: relative !important;
+        z-index: 20 !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        min-height: 2.5rem !important;
+        height: 2.5rem !important;
+        overflow: visible !important;
+      }
+      div.st-key-auth_logout [data-testid="stButton"] {
+        position: absolute !important;
+        top: calc(3.75rem - 0.6rem + 4px) !important;
+        right: 0 !important;
+        left: auto !important;
+        width: auto !important;
+        max-width: 100% !important;
+        overflow: visible !important;
+        z-index: 21 !important;
+      }
+      div.st-key-auth_logout button {
+        width: auto !important;
+        min-width: 4.75rem !important;
+        max-width: 100% !important;
+        min-height: 44px !important;
+        height: 44px !important;
+        padding: 0 1rem !important;
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        line-height: 1.2 !important;
+        flex: 0 0 auto !important;
+        touch-action: manipulation;
+      }
+      div.st-key-auth_logout button * {
+        white-space: nowrap !important;
+        overflow: visible !important;
+        text-overflow: clip !important;
+        max-width: none !important;
+      }
       div[data-testid="stColumn"] { min-width: 0 !important; }
       div[data-testid="stHorizontalBlock"] {
         flex-wrap: wrap !important;
