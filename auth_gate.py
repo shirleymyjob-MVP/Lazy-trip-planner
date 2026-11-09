@@ -69,12 +69,20 @@ def require_login() -> str:
 
 
 def render_logout() -> None:
-    """已登入之後先呼叫。細粒、常駐喺頁頂，唔展示電郵或 ``sub``。"""
+    """已登入之後先呼叫。細粒、常駐喺頁頂右側，唔展示電郵或 ``sub``。
+
+    唔好再用 ``st.columns([6, 1])``。手機上第二欄大約 45px，「登出」會摺行，
+    只睇到「登」。位置同可點範圍由 ``app.py`` 的 ``.st-key-auth_logout`` 負責：
+    掣要避開 3.75rem 高的 Streamlit header，並且完整顯示兩個字。
+    """
+    st.button(
+        "登出",
+        key="auth_logout",
+        on_click=_do_logout,
+        width="content",
+    )
     if st.session_state.get(_LOGOUT_ERROR_KEY):
         st.caption("登出未完成，請再試一次。")
-    _spacer, action = st.columns([6, 1])
-    with action:
-        st.button("登出", key="auth_logout", on_click=_do_logout)
 
 
 def _do_login() -> None:

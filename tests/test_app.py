@@ -121,11 +121,29 @@ def test_opening_shows_the_four_steps_and_build_without_a_paywall():
         assert step in page
     assert any("build:" in caption.value for caption in at.caption)
     assert any("AI 服務未設定好" in error.value for error in at.error)
-    assert any(button.label == "登出" for button in at.button)
+    logout = _button(at, "登出")
+    assert logout.label == "登出"
+    assert not logout.disabled
     start = _button(at, "開始收集想去的地方")
     assert not start.disabled
     assert not any(button.label == "開始排行程" for button in at.button)
     assert not at.download_button
+
+
+def test_logout_css_stays_tappable_without_covering_the_desktop_column():
+    """手機要見到完整「登出」並可點；桌面唔好變成整行大掣。"""
+    css = open(APP, encoding="utf-8").read()
+    start = css.index("div.st-key-auth_logout {")
+    block = css[start:css.index("div[data-testid=\"stColumn\"]", start)]
+    assert "st-key-auth_logout_missing_sub" not in block
+    assert "[class*=\"st-key-auth_logout\"]" not in block
+    assert "min-height: 44px" in block
+    assert "white-space: nowrap" in block
+    assert "3.75rem" in block
+    assert "width: auto" in block
+    button_rules = block.split("button {", 1)[1]
+    assert "\n        width: 100%" not in button_rules
+    assert "min-width: 4.75rem" in button_rules
 
 
 def test_upload_waits_for_the_analyze_button_then_fills_facts():
