@@ -807,6 +807,9 @@ def _render_notice():
     if not notice:
         return
     level, text = notice
+    # 未有行程時，內容只喺今次 session。唔好用成功訊息扮已儲存。
+    if level == "success" and not str(st.session_state.get("trip_id") or ""):
+        return
     renderer = {"error": st.error, "warning": st.warning, "success": st.success, "info": st.info}.get(level, st.info)
     renderer(text)
 
@@ -1017,14 +1020,55 @@ def _remote_has_trip_content(loaded: dict) -> bool:
     return False
 
 
+_UNSAVED_TRIP_NOTICE = "尚未儲存。按「新增行程」之後先會保留。"
+_EMPTY_TRIPS_NOTE = "你仲未有行程"
+
+
+def _remember_storage_error(message: str) -> None:
+    st.session_state.trip_storage_error = message
+    st.session_state._storage_error_set = True
+
+
+def _clear_storage_error(*, force: bool = False) -> None:
+    """今次執行剛記低嘅錯誤，唔好被隨後「內容冇變」清走。"""
+    if st.session_state.get("_storage_error_set") and not force:
+        return
+    st.session_state.trip_storage_error = ""
+    st.session_state._storage_error_set = False
+
+
+def _render_storage_error() -> None:
+    message = str(st.session_state.get("trip_storage_error") or "").strip()
+    if message:
+        st.error(message)
+
+
+def _render_unsaved_trip_notice() -> None:
+    """未有行程時，收集同收藏仍然可以用，但要講明仲未寫入儲存。"""
+    if str(st.session_state.get("trip_id") or ""):
+        return
+    if not _session_has_trip_content():
+        return
+    st.info(_UNSAVED_TRIP_NOTICE)
+
+
 def _load_shared_trip() -> None:
+    # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _skip_next_create。
+    st.session_state._create_done_this_run = False
+    st.session_state._storage_error_set = False
     try:
         trips = trip_store.list_trips()
-        if not trips:
-            created = trip_store.create_trip()
-            trips = trip_store.list_trips() or [created]
     except trip_store.TripStoreError as err:
         _storage_stop(str(err))
+    if not trips:
+        # 唔好自動開行程。清空 id，但留低今次 session 已收集的內容。
+        st.session_state.trip_catalog = []
+        st.session_state.trip_id = ""
+        st.session_state.loaded_trip_id = ""
+        st.session_state.seen_stamp = ""
+        st.session_state.last_digest = ""
+        st.session_state.pop("force_trip_reload", None)
+        return
     st.session_state.trip_catalog = [
         {"id": row["id"], "title": row.get("title") or "行程"} for row in trips
     ]
@@ -1090,24 +1134,30 @@ def _snapshot() -> dict:
 
 
 def _persist_shared_trip() -> bool:
+    """有行程而且寫入成功（或內容冇變）先回傳 True。
+
+    未有 trip_id 唔算儲存成功：呼叫方唔好當成已寫入。
+    """
     trip_id = str(st.session_state.get("trip_id") or "")
     if not trip_id:
-        return True
+        return False
     try:
         snapshot = _snapshot()
         current = trip_store.digest(snapshot)
     except trip_store.TripStoreError as err:
-        st.error(str(err))
+        _remember_storage_error(str(err))
         return False
     if current == st.session_state.get("last_digest"):
+        _clear_storage_error()
         return True
     try:
         st.session_state.seen_stamp = trip_store.save_trip(snapshot)
     except trip_store.TripStoreError as err:
-        st.error(str(err))
+        _remember_storage_error(str(err))
         return False
     st.session_state.last_digest = current
     st.session_state.loaded_trip_id = trip_id
+    _clear_storage_error(force=True)
     return True
 
 
@@ -1120,35 +1170,68 @@ def _activate_trip(trip_id: str) -> None:
 
 
 def _create_new_trip() -> None:
-    if not _persist_shared_trip():
+    """一次撳掣最多開一行。重入或緊接嘅 rerun 唔好再開。"""
+    if st.session_state.get("_create_done_this_run"):
+        return
+    st.session_state._create_done_this_run = True
+    current = str(st.session_state.get("trip_id") or "")
+    if current and not _persist_shared_trip():
         return
     try:
         created = trip_store.create_trip()
     except trip_store.TripStoreError as err:
-        st.error(str(err))
+        _remember_storage_error(str(err))
         return
+    st.session_state._skip_next_create = True
     st.session_state.trip_id = created["id"]
     st.session_state.trip_title = created.get("title") or "行程"
+    if not current and _session_has_trip_content():
+        try:
+            snapshot = _snapshot()
+            stamp = trip_store.save_trip(snapshot)
+        except trip_store.TripStoreError as err:
+            # 行程列已開，但內容未寫入。唔好用空白行程蓋過今次 session。
+            st.session_state.last_digest = ""
+            st.session_state.loaded_trip_id = ""
+            st.session_state.seen_stamp = ""
+            st.session_state.force_trip_reload = False
+            _remember_storage_error(str(err))
+            st.rerun()
+            return
+        st.session_state.seen_stamp = stamp
+        st.session_state.last_digest = trip_store.digest(snapshot)
+        st.session_state.loaded_trip_id = created["id"]
+        st.session_state.force_trip_reload = False
+        _clear_storage_error(force=True)
+        st.rerun()
+        return
     st.session_state.force_trip_reload = True
+    _clear_storage_error(force=True)
     st.rerun()
 
 
 def _render_trip_switcher() -> None:
+    replay = bool(st.session_state.get("_skip_next_create"))
+    if replay:
+        st.session_state._skip_next_create = False
     catalog = list(st.session_state.get("trip_catalog") or [])
-    if not catalog:
-        return
     st.caption("我的行程")
-    current = st.session_state.get("trip_id")
-    for index, row in enumerate(catalog, start=1):
-        title = row.get("title") or f"行程 {index}"
-        label = f"{title}（目前）" if row.get("id") == current else title
-        if st.button(label, key=f"switch_trip_{row['id']}"):
-            if row.get("id") != current:
-                _activate_trip(row["id"])
+    if not catalog:
+        st.caption(_EMPTY_TRIPS_NOTE)
+    else:
+        current = st.session_state.get("trip_id")
+        for index, row in enumerate(catalog, start=1):
+            title = row.get("title") or f"行程 {index}"
+            label = f"{title}（目前）" if row.get("id") == current else title
+            if st.button(label, key=f"switch_trip_{row['id']}"):
+                if row.get("id") != current:
+                    _activate_trip(row["id"])
+    _render_unsaved_trip_notice()
     cap = trip_store.max_trips()
     if len(catalog) >= cap:
         st.caption(f"每位會員最多可儲存 {cap} 個行程。")
-    elif st.button("新增行程", key="create_trip"):
+        return
+    if st.button("新增行程", key="create_trip") and not replay:
         _create_new_trip()
 
 
@@ -2951,3 +3034,4 @@ st.caption(
 # 開始分析喺 fragment 入面先寫完第二張卡。儲存前再收一次，避免行程留低兩個 kchiara。
 _publish_favourites()
 _persist_shared_trip()
+_render_storage_error()
