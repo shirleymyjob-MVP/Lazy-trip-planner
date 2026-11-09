@@ -20,6 +20,7 @@ from urllib.parse import quote, urlencode
 
 import streamlit as st
 import streamlit.components.v1 as components
+from streamlit.runtime.scriptrunner import StopException
 
 import auth_gate
 import gemini_client
@@ -621,10 +622,6 @@ _PASTE = components.declare_component(
     "inbox_paste",
     path=str(Path(__file__).parent / "components" / "inbox_paste"),
 )
-_COPY = components.declare_component(
-    "copy_link",
-    path=str(Path(__file__).parent / "components" / "copy_link"),
-)
 _MOBILE = components.declare_component(
     "mobile_fix",
     path=str(Path(__file__).parent / "components" / "mobile_fix"),
@@ -716,7 +713,7 @@ def init_state():
     st.session_state.setdefault("trip_style", DEFAULT_TRIP_STYLE)
     st.session_state.setdefault("allow_ai", True)
     st.session_state.setdefault("day_count", 3)
-    st.session_state.setdefault("show_invite", False)
+    st.session_state.setdefault("trip_title", "行程")
 
 
 def remaining_quota() -> int:
@@ -957,27 +954,6 @@ def _sync_recognize() -> bool:
     return os.environ.get("LAZY_TRIP_SYNC_RECOGNIZE") == "1"
 
 
-def _ensure_share() -> None:
-    query = st.query_params.get("share", "")
-    if isinstance(query, list):
-        query = query[0] if query else ""
-    token = st.session_state.get("share_token") or ""
-    if not re.fullmatch(r"[0-9a-f]{8,32}", token):
-        token = query if re.fullmatch(r"[0-9a-f]{8,32}", query or "") else trip_store.new_token()
-    st.session_state.share_token = token
-    if query != token:
-        st.query_params["share"] = token
-
-
-def _share_url() -> str:
-    try:
-        current = st.context.url or ""
-    except Exception:  # noqa: BLE001
-        current = ""
-    base = current.split("?", 1)[0] if current else "http://localhost:8501/"
-    return f"{base}?share={st.session_state.share_token}"
-
-
 def _apply_loaded_trip(loaded: dict) -> None:
     st.session_state.inbox = list(loaded.get("inbox") or [])
     st.session_state.itinerary = loaded.get("itinerary")
@@ -1001,32 +977,86 @@ def _apply_loaded_trip(loaded: dict) -> None:
         st.session_state[f"remark_{item['id']}"] = item.get("remark") or ""
         names = [name for name in trip_core.inbox_region_names(item) if name != trip_core.UNSORTED_REGION]
         st.session_state[f"region_fix_{item['id']}"] = names
-    st.session_state.last_digest = trip_store.digest({
-        "inbox": st.session_state.inbox,
-        "itinerary": st.session_state.itinerary,
-        "itinerary_places": st.session_state.itinerary_places,
-        "next_image_num": st.session_state.next_image_num,
-        "picks": {item["id"]: bool(picks.get(item["id"], True)) for item in st.session_state.inbox},
-        "members": st.session_state.members,
-        **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
-    })
+
+
+def _ensure_share() -> None:
+    """舊的 ?share= 連結已停用。
+
+    唔讀取、唔寫入 query string，亦唔會用分享碼決定可以睇邊份行程。
+    """
+    return
+
+
+def _storage_stop(message: str) -> None:
+    st.error(message)
+    st.stop()
+    raise StopException()
+
+
+def _session_has_trip_content() -> bool:
+    if st.session_state.get("inbox"):
+        return True
+    if st.session_state.get("favourites"):
+        return True
+    if st.session_state.get("itinerary"):
+        return True
+    if st.session_state.get("itinerary_places"):
+        return True
+    return False
+
+
+def _remote_has_trip_content(loaded: dict) -> bool:
+    if loaded.get("inbox"):
+        return True
+    if loaded.get("favourites"):
+        return True
+    if loaded.get("itinerary"):
+        return True
+    if loaded.get("itinerary_places"):
+        return True
+    return False
 
 
 def _load_shared_trip() -> None:
-    token = st.session_state.share_token
     try:
-        mt = trip_store.mtime(token)
-    except ValueError:
+        trips = trip_store.list_trips()
+        if not trips:
+            created = trip_store.create_trip()
+            trips = trip_store.list_trips() or [created]
+    except trip_store.TripStoreError as err:
+        _storage_stop(str(err))
+    st.session_state.trip_catalog = [
+        {"id": row["id"], "title": row.get("title") or "行程"} for row in trips
+    ]
+    ids = [row["id"] for row in trips]
+    requested = str(st.session_state.get("trip_id") or "")
+    force = bool(st.session_state.pop("force_trip_reload", False))
+    if requested not in ids:
+        current = ids[0]
+        if requested:
+            force = True
+    else:
+        current = requested
+    st.session_state.trip_id = current
+    remote_stamp = next(row["updated_at"] for row in trips if row["id"] == current)
+    if (
+        not force
+        and st.session_state.get("loaded_trip_id") == current
+        and st.session_state.get("seen_stamp") == remote_stamp
+    ):
         return
-    if mt == st.session_state.get("seen_mtime"):
-        return
-    st.session_state.seen_mtime = mt
-    if not mt:
-        st.session_state.last_digest = ""
-        return
-    loaded = trip_store.load_trip(token)
-    if loaded:
+    try:
+        loaded = trip_store.load_trip(current)
+    except trip_store.TripStoreError as err:
+        _storage_stop(str(err))
+    st.session_state.trip_title = loaded.get("title") or "行程"
+    if force or _remote_has_trip_content(loaded) or not _session_has_trip_content():
         _apply_loaded_trip(loaded)
+        st.session_state.last_digest = trip_store.digest(_snapshot())
+    else:
+        st.session_state.last_digest = ""
+    st.session_state.seen_stamp = loaded.get("updated_at") or remote_stamp
+    st.session_state.loaded_trip_id = current
 
 
 def _snapshot() -> dict:
@@ -1042,7 +1072,8 @@ def _snapshot() -> dict:
     members = sorted({*(st.session_state.get("members") or []), name})
     st.session_state.members = members
     return {
-        "token": st.session_state.share_token,
+        "trip_id": st.session_state.get("trip_id"),
+        "title": st.session_state.get("trip_title") or "行程",
         "inbox": inbox,
         "itinerary": st.session_state.itinerary,
         "itinerary_places": st.session_state.itinerary_places,
@@ -1058,17 +1089,82 @@ def _snapshot() -> dict:
     }
 
 
-def _persist_shared_trip() -> None:
-    snapshot = _snapshot()
-    current = trip_store.digest(snapshot)
+def _persist_shared_trip() -> bool:
+    trip_id = str(st.session_state.get("trip_id") or "")
+    if not trip_id:
+        return True
+    try:
+        snapshot = _snapshot()
+        current = trip_store.digest(snapshot)
+    except trip_store.TripStoreError as err:
+        st.error(str(err))
+        return False
     if current == st.session_state.get("last_digest"):
+        return True
+    try:
+        st.session_state.seen_stamp = trip_store.save_trip(snapshot)
+    except trip_store.TripStoreError as err:
+        st.error(str(err))
+        return False
+    st.session_state.last_digest = current
+    st.session_state.loaded_trip_id = trip_id
+    return True
+
+
+def _activate_trip(trip_id: str) -> None:
+    if not _persist_shared_trip():
+        return
+    st.session_state.trip_id = trip_id
+    st.session_state.force_trip_reload = True
+    st.rerun()
+
+
+def _create_new_trip() -> None:
+    if not _persist_shared_trip():
         return
     try:
-        st.session_state.seen_mtime = trip_store.save_trip(snapshot)
-    except ValueError:
-        logger.exception("Could not save shared trip")
+        created = trip_store.create_trip()
+    except trip_store.TripStoreError as err:
+        st.error(str(err))
         return
-    st.session_state.last_digest = current
+    st.session_state.trip_id = created["id"]
+    st.session_state.trip_title = created.get("title") or "行程"
+    st.session_state.force_trip_reload = True
+    st.rerun()
+
+
+def _render_trip_switcher() -> None:
+    catalog = list(st.session_state.get("trip_catalog") or [])
+    if not catalog:
+        return
+    st.caption("我的行程")
+    current = st.session_state.get("trip_id")
+    for index, row in enumerate(catalog, start=1):
+        title = row.get("title") or f"行程 {index}"
+        label = f"{title}（目前）" if row.get("id") == current else title
+        if st.button(label, key=f"switch_trip_{row['id']}"):
+            if row.get("id") != current:
+                _activate_trip(row["id"])
+    cap = trip_store.max_trips()
+    if len(catalog) >= cap:
+        st.caption(f"每位會員最多可儲存 {cap} 個行程。")
+    elif st.button("新增行程", key="create_trip"):
+        _create_new_trip()
+
+
+def _image_room() -> int:
+    trip_id = str(st.session_state.get("trip_id") or "")
+    try:
+        used = trip_store.count_images(excluding_trip_id=trip_id or None)
+    except trip_store.TripStoreError as err:
+        st.error(str(err))
+        return 0
+    current = sum(
+        1
+        for item in st.session_state.get("inbox") or []
+        if isinstance(item, dict) and item.get("image")
+    )
+    return max(0, trip_store.max_images() - used - current)
 
 
 def _remember_region_fix(item_id: str) -> None:
@@ -1863,17 +1959,6 @@ def _render_nav() -> None:
         st.rerun()
 
 
-def _render_copy_link(key: str, *, label: str = "") -> None:
-    _COPY(url=_share_url(), label=label, key=key)
-
-
-def _render_invite() -> None:
-    _render_copy_link(
-        "copy_invite_link",
-        label="邀請朋友一起收集",
-    )
-
-
 def _data_uri(image: bytes) -> str:
     if image[:8] == b"\x89PNG\r\n\x1a\n":
         mime = "image/png"
@@ -2057,11 +2142,16 @@ def _ingest_collect_inputs() -> None:
             st.warning(f"「{getattr(file, 'name', '圖片')}」讀不到，已略過。")
             continue
         fresh.append(image)
-    batch = len(fresh) > 1
     if fresh:
-        st.session_state.inbox = list(st.session_state.inbox) + [
-            _new_item(image, "", batch=batch) for image in fresh
-        ]
+        room = _image_room()
+        if len(fresh) > room:
+            st.warning(trip_store.images_cap_message() + "今次未能再加入。")
+            fresh = fresh[:room]
+        if fresh:
+            batch = len(fresh) > 1
+            st.session_state.inbox = list(st.session_state.inbox) + [
+                _new_item(image, "", batch=batch) for image in fresh
+            ]
     st.session_state.seen_upload_ids = seen_uploads
 
     pasted = _PASTE(key=f"inbox_paste_{st.session_state.batch}", default=None)
@@ -2071,7 +2161,10 @@ def _ingest_collect_inputs() -> None:
         seen = set(st.session_state.seen_paste_ids)
         seen.add(paste_id)
         st.session_state.seen_paste_ids = seen
-        st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark, batch=False)]
+        if _image_room() <= 0:
+            st.warning(trip_store.images_cap_message() + "今次未能再加入。")
+        else:
+            st.session_state.inbox = list(st.session_state.inbox) + [_new_item(image, remark, batch=False)]
 
 
 def _card_columns():
@@ -2391,7 +2484,6 @@ def _render_collection() -> None:
         '<p class="helper">這裡只有你（和朋友）收藏的地點，排行程時會用這些。</p>',
         unsafe_allow_html=True,
     )
-    _render_invite()
     favs = list(st.session_state.get("favourites") or [])
     _render_manual_adder("collection")
     if not favs:
@@ -2806,12 +2898,9 @@ def _render_results() -> None:
             st.caption("這一天未有安排。")
         else:
             _render_timeline(visible)
-    st.markdown("**分享行程**")
     maps_url = _google_trip_url(visible)
     if maps_url:
         st.link_button("喺 Google 睇行程", maps_url, type="primary", use_container_width=True)
-    _render_copy_link("copy_result_link")
-    st.caption("連結可供朋友瀏覽；編輯權限與收藏收件匣分開。")
 
 
 def _render_opening() -> None:
@@ -2820,15 +2909,8 @@ def _render_opening() -> None:
     steps = "\n".join(f"{index}. {label}" for index, label in enumerate(OPENING_STEPS, start=1))
     st.markdown(steps)
     st.text_input("你的顯示名", key="display_name")
-    members = "、".join(st.session_state.get("members") or []) or _viewer_name()
-    st.caption(f"目前一起修改：{members}")
     if st.button("開始收集想去的地方", type="primary", key="start_collect"):
         _go("B")
-    if st.button("先複製邀請連結", key="open_invite"):
-        st.session_state.show_invite = not st.session_state.get("show_invite")
-        st.rerun()
-    if st.session_state.get("show_invite"):
-        _render_invite()
 
 
 init_state()
@@ -2837,6 +2919,7 @@ _load_shared_trip()
 _publish_favourites()
 
 _render_nav()
+_render_trip_switcher()
 _MOBILE(key="mobile_fix")
 _render_notice()
 screen = st.session_state.get("screen") or "A"
@@ -2865,6 +2948,6 @@ st.divider()
 st.caption(
     f"原型版本 | 今次還可使用 {remaining_quota()}/{MAX_ANALYSES} 次 | build: {_build_sha()}"
 )
-# 開始分析喺 fragment 入面先寫完第二張卡。儲存前再收一次，避免分享檔留低兩個 kchiara。
+# 開始分析喺 fragment 入面先寫完第二張卡。儲存前再收一次，避免行程留低兩個 kchiara。
 _publish_favourites()
 _persist_shared_trip()

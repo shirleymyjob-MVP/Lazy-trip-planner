@@ -283,7 +283,16 @@ def _block_store(monkeypatch, tmp_path):
     def fail(*_args, **_kwargs):
         raise AssertionError("trip store used before login")
 
-    for name in ("new_token", "mtime", "load_trip", "save_trip", "store_dir"):
+    for name in (
+        "list_trips",
+        "create_trip",
+        "load_trip",
+        "save_trip",
+        "delete_trip",
+        "delete_image",
+        "delete_image_path",
+        "count_images",
+    ):
         monkeypatch.setattr(trip_store, name, fail)
 
 

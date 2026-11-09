@@ -19,6 +19,7 @@ import pytest
 import auth_gate  # noqa: E402
 import gemini_client  # noqa: E402
 import trip_core  # noqa: E402
+import trip_store  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -385,27 +386,33 @@ def test_plan_failure_does_not_spend_a_turn():
     assert at.session_state["itinerary"] is None
 
 
-def test_shared_inbox_keeps_who_added_the_screenshot():
-    token = "ab" * 6
+def test_same_member_reloads_screenshot_and_share_query_is_ignored():
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
-    at.query_params["share"] = token
+    at.query_params["share"] = "abc123def456"
     at.session_state["display_name"] = "Ada"
     at.session_state["screen"] = "B"
     at.run()
+    assert at.query_params.get("share") == "abc123def456"
+    assert "share_token" not in at.session_state
     with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("no analyze")):
         at.file_uploader[0].upload("shared.png", _png("red"), "image/png").run()
     assert at.session_state["inbox"][0]["added_by"] == "Ada"
+    image = at.session_state["inbox"][0]["image"]
+    assert image
     assert "尚未分析" in _page(at)
     other = AppTest.from_file(APP, default_timeout=30)
     other.secrets["GEMINI_API_KEY"] = "fake"
-    other.query_params["share"] = token
+    other.query_params["share"] = "abc123def456"
     other.session_state["display_name"] = "Bo"
     other.session_state["screen"] = "B"
     other.run()
     assert not other.exception
+    assert other.query_params.get("share") == "abc123def456"
     assert other.session_state["inbox"][0]["added_by"] == "Ada"
+    assert other.session_state["inbox"][0]["image"] == image
     assert "加入：Ada" in _page(other)
+    assert "test-service-role-key" not in _page(other)
 
 
 def test_collect_page_has_helper_and_no_clipboard_button():
@@ -422,7 +429,9 @@ def test_collect_page_has_helper_and_no_clipboard_button():
     assert at.file_uploader[0].label == "從相簿或相機加入"
     assert "相簿或相機" in (at.file_uploader[0].help or "")
     source = open(APP, encoding="utf-8").read()
-    assert 'label="邀請朋友一起收集"' in source
+    assert 'label="邀請朋友一起收集"' not in source
+    assert "先複製邀請連結" not in source
+    assert 'st.query_params["share"]' not in source
     assert "朋友打開後可加入同一收藏清單" not in source
     assert 'content: "從相簿或相機加入"' in source
     assert "stFileUploaderDropzoneInstructions" in source
@@ -1092,9 +1101,8 @@ def test_unrelated_buttons_do_not_open_the_zoom_dialog():
     at.run()
     assert not at.exception
     assert not any(button.label == "關閉" for button in at.button)
+    assert not any(button.label == "先複製邀請連結" for button in at.button)
 
-    _button(at, "先複製邀請連結").click().run()
-    assert not any(button.label == "關閉" for button in at.button)
     _button(at, "開始收集想去的地方").click().run()
     assert at.session_state["screen"] == "B"
     assert not any(button.label == "關閉" for button in at.button)
@@ -1376,3 +1384,147 @@ def test_ai_toggle_stays_visible_and_nearby_suggestions_are_verified():
     assert not empty.exception
     assert "市中心打卡熱點" not in _page(empty)
     assert trip_core.NEARBY_UNVERIFIED_NOTE in _page(empty)
+
+
+def _joined(blocks) -> str:
+    return "\n".join(block.value for block in blocks)
+
+
+def test_share_query_does_not_open_another_members_trip(monkeypatch, memory_supabase):
+    holder = {"sub": "user-a"}
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: holder["sub"])
+    created = trip_store.create_trip()
+    item_id = "ab" * 16
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "title": "甲的行程",
+        "inbox": [{
+            "id": item_id,
+            "label": "截圖 1",
+            "remark": "",
+            "status": "未排程",
+            "analysis": "done",
+            "places": [{"name": "秘密拉麵", "name_zh": "秘密拉麵"}],
+            "added_by": "Ada",
+            "image": b"\xff\xd8secret",
+        }],
+        "favourites": [],
+        "itinerary": None,
+    })
+    holder["sub"] = "user-b"
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.query_params["share"] = "abc123def456"
+    at.session_state["trip_id"] = created["id"]
+    at.session_state["screen"] = "B"
+    at.run()
+    assert not at.exception
+    assert "秘密拉麵" not in _page(at)
+    assert at.session_state.get("trip_id") != created["id"]
+    assert at.query_params.get("share") == "abc123def456"
+    assert "share_token" not in at.session_state
+    path = f"user-a/{created['id']}/{item_id}.jpg"
+    assert memory_supabase.objects[path] == b"\xff\xd8secret"
+    holder["sub"] = "user-a"
+    loaded = trip_store.load_trip(created["id"])
+    assert loaded["inbox"][0]["places"][0]["name"] == "秘密拉麵"
+
+
+def test_trip_switcher_stops_at_the_configured_cap(monkeypatch):
+    monkeypatch.setenv("MAX_TRIPS_PER_USER", "2")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    assert not at.exception
+    assert any("行程 1" in button.label for button in at.button)
+    _button(at, "新增行程").click().run()
+    assert not at.exception
+    labels = [button.label for button in at.button]
+    assert any(label == "行程 1" or label.startswith("行程 1") for label in labels)
+    assert any("行程 2" in label for label in labels)
+    assert "新增行程" not in labels
+    assert "每位會員最多可儲存 2 個行程" in _page(at)
+
+
+def test_image_cap_stops_extra_uploads(monkeypatch):
+    monkeypatch.setenv("MAX_IMAGES_PER_USER", "1")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "B"
+    at.run()
+    uploader = at.file_uploader[0]
+    uploader.upload("a.png", _png("red"), "image/png")
+    uploader.upload("b.png", _png("blue"), "image/png").run()
+    assert not at.exception
+    assert len(at.session_state["inbox"]) == 1
+    assert "每位會員最多可儲存 1 張圖片" in _joined(at.warning)
+
+
+def test_missing_supabase_config_stops_without_local_fallback(monkeypatch, memory_supabase, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.setattr(trip_store, "_lookup_secret", lambda _path: None)
+    calls = {"n": 0}
+
+    def boom():
+        calls["n"] += 1
+        raise AssertionError("should not connect")
+
+    monkeypatch.setattr(trip_store, "_connect", boom)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.query_params["share"] = "abc123def456"
+    at.run()
+    assert not at.exception
+    text = _joined(at.error)
+    assert "行程儲存未設定好" in text
+    assert "test-service-role-key" not in text
+    assert "abc123def456" not in text
+    labels = [button.label for button in at.button]
+    assert "開始收集想去的地方" not in labels
+    assert calls["n"] == 0
+    assert memory_supabase.rows == []
+    assert memory_supabase.uploads == []
+    assert not (tmp_path / "data").exists()
+
+
+def test_supabase_secrets_are_enough_and_stay_off_the_page(monkeypatch):
+    monkeypatch.delenv("SUPABASE_URL", raising=False)
+    monkeypatch.delenv("SUPABASE_SERVICE_ROLE_KEY", raising=False)
+    monkeypatch.delenv("MAX_TRIPS_PER_USER", raising=False)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.secrets["supabase"] = {
+        "url": "https://from-secrets.supabase.co",
+        "service_role_key": "secret-value-from-secrets",
+    }
+    at.secrets["limits"] = {"max_trips_per_user": 1, "max_images_per_user": 1}
+    at.run()
+    assert not at.exception
+    assert "行程儲存未設定好" not in _joined(at.error)
+    assert any("行程 1" in button.label for button in at.button)
+    assert not any(button.label == "新增行程" for button in at.button)
+    blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption))
+    assert "secret-value-from-secrets" not in blob
+    assert "test-service-role-key" not in blob
+
+
+def test_connection_failure_refuses_without_leaking_or_local_files(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+
+    def boom():
+        raise RuntimeError("connect apikey=super-secret-token https://db.internal")
+
+    monkeypatch.setattr(trip_store, "_connect", boom)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.query_params["share"] = "abc123def456"
+    at.run()
+    assert not at.exception
+    text = _joined(at.error)
+    assert "暫時連不到行程儲存" in text
+    assert "super-secret-token" not in text
+    assert "db.internal" not in text
+    assert "開始收集想去的地方" not in [button.label for button in at.button]
+    assert not (tmp_path / "data").exists()

@@ -4,3 +4,5 @@ Pillow==13.0.0
 # st.login requires Authlib>=1.3.2; the Starlette OIDC client also imports httpx.
 Authlib==1.9.2
 httpx==0.28.1
+# Server-side Supabase client. The service role key stays in Streamlit secrets.
+supabase==2.34.1

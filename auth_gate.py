@@ -113,10 +113,7 @@ def _render_login() -> None:
         on_click=_do_login,
         use_container_width=True,
     )
-    st.caption(
-        "如果登入被取消或失敗，會回到呢版，再試一次就得。"
-        "分享連結要登入之後先再開一次：登入過程會返回首頁，分享碼未必留到。"
-    )
+    st.caption("如果登入被取消或失敗，會回到呢版，再試一次就得。")
     _halt()
 
 
