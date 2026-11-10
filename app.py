@@ -8,6 +8,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import json
 import importlib
 import logging
 import os
@@ -132,7 +133,13 @@ _REQUIRED_LOCAL_ATTRS = {
     ),
     "trip_store": (
         "INVITE_DAYS",
+        "MSG_CONFIG",
         "MSG_CONFLICT",
+        "MSG_CONTENT",
+        "MSG_DENIED",
+        "MSG_NOT_IMAGE",
+        "MSG_TOO_BIG",
+        "MSG_UNAVAILABLE",
         "TripConflictError",
         "TripStoreError",
         "accept_invite",
@@ -1322,6 +1329,87 @@ def _unsaved_local_changes() -> bool:
         return True
 
 
+def _classify_save_error(err: BaseException | None) -> str:
+    """只按例外類型、reason 同固定訊息分類。對唔上就係 SAVE-UNKNOWN，唔當衝突。"""
+    if isinstance(err, trip_store.TripConflictError):
+        return "SAVE-CONFLICT"
+    reason = getattr(err, "reason", None)
+    if reason == "update0":
+        return "SAVE-UPDATE0"
+    if reason == "content":
+        return "SAVE-CONTENT"
+    if reason == "denied":
+        return "SAVE-DENIED"
+    if reason == "unavailable":
+        return "SAVE-NET"
+    text = str(err or "")
+    if text in {
+        trip_store.MSG_CONTENT,
+        trip_store.MSG_NOT_IMAGE,
+        trip_store.MSG_TOO_BIG,
+        trip_store.images_cap_message(),
+    }:
+        return "SAVE-CONTENT"
+    if text == trip_store.MSG_DENIED:
+        return "SAVE-DENIED"
+    if text in {trip_store.MSG_UNAVAILABLE, trip_store.MSG_CONFIG}:
+        return "SAVE-NET"
+    return "SAVE-UNKNOWN"
+
+
+def _trip_log_hash(trip_id: str) -> str:
+    if not trip_id:
+        return ""
+    return hashlib.sha256(str(trip_id).encode("utf-8")).hexdigest()[:8]
+
+
+def _snapshot_byte_size(snapshot: dict | None) -> int | None:
+    if not isinstance(snapshot, dict):
+        return None
+    try:
+        encoded = json.dumps(
+            snapshot,
+            ensure_ascii=False,
+            default=lambda obj: f"<{type(obj).__name__}>",
+        )
+        return len(encoded.encode("utf-8"))
+    except Exception:
+        return None
+
+
+def _note_save_failure(code: str, err: BaseException | None = None, *, trip_id: str = "", payload_bytes: int | None = None) -> None:
+    if code not in _SAVE_HINTS:
+        code = "SAVE-UNKNOWN"
+    st.session_state.save_failure_code = code
+    expected = getattr(err, "expected_version", None) if err is not None else None
+    remote = getattr(err, "remote_version", None) if err is not None else None
+    if payload_bytes is None and err is not None:
+        payload_bytes = getattr(err, "payload_bytes", None)
+    logger.warning(
+        "save_failed code=%s exc=%s expected_version=%s remote_version=%s payload_bytes=%s trip_hash=%s",
+        code,
+        type(err).__name__ if err is not None else "",
+        "" if expected is None else expected,
+        "" if remote is None else remote,
+        "" if payload_bytes is None else payload_bytes,
+        _trip_log_hash(trip_id),
+    )
+
+
+def _clear_save_failure() -> None:
+    st.session_state.save_failure_code = ""
+
+
+def _render_itinerary_unsaved() -> None:
+    if not (st.session_state.get("itinerary_unsaved") and st.session_state.get("itinerary")):
+        return
+    code = st.session_state.get("save_failure_code") or "SAVE-UNKNOWN"
+    if code not in _SAVE_HINTS:
+        code = "SAVE-UNKNOWN"
+    st.error(f"{_ITINERARY_UNSAVED_LEAD}（{code}）")
+    st.caption(_SAVE_HINTS[code])
+
+
 def _hold_remote_conflict() -> None:
     st.session_state.trip_conflict = True
     _remember_storage_error(trip_store.MSG_CONFLICT)
@@ -1365,10 +1453,17 @@ def _sync_remote_content(loaded: dict, remote_stamp: object, *, same: bool, forc
     _note_seen(loaded, remote_stamp)
 
 
-_ITINERARY_UNSAVED = (
-    "AI 行程已生成，但尚未儲存：呢份行程可能已喺另一個分頁、工作階段或成員度更新。"
-    "重新整理或重新載入會失去呢份未儲存嘅行程。"
-)
+_ITINERARY_UNSAVED_LEAD = "AI 行程已生成，但尚未儲存。"
+_SAVE_HINTS = {
+    "SAVE-CONFLICT": "另一個分頁、工作階段或成員已更新呢份行程，今次未寫入。重新整理或重新載入會失去呢份未儲存嘅行程。",
+    "SAVE-ALREADY": "已經有未解決的版本衝突，今次未再寫入。",
+    "SAVE-CONTENT": "行程內容格式有問題，未能寫入。",
+    "SAVE-DENIED": "沒有權限或讀不到這份行程，未能寫入。",
+    "SAVE-UPDATE0": "資料庫沒有更新到任何列，但版本沒有變，未能寫入。",
+    "SAVE-NET": "連線、逾時或伺服器錯誤，未能寫入。",
+    "SAVE-STATE": "行程尚未準備好（沒有行程編號或儲存進行中），未能寫入。",
+    "SAVE-UNKNOWN": "原因未能確定，未能寫入。",
+}
 _CONFLICT_BANNER = (
     "呢份行程可能已喺另一個分頁、工作階段或成員度更新。你未儲存嘅更改未寫入。"
 )
@@ -1684,22 +1779,41 @@ def _remember_saved_version(snapshot: dict, stamp: str) -> None:
     st.session_state.trip_conflict = False
 
 
+def _fail_persist(code: str, err: BaseException | None, trip_id: str, snapshot: dict | None) -> bool:
+    if code == "SAVE-CONFLICT":
+        _hold_remote_conflict()
+    elif err is not None and not st.session_state.get("trip_conflict"):
+        _remember_storage_error(str(err))
+    elif code == "SAVE-ALREADY":
+        _remember_storage_error(trip_store.MSG_CONFLICT)
+    _note_save_failure(
+        code,
+        err,
+        trip_id=trip_id,
+        payload_bytes=_snapshot_byte_size(snapshot),
+    )
+    return False
+
+
 def _persist_collection_inbox() -> bool:
     """未有行程時，有內容先寫入收藏匣。登入本身唔會開列。"""
+    trip_id = str(st.session_state.get("trip_id") or "")
     if st.session_state.get("trip_conflict"):
-        _remember_storage_error(trip_store.MSG_CONFLICT)
-        return False
+        return _fail_persist("SAVE-ALREADY", None, trip_id, None)
     has_inbox = bool(st.session_state.get("collection_inbox_id"))
     if not _session_has_trip_content() and not has_inbox:
         return True
     if st.session_state.get("_inbox_save_inflight"):
-        return False
+        return _fail_persist("SAVE-STATE", None, trip_id, None)
     st.session_state._inbox_save_inflight = True
+    snapshot: dict | None = None
     try:
         snapshot = _snapshot()
         current = trip_store.digest(snapshot)
         if current == st.session_state.get("last_digest") and has_inbox:
             _clear_storage_error()
+            st.session_state.itinerary_unsaved = False
+            _clear_save_failure()
             return True
         stamp = trip_store.save_collection_inbox(snapshot)
         _remember_saved_version(snapshot, stamp)
@@ -1707,13 +1821,11 @@ def _persist_collection_inbox() -> bool:
         st.session_state.loaded_inbox_id = st.session_state.collection_inbox_id
         st.session_state.last_digest = current
         _clear_storage_error(force=True)
+        st.session_state.itinerary_unsaved = False
+        _clear_save_failure()
         return True
-    except trip_store.TripConflictError:
-        _hold_remote_conflict()
-        return False
     except trip_store.TripStoreError as err:
-        _remember_storage_error(str(err))
-        return False
+        return _fail_persist(_classify_save_error(err), err, trip_id, snapshot)
     finally:
         st.session_state._inbox_save_inflight = False
 
@@ -1723,35 +1835,32 @@ def _persist_shared_trip() -> bool:
 
     未有行程時改寫收藏匣。寫入失敗唔當成功。版本衝突唔會覆蓋遠端。
     """
-    if st.session_state.get("trip_conflict"):
-        _remember_storage_error(trip_store.MSG_CONFLICT)
-        return False
     trip_id = str(st.session_state.get("trip_id") or "")
+    if st.session_state.get("trip_conflict"):
+        return _fail_persist("SAVE-ALREADY", None, trip_id, None)
     if not trip_id:
         return _persist_collection_inbox()
+    snapshot: dict | None = None
     try:
         snapshot = _snapshot()
         current = trip_store.digest(snapshot)
     except trip_store.TripStoreError as err:
-        _remember_storage_error(str(err))
-        return False
+        return _fail_persist(_classify_save_error(err), err, trip_id, snapshot)
     if current == st.session_state.get("last_digest"):
         _clear_storage_error()
         st.session_state.itinerary_unsaved = False
+        _clear_save_failure()
         return True
     try:
         stamp = trip_store.save_trip(snapshot)
-    except trip_store.TripConflictError:
-        _hold_remote_conflict()
-        return False
     except trip_store.TripStoreError as err:
-        _remember_storage_error(str(err))
-        return False
+        return _fail_persist(_classify_save_error(err), err, trip_id, snapshot)
     _remember_saved_version(snapshot, stamp)
     st.session_state.last_digest = current
     st.session_state.loaded_trip_id = trip_id
     _clear_storage_error(force=True)
     st.session_state.itinerary_unsaved = False
+    _clear_save_failure()
     return True
 
 
@@ -3654,8 +3763,7 @@ def _render_collection() -> None:
 
 def _render_plan() -> None:
     st.subheader("一鍵排行程")
-    if st.session_state.get("itinerary_unsaved") and st.session_state.get("itinerary"):
-        st.error(_ITINERARY_UNSAVED)
+    _render_itinerary_unsaved()
     favs = list(st.session_state.get("favourites") or [])
     st.markdown("**選擇目的地／地區**")
     choice = _bound_selectbox(
@@ -3808,7 +3916,7 @@ def _render_plan() -> None:
     elif st.session_state.get("screen") == "E":
         st.rerun()
     elif st.session_state.get("itinerary_unsaved"):
-        st.error(_ITINERARY_UNSAVED)
+        _render_itinerary_unsaved()
 
 
 def _suggested_seeds(itinerary: dict, known_places: list[dict]) -> list[dict]:
@@ -4037,8 +4145,7 @@ def _isolate_cloned_days(days: list[dict]) -> list[dict]:
 
 
 def _render_results() -> None:
-    if st.session_state.get("itinerary_unsaved") and st.session_state.get("itinerary"):
-        st.error(_ITINERARY_UNSAVED)
+    _render_itinerary_unsaved()
     itinerary = st.session_state.get("itinerary")
     style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
     if not itinerary:

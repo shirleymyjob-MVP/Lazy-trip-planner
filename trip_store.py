@@ -73,11 +73,36 @@ _ITEM_FIELDS = (
 
 
 class TripStoreError(Exception):
-    """可以顯示俾用家嘅繁體中文訊息。唔包含密鑰、路徑或對方帳戶資料。"""
+    """可以顯示俾用家嘅繁體中文訊息。唔包含密鑰、路徑或對方帳戶資料。
+
+    ``reason`` 只係診斷代碼用，唔改變幾時拋錯、訊息文字，或者會唔會寫入。
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *args,
+        reason: str | None = None,
+        expected_version: object = None,
+        remote_version: object = None,
+        payload_bytes: object = None,
+    ):
+        if args:
+            super().__init__(message, *args)
+        else:
+            super().__init__(message)
+        self.reason = reason
+        self.expected_version = expected_version
+        self.remote_version = remote_version
+        self.payload_bytes = payload_bytes
 
 
 class TripConflictError(TripStoreError):
     """讀取之後行程版本已經變咗。拒絕覆蓋，唔好靜默寫入。"""
+
+    def __init__(self, message: str = "", *args, **kwargs):
+        kwargs.setdefault("reason", "conflict")
+        super().__init__(message, *args, **kwargs)
 
 
 def max_trips() -> int:
@@ -514,7 +539,11 @@ def _write_snapshot(
         raise TripStoreError(MSG_CONTENT)
     current_version = _require_version(row)
     if current_version != parsed_version:
-        raise TripConflictError(MSG_CONFLICT)
+        raise TripConflictError(
+            MSG_CONFLICT,
+            expected_version=parsed_version,
+            remote_version=current_version,
+        )
     previous = copy.deepcopy(_payload_dict(row))
     inbox_out, new_images = _stage_items(snapshot)
     stored_ids = _image_ids(previous)
@@ -1838,10 +1867,19 @@ def _update_owned(owner: str, trip_id: str, payload: dict, expected_version: int
             raise TripStoreError(MSG_DENIED)
         current = _coerce_version(owned[0].get("version"))
         if current is None:
-            raise TripStoreError(MSG_UNAVAILABLE)
+            raise TripStoreError(MSG_UNAVAILABLE, reason="unavailable")
         if current != parsed:
-            raise TripConflictError(MSG_CONFLICT)
-        raise TripStoreError(MSG_UNAVAILABLE)
+            raise TripConflictError(
+                MSG_CONFLICT,
+                expected_version=parsed,
+                remote_version=current,
+            )
+        raise TripStoreError(
+            MSG_UNAVAILABLE,
+            reason="update0",
+            expected_version=parsed,
+            remote_version=current,
+        )
 
     return _call("update", run)
 
@@ -1943,7 +1981,7 @@ def _call(action: str, fn: Callable[[Any], Any]) -> Any:
         raise
     except Exception as exc:
         logger.warning("Supabase %s failed (%s)", action, type(exc).__name__)
-        raise TripStoreError(MSG_UNAVAILABLE) from None
+        raise TripStoreError(MSG_UNAVAILABLE, reason="unavailable") from None
 
 
 def _client() -> Any:
@@ -1954,7 +1992,7 @@ def _client() -> Any:
         raise
     except Exception as exc:
         logger.warning("Supabase connect failed (%s)", type(exc).__name__)
-        raise TripStoreError(MSG_UNAVAILABLE) from None
+        raise TripStoreError(MSG_UNAVAILABLE, reason="unavailable") from None
 
 
 def _connect() -> Any:

@@ -801,6 +801,94 @@ def test_rows_without_kind_remain_normal_trips(use_sub, memory_supabase):
     assert memory_supabase.rows[0]["updated_at"] == updated
 
 
+def test_zero_row_update_with_same_version_is_update0_not_conflict(monkeypatch):
+    owner = "user-a"
+    trip_id = "11111111-1111-4111-8111-111111111111"
+    row = {"id": trip_id, "owner_sub": owner, "version": 4, "payload": {"title": "保留"}}
+
+    class _Query:
+        def __init__(self):
+            self.op = ""
+
+        def update(self, _patch):
+            self.op = "update"
+            return self
+
+        def select(self, *_args):
+            self.op = "select"
+            return self
+
+        def eq(self, _key, _value):
+            return self
+
+        def limit(self, _count):
+            return self
+
+        def execute(self):
+            if self.op == "update":
+                return _Resp([])
+            return _Resp([row])
+
+    class _Client:
+        def table(self, _name):
+            return _Query()
+
+    monkeypatch.setattr(trip_store, "_call", lambda _action, fn: fn(_Client()))
+    with pytest.raises(trip_store.TripStoreError) as caught:
+        trip_store._update_owned(owner, trip_id, {"title": "唔好寫"}, 4)
+    err = caught.value
+    assert not isinstance(err, trip_store.TripConflictError)
+    assert err.reason == "update0"
+    assert str(err) == trip_store.MSG_UNAVAILABLE
+    assert err.expected_version == 4
+    assert err.remote_version == 4
+    assert row["version"] == 4
+    assert row["payload"]["title"] == "保留"
+
+
+def test_zero_row_update_with_newer_version_stays_a_conflict(monkeypatch):
+    owner = "user-a"
+    trip_id = "22222222-2222-4222-8222-222222222222"
+    row = {"id": trip_id, "owner_sub": owner, "version": 6, "payload": {"title": "對方"}}
+
+    class _Query:
+        def __init__(self):
+            self.op = ""
+
+        def update(self, _patch):
+            self.op = "update"
+            return self
+
+        def select(self, *_args):
+            self.op = "select"
+            return self
+
+        def eq(self, _key, _value):
+            return self
+
+        def limit(self, _count):
+            return self
+
+        def execute(self):
+            if self.op == "update":
+                return _Resp([])
+            return _Resp([row])
+
+    class _Client:
+        def table(self, _name):
+            return _Query()
+
+    monkeypatch.setattr(trip_store, "_call", lambda _action, fn: fn(_Client()))
+    with pytest.raises(trip_store.TripConflictError) as caught:
+        trip_store._update_owned(owner, trip_id, {"title": "唔好寫"}, 4)
+    err = caught.value
+    assert err.args[0] == trip_store.MSG_CONFLICT
+    assert err.reason == "conflict"
+    assert err.expected_version == 4
+    assert err.remote_version == 6
+    assert row["payload"]["title"] == "對方"
+
+
 def test_store_and_app_do_not_embed_a_service_role_or_local_share_store():
     store = Path(trip_store.__file__).read_text(encoding="utf-8")
     app = Path(trip_store.__file__).resolve().parent.joinpath("app.py").read_text(encoding="utf-8")
