@@ -14,6 +14,9 @@ from streamlit.testing.v1 import AppTest
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
 APP = os.path.join(ROOT, "app.py")
+_CONFLICT_BANNER = "呢份行程可能已喺另一個分頁、工作階段或成員度更新。你未儲存嘅更改未寫入。"
+_CONFLICT_RELOAD_NOTE = "撳「重新載入已儲存的行程」會放棄呢度未儲存嘅更改，改為顯示已儲存的版本。"
+_TOKYO = "東京（國泰、香港快運直飛）"
 
 import pytest
 
@@ -2045,7 +2048,7 @@ def test_remote_edit_keeps_unsaved_local_until_reload(monkeypatch, memory_supaba
     assert not at.exception
     assert at.session_state["trip_title"] == "我未儲存"
     assert at.session_state["inbox"][0]["image"] == image
-    assert trip_store.MSG_CONFLICT in _joined(at.error)
+    assert _CONFLICT_BANNER in _joined(at.error)
     assert any(button.label == "重新載入已儲存的行程" for button in at.button)
     assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
     assert memory_supabase.objects[f"user-a/{created['id']}/{item_id}.jpg"] == image
@@ -2188,10 +2191,10 @@ def test_conflict_alert_stays_on_every_screen(monkeypatch, memory_supabase):
     at.session_state["trip_title"] = "我未儲存"
     at.session_state["last_digest"] = "local-dirty"
     at.run()
-    assert trip_store.MSG_CONFLICT in _joined(at.error)
+    assert _CONFLICT_BANNER in _joined(at.error)
     for label in ("首頁", "收集", "排程", "行程", "旅行夾"):
         _open_screen(at, label)
-        assert trip_store.MSG_CONFLICT in _joined(at.error)
+        assert _CONFLICT_BANNER in _joined(at.error)
         assert at.session_state["trip_title"] == "我未儲存"
     assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
 
@@ -2433,3 +2436,169 @@ def test_opening_private_inbox_still_goes_to_collect(monkeypatch, memory_supabas
     assert _nav(at).value == "收集"
     assert at.session_state.get("view_inbox") is True
     assert "我的私人收藏" not in _page(at)
+
+
+def _destination_box(at: AppTest):
+    found = [box for box in at.selectbox if "選擇目的地" in box.label]
+    assert found, [box.label for box in at.selectbox]
+    return found[0]
+
+
+def _ready_plan(at: AppTest, favs: list[dict] | None = None) -> AppTest:
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["screen"] = "D"
+    at.session_state["favourites"] = list(favs) if favs is not None else [_fav()]
+    at.session_state["start_date"] = date(2026, 11, 14)
+    at.session_state["allow_ai"] = True
+    at.run()
+    assert not at.exception
+    return at
+
+
+def _fake_itinerary() -> dict:
+    return {"title": "測試行程", "days": [{"day": 1, "area": "", "theme": "", "items": []}], "tips": []}
+
+
+def test_plan_destination_choice_is_what_the_itinerary_receives():
+    at = _ready_plan(AppTest.from_file(APP, default_timeout=30))
+    assert "選擇目的地／地區" in _page(at)
+    assert "自動判斷：福岡" in _page(at)
+    assert _destination_box(at).value == trip_core.DESTINATION_DEFAULT
+    _destination_box(at).set_value(_TOKYO).run()
+    assert at.session_state["destination_choice"] == _TOKYO
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=_fake_itinerary()) as gen:
+        _button(at, "開始排行程").click().run()
+    assert gen.call_args.args[4] == "東京"
+
+    other = _ready_plan(AppTest.from_file(APP, default_timeout=30))
+    _destination_box(other).set_value(trip_core.DESTINATION_OTHER).run()
+    [box for box in other.text_input if box.label == "其他目的地"][0].input("首爾").run()
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=_fake_itinerary()) as gen:
+        _button(other, "開始排行程").click().run()
+    assert gen.call_args.args[4] == "首爾"
+
+
+def test_explicit_destination_survives_every_screen_and_is_saved():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _open_screen(at, "排程")
+    _destination_box(at).set_value(_TOKYO).run()
+    for label in _SCREENS:
+        _open_screen(at, label)
+        at.run()
+    assert at.session_state["destination_choice"] == _TOKYO
+    loaded = trip_store.load_trip(at.session_state["trip_id"])
+    assert loaded["destination_choice"] == _TOKYO
+    assert loaded["destination_choice"] != trip_core.DESTINATION_DEFAULT
+    _open_screen(at, "排程")
+    assert _destination_box(at).value == _TOKYO
+
+
+def test_switching_trips_restores_each_saved_destination():
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _open_screen(at, "排程")
+    _destination_box(at).set_value(_TOKYO).run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _open_screen(at, "排程")
+    assert _destination_box(at).value == trip_core.DESTINATION_DEFAULT
+    _open_screen(at, "旅行夾")
+    _button(at, "行程 1").click().run()
+    _open_screen(at, "排程")
+    assert at.session_state["destination_choice"] == _TOKYO
+    assert _destination_box(at).value == _TOKYO
+
+
+def test_old_payload_without_a_destination_stays_on_auto(monkeypatch):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    created = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "version": created["version"],
+        "title": "舊行程",
+        "inbox": [],
+        "favourites": [_fav()],
+        "itinerary": None,
+    })
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["trip_id"] = created["id"]
+    at.session_state["screen"] = "D"
+    at.session_state["start_date"] = date(2026, 11, 14)
+    at.run()
+    assert _destination_box(at).value == trip_core.DESTINATION_DEFAULT
+    assert "自動判斷：福岡" in _page(at)
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=_fake_itinerary()) as gen:
+        _button(at, "開始排行程").click().run()
+    assert gen.call_args.args[4] == "福岡"
+
+    stored = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": stored["id"],
+        "version": stored["version"],
+        "title": "寫明預設",
+        "destination_choice": trip_core.DESTINATION_DEFAULT,
+        "inbox": [],
+        "favourites": [_fav()],
+        "itinerary": None,
+    })
+    again = AppTest.from_file(APP, default_timeout=30)
+    again.secrets["GEMINI_API_KEY"] = "fake"
+    again.session_state["trip_id"] = stored["id"]
+    again.session_state["screen"] = "D"
+    again.session_state["start_date"] = date(2026, 11, 14)
+    again.run()
+    assert again.session_state["destination_choice"] == trip_core.DESTINATION_DEFAULT
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=_fake_itinerary()) as gen:
+        _button(again, "開始排行程").click().run()
+    assert gen.call_args.args[4] == "福岡"
+
+
+def test_second_session_edit_shows_the_new_banner_and_is_not_saved(monkeypatch):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    first = AppTest.from_file(APP, default_timeout=30)
+    first.secrets["GEMINI_API_KEY"] = "fake"
+    first.run()
+    _open_screen(first, "旅行夾")
+    _button(first, "建立新旅行夾").click().run()
+    trip_id = first.session_state["trip_id"]
+    _open_screen(first, "排程")
+    [box for box in first.number_input if "日數" in box.label][0].set_value(6).run()
+    assert not any(_CONFLICT_BANNER in error.value for error in first.error)
+    other = AppTest.from_file(APP, default_timeout=30)
+    other.secrets["GEMINI_API_KEY"] = "fake"
+    other.session_state["trip_id"] = trip_id
+    other.session_state["screen"] = "D"
+    other.run()
+    [box for box in first.number_input if "日數" in box.label][0].set_value(8).run()
+    [box for box in other.radio if "行程風格" in box.label][0].set_value("Chill 型").run()
+    assert _CONFLICT_BANNER in _joined(other.error)
+    assert _CONFLICT_RELOAD_NOTE in _page(other)
+    assert other.session_state["trip_style"] == "Chill 型"
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded["day_count"] == 8
+    assert loaded["trip_style"] != "Chill 型"
+    [box for box in other.number_input if "日數" in box.label][0].set_value(9).run()
+    assert _CONFLICT_BANNER in _joined(other.error)
+    assert trip_store.load_trip(trip_id)["day_count"] == 8
+    with pytest.raises(trip_store.TripConflictError) as caught:
+        trip_store.save_trip({
+            "trip_id": trip_id,
+            "version": 1,
+            "title": "唔好寫",
+            "inbox": [],
+            "favourites": [],
+            "itinerary": None,
+        })
+    assert caught.value.args[0] == trip_store.MSG_CONFLICT
