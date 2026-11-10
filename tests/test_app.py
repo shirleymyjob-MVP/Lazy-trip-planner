@@ -69,6 +69,20 @@ def _button(at: AppTest, label: str):
     return found[0]
 
 
+def _nav(at: AppTest):
+    found = [pill for pill in at.pills if pill.label == "步驟"]
+    assert found, "找不到步驟 pills"
+    return found[0]
+
+
+def _open_screen(at: AppTest, label: str):
+    nav = _nav(at)
+    if nav.value != label:
+        nav.set_value(label).run()
+    assert not at.exception
+    return at
+
+
 def _select(at: AppTest, label: str):
     return [box for box in at.selectbox if label in box.label][0]
 
@@ -396,7 +410,9 @@ def test_same_member_reloads_screenshot_and_share_query_is_ignored():
     at.run()
     assert at.query_params.get("share") == "abc123def456"
     assert "share_token" not in at.session_state
+    _open_screen(at, "旅行夾")
     _button(at, "建立新旅行夾").click().run()
+    _open_screen(at, "收集")
     with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("no analyze")):
         at.file_uploader[0].upload("shared.png", _png("red"), "image/png").run()
     assert at.session_state["inbox"][0]["added_by"] == "Ada"
@@ -1041,7 +1057,7 @@ def test_nav_is_small_step_chips_not_a_full_width_button():
     assert not at.exception
     nav = [pill for pill in at.pills if pill.label == "步驟"]
     assert nav, "step chips should be st.pills"
-    assert nav[0].options == ["首頁", "收集", "收藏", "排程", "行程"]
+    assert nav[0].options == ["首頁", "旅行夾", "收集", "收藏", "排程", "行程"]
     assert not any(button.label == "開場" for button in at.button)
     nav[0].set_value("收集").run()
     assert at.session_state["screen"] == "B"
@@ -1441,6 +1457,7 @@ def test_trip_switcher_stops_at_the_configured_cap(monkeypatch, memory_supabase)
     at.run()
     assert not at.exception
     assert memory_supabase.inserts == []
+    _open_screen(at, "旅行夾")
     assert "你仲未有行程" in _page(at)
     assert any(button.label == "建立新旅行夾" for button in at.button)
     _button(at, "建立新旅行夾").click().run()
@@ -1515,6 +1532,7 @@ def test_supabase_secrets_are_enough_and_stay_off_the_page(monkeypatch):
     at.run()
     assert not at.exception
     assert "行程儲存未設定好" not in _joined(at.error)
+    _open_screen(at, "旅行夾")
     assert any(button.label == "建立新旅行夾" for button in at.button)
     assert not any("行程 1" in button.label for button in at.button)
     blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption))
@@ -1572,10 +1590,12 @@ def test_new_account_load_does_not_create_a_trip(memory_supabase):
     assert memory_supabase.rows == []
     assert at.session_state.get("trip_id") in ("", None)
     assert list(at.session_state.get("trip_catalog") or []) == []
+    assert "開始收集想去的地方" in [button.label for button in at.button]
+    assert not any(button.label == "建立新旅行夾" for button in at.button)
+    _open_screen(at, "旅行夾")
     assert "你仲未有行程" in _page(at)
     assert any(button.label == "建立新旅行夾" for button in at.button)
     assert not any("行程 1" in button.label for button in at.button)
-    assert "開始收集想去的地方" in [button.label for button in at.button]
     assert not list(at.success)
     assert not _saved_messages(_feedback(at))
 
@@ -1585,6 +1605,7 @@ def test_create_trip_once_stays_one_across_reruns(memory_supabase):
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.run()
     assert memory_supabase.inserts == []
+    _open_screen(at, "旅行夾")
     _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     assert len(memory_supabase.rows) == 1
@@ -1604,6 +1625,7 @@ def test_create_trip_replay_and_reentry_insert_once(monkeypatch, memory_supabase
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.run()
+    _open_screen(at, "旅行夾")
     at.session_state["_skip_next_create"] = True
     _button(at, "建立新旅行夾").click().run()
     assert not at.exception
@@ -1688,11 +1710,13 @@ def test_existing_member_loads_own_trips_unchanged(monkeypatch, memory_supabase)
     assert not at.exception
     assert len(memory_supabase.inserts) == inserts_before
     assert at.session_state["trip_id"] == second["id"]
+    assert "清水寺" in _page(at)
+    assert "秘密拉麵" not in _page(at)
+    assert not any("建立新旅行夾" == button.label for button in at.button)
+    _open_screen(at, "旅行夾")
     labels = [button.label for button in at.button]
     assert any(label.startswith("京都") and "目前" in label for label in labels)
     assert any(label == "大阪" or label.startswith("大阪") for label in labels)
-    assert "清水寺" in _page(at)
-    assert "秘密拉麵" not in _page(at)
     after = {
         row["id"]: json.dumps(row["payload"], ensure_ascii=False, sort_keys=True)
         for row in memory_supabase.rows
@@ -1726,8 +1750,11 @@ def test_collection_inbox_saves_without_a_trip_and_adopt_clears_it(monkeypatch, 
     assert not at.exception
     assert len(_inbox_rows(memory_supabase)) == 1
     assert trip_store.list_trips() == []
-    assert "你仲未有行程" in _page(at)
+    assert "你仲未有行程" not in _page(at)
     assert not any("行程 1" in button.label for button in at.button)
+    _open_screen(at, "旅行夾")
+    assert "你仲未有行程" in _page(at)
+    _open_screen(at, "收集")
     assert _UNSAVED_NOTICE not in _feedback(at)
     assert not list(at.success)
     assert not _saved_messages(_feedback(at))
@@ -1751,6 +1778,7 @@ def test_collection_inbox_saves_without_a_trip_and_adopt_clears_it(monkeypatch, 
     assert _UNSAVED_NOTICE not in _feedback(fresh)
     _button(fresh, "查看我的收藏 →").click().run()
     assert fresh.session_state["screen"] == "C"
+    _open_screen(fresh, "旅行夾")
     _button(fresh, "建立新旅行夾").click().run()
     assert not fresh.exception
     assert _inbox_rows(memory_supabase) == []
@@ -1803,7 +1831,8 @@ def test_inbox_save_failure_is_an_error_not_success(monkeypatch, memory_supabase
     assert at.session_state["inbox"][0]["image"] == b"\xff\xd8pending-photo"
     assert memory_supabase.rows == []
     assert memory_supabase.objects == {}
-    assert "你仲未有行程" in _page(at)
+    assert at.session_state.get("trip_id") in ("", None)
+    assert "你仲未有行程" not in _page(at)
     assert any("我的收藏" in block.value for block in at.subheader)
 
 
@@ -1844,6 +1873,8 @@ def test_cross_user_load_does_not_create_or_leak(monkeypatch, memory_supabase):
     assert [row for row in memory_supabase.rows if row.get("owner_sub") == "user-b"] == []
     assert at.session_state.get("trip_id") in ("", None)
     assert "秘密拉麵" not in _page(at)
+    assert "你仲未有行程" not in _page(at)
+    _open_screen(at, "旅行夾")
     assert "你仲未有行程" in _page(at)
     _button(at, "建立新旅行夾").click().run()
     assert not at.exception
@@ -1898,6 +1929,7 @@ def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypat
     at.run()
     assert not at.exception
     assert at.session_state.get("trip_id") in ("", None)
+    _open_screen(at, "旅行夾")
     _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     trip_id = at.session_state["trip_id"]
@@ -2049,6 +2081,8 @@ def test_invite_opens_shared_workspace_and_dates_persist(monkeypatch, memory_sup
     at.run()
     assert not at.exception
     assert at.session_state["trip_id"] == created["id"]
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
     page = _page(at)
     assert "福岡旅行" in page
     assert "共同旅行" in page
@@ -2076,6 +2110,7 @@ def test_invite_opens_shared_workspace_and_dates_persist(monkeypatch, memory_sup
     owner.session_state["display_name"] = "行程主人"
     owner.run()
     assert not owner.exception
+    _open_screen(owner, "旅行夾")
     _button(owner, "⚙").click().run()
     _button(owner, "邀請朋友").click().run()
     owner_labels = [button.label for button in owner.button]
@@ -2093,3 +2128,308 @@ def test_invite_opens_shared_workspace_and_dates_persist(monkeypatch, memory_sup
     assert loaded["travel_end"] == "2026-03-18"
     assert "4日3夜" in _page(owner)
     assert "owner-sub" not in _page(owner)
+
+
+_SCREENS = ("首頁", "旅行夾", "收集", "收藏", "排程", "行程")
+
+
+def test_folder_block_is_only_on_the_folder_screen_and_alerts_stay(monkeypatch):
+    """旅行夾只出現喺自己嗰頁。邀請失敗同清理警告每一頁都要見到。"""
+    monkeypatch.setattr(trip_store, "has_pending_collection_inbox", lambda: True)
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["invite_error"] = "邀請連結無效、已過期或已撤銷。"
+    at.session_state["inbox_cleanup_warning"] = "新行程已儲存。舊收集匣暫時未清理，唔使再新增。"
+    at.run()
+    assert not at.exception
+    for label in _SCREENS:
+        _open_screen(at, label)
+        page = _page(at)
+        errors = _joined(at.error)
+        warnings = _joined(at.warning)
+        assert "邀請連結無效、已過期或已撤銷。" in errors
+        assert "新行程已儲存。舊收集匣暫時未清理，唔使再新增。" in warnings
+        assert _nav(at).value == label
+        if label == "旅行夾":
+            assert "我的私人收藏" in page
+            assert "共同旅行" in page
+            assert any(button.label == "建立新旅行夾" for button in at.button)
+        else:
+            assert "我的私人收藏" not in page
+            assert "建立新旅行夾" not in [button.label for button in at.button]
+            assert "前往收集" not in [button.label for button in at.button]
+            assert not any(box.label == "行程名稱" for box in at.text_input)
+    assert at.session_state["nav_chip"] == "行程"
+    assert at.session_state["screen"] == "E"
+
+
+def test_conflict_alert_stays_on_every_screen(monkeypatch, memory_supabase):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "user-a")
+    created = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "version": created["version"],
+        "title": "大阪",
+        "inbox": [],
+        "favourites": [],
+        "members": ["旅人"],
+        "itinerary": None,
+    })
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["trip_id"] = created["id"]
+    at.session_state["screen"] = "C"
+    at.run()
+    row = memory_supabase.rows[0]
+    payload = dict(row["payload"])
+    payload["title"] = "遠端已改"
+    row["payload"] = payload
+    row["version"] = int(row["version"]) + 1
+    at.session_state["trip_title"] = "我未儲存"
+    at.session_state["last_digest"] = "local-dirty"
+    at.run()
+    assert trip_store.MSG_CONFLICT in _joined(at.error)
+    for label in ("首頁", "收集", "排程", "行程", "旅行夾"):
+        _open_screen(at, label)
+        assert trip_store.MSG_CONFLICT in _joined(at.error)
+        assert at.session_state["trip_title"] == "我未儲存"
+    assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
+
+
+def test_saved_inputs_survive_every_screen_and_are_not_reset_to_defaults(memory_supabase):
+    """離開畫面再入返，行程名、日期、顯示名、日數、風格、偏好都唔可以變回預設。
+
+    舊程式：顯示名的 widget 只喺首頁，離開之後 session 會變返「旅人」。
+    日數、風格、偏好的 widget 只喺排程，離開之後會寫低 3／平衡型／美食+景點，覆蓋已儲存行程。
+    行程名同日期當時因為旅行夾每頁都畫，所以未覆寫；收埋旅行夾之後一樣會中招。
+    """
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    trip_id = at.session_state["trip_id"]
+    _open_screen(at, "首頁")
+    [box for box in at.text_input if box.label == "你的顯示名"][0].input("阿強").run()
+    assert at.session_state["display_name"] == "阿強"
+    _open_screen(at, "旅行夾")
+    [box for box in at.text_input if box.label == "行程名稱"][0].input("大阪行").run()
+    [box for box in at.text_input if box.label == "旅行開始"][0].input("2026-03-15").run()
+    [box for box in at.text_input if box.label == "旅行結束"][0].input("2026-03-18").run()
+    _open_screen(at, "排程")
+    [box for box in at.number_input if "日數" in box.label][0].set_value(7).run()
+    [box for box in at.radio if "行程風格" in box.label][0].set_value("Chill 型").run()
+    [box for box in at.pills if "類型" in box.label][0].set_value(["美食"]).run()
+    assert not at.exception
+    before = trip_store.load_trip(trip_id)
+    assert before["title"] == "大阪行"
+    assert before["travel_start"] == "2026-03-15"
+    assert before["travel_end"] == "2026-03-18"
+    assert before["day_count"] == 7
+    assert before["trip_style"] == "Chill 型"
+    assert before["pref_pills"] == ["美食"]
+    assert "阿強" in before["members"]
+    for label in _SCREENS:
+        _open_screen(at, label)
+        at.run()
+        assert not at.exception
+    assert at.session_state["display_name"] == "阿強"
+    assert at.session_state["trip_title"] == "大阪行"
+    assert at.session_state["travel_start"] == "2026-03-15"
+    assert at.session_state["travel_end"] == "2026-03-18"
+    assert at.session_state["day_count"] == 7
+    assert at.session_state["trip_style"] == "Chill 型"
+    assert list(at.session_state["pref_pills"]) == ["美食"]
+    saved = trip_store.load_trip(trip_id)
+    assert saved["title"] == "大阪行"
+    assert saved["travel_start"] == "2026-03-15"
+    assert saved["travel_end"] == "2026-03-18"
+    assert saved["day_count"] == 7
+    assert saved["trip_style"] == "Chill 型"
+    assert saved["pref_pills"] == ["美食"]
+    assert "阿強" in saved["members"]
+    assert saved["members"] != ["旅人"]
+    _open_screen(at, "旅行夾")
+    assert [box for box in at.text_input if box.label == "行程名稱"][0].value == "大阪行"
+    assert [box for box in at.text_input if box.label == "旅行開始"][0].value == "2026-03-15"
+    assert [box for box in at.text_input if box.label == "旅行結束"][0].value == "2026-03-18"
+    _open_screen(at, "首頁")
+    assert [box for box in at.text_input if box.label == "你的顯示名"][0].value == "阿強"
+    _open_screen(at, "排程")
+    assert [box for box in at.number_input if "日數" in box.label][0].value == 7
+    assert [box for box in at.radio if "行程風格" in box.label][0].value == "Chill 型"
+    assert [box for box in at.pills if "類型" in box.label][0].value == ["美食"]
+    assert "目前行程：大阪行" in _page(at)
+
+
+def test_switching_trips_updates_the_folder_inputs(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    [box for box in at.text_input if box.label == "行程名稱"][0].input("大阪行").run()
+    [box for box in at.text_input if box.label == "旅行開始"][0].input("2026-04-01").run()
+    [box for box in at.text_input if box.label == "旅行結束"][0].input("2026-04-03").run()
+    _button(at, "建立新旅行夾").click().run()
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
+    assert [box for box in at.text_input if box.label == "行程名稱"][0].value != "大阪行"
+    _button(at, "大阪行").click().run()
+    assert not at.exception
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
+    assert at.session_state["trip_title"] == "大阪行"
+    assert at.session_state["travel_start"] == "2026-04-01"
+    assert at.session_state["travel_end"] == "2026-04-03"
+    assert [box for box in at.text_input if box.label == "行程名稱"][0].value == "大阪行"
+    assert [box for box in at.text_input if box.label == "旅行開始"][0].value == "2026-04-01"
+    assert [box for box in at.text_input if box.label == "旅行結束"][0].value == "2026-04-03"
+
+
+def test_folder_actions_land_on_the_folder_screen_and_workspace_links_still_go(monkeypatch, memory_supabase):
+    holder = {"sub": "owner-sub"}
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: holder["sub"])
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    assert at.session_state["screen"] == "A"
+    assert "我的私人收藏" not in _page(at)
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
+    _button(at, "前往收集").click().run()
+    assert at.session_state["screen"] == "B"
+    assert _nav(at).value == "收集"
+    assert "我的私人收藏" not in _page(at)
+    _open_screen(at, "旅行夾")
+    _button(at, "前往收藏").click().run()
+    assert at.session_state["screen"] == "C"
+    assert _nav(at).value == "收藏"
+    _open_screen(at, "旅行夾")
+    _button(at, "前往行程").click().run()
+    assert at.session_state["screen"] == "D"
+    assert _nav(at).value == "排程"
+    _open_screen(at, "旅行夾")
+    _button(at, "⚙").click().run()
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
+    _button(at, "邀請朋友").click().run()
+    assert at.session_state["screen"] == "F"
+    assert any(block.value == "邀請朋友加入" for block in at.subheader)
+    _button(at, "返回行程").click().run()
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
+    assert not any(block.value == "邀請朋友加入" for block in at.subheader)
+    assert "前往收集" in [button.label for button in at.button]
+    if not any(button.label == "刪除行程" for button in at.button):
+        _button(at, "⚙").click().run()
+    _button(at, "刪除行程").click().run()
+    assert at.session_state["screen"] == "F"
+    _button(at, "確認刪除").click().run()
+    assert not at.exception
+    assert at.session_state["screen"] == "F"
+    assert _nav(at).value == "旅行夾"
+    assert trip_store.list_trips() == []
+    assert "你仲未有行程" in _page(at)
+
+    holder["sub"] = "owner-sub"
+    created = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "version": created["version"],
+        "title": "共同大阪",
+        "inbox": [],
+        "favourites": [],
+        "itinerary": None,
+    })
+    invite = trip_store.create_invite(created["id"])
+    holder["sub"] = "member-sub"
+    member = AppTest.from_file(APP, default_timeout=30)
+    member.secrets["GEMINI_API_KEY"] = "fake"
+    member.query_params["invite"] = invite["token"]
+    member.session_state["display_name"] = "朋友 A"
+    member.run()
+    assert member.session_state["screen"] == "F"
+    assert _nav(member).value == "旅行夾"
+    holder["sub"] = "owner-sub"
+    owner = AppTest.from_file(APP, default_timeout=30)
+    owner.secrets["GEMINI_API_KEY"] = "fake"
+    owner.session_state["trip_id"] = created["id"]
+    owner.run()
+    _open_screen(owner, "旅行夾")
+    _button(owner, "⚙").click().run()
+    remove = [button for button in owner.button if button.label.startswith("移除 ")]
+    assert remove, [button.label for button in owner.button]
+    remove[0].click().run()
+    assert owner.session_state["screen"] == "F"
+    _button(owner, "確認移除").click().run()
+    assert not owner.exception
+    assert owner.session_state["screen"] == "F"
+    assert _nav(owner).value == "旅行夾"
+
+    holder["sub"] = "owner-sub"
+    other = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": other["id"],
+        "version": other["version"],
+        "title": "共同京都",
+        "inbox": [],
+        "favourites": [],
+        "itinerary": None,
+    })
+    other_invite = trip_store.create_invite(other["id"])
+    holder["sub"] = "member-sub"
+    leaver = AppTest.from_file(APP, default_timeout=30)
+    leaver.secrets["GEMINI_API_KEY"] = "fake"
+    leaver.query_params["invite"] = other_invite["token"]
+    leaver.session_state["display_name"] = "朋友 A"
+    leaver.run()
+    assert leaver.session_state["screen"] == "F"
+    _button(leaver, "⚙").click().run()
+    _button(leaver, "離開行程").click().run()
+    assert leaver.session_state["screen"] == "F"
+    _button(leaver, "確認離開").click().run()
+    assert not leaver.exception
+    assert leaver.session_state["screen"] == "F"
+    assert _nav(leaver).value == "旅行夾"
+    assert leaver.session_state.get("trip_id") != other["id"]
+
+
+def test_skip_next_create_is_cleared_off_the_folder_screen(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    at.session_state["_skip_next_create"] = True
+    at.session_state["screen"] = "B"
+    at.run()
+    assert at.session_state.get("_skip_next_create") in (False, None, "")
+    assert memory_supabase.inserts == []
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    assert len(memory_supabase.inserts) == 1
+    _button(at, "建立新旅行夾").click().run()
+    assert len(memory_supabase.inserts) == 2
+
+
+def test_opening_private_inbox_still_goes_to_collect(monkeypatch, memory_supabase):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    created = trip_store.create_trip()
+    trip_store.save_collection_inbox({
+        "title": "收藏",
+        "inbox": [],
+        "favourites": [_fav(name="太宰府天滿宮")],
+        "itinerary": None,
+    })
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.session_state["trip_id"] = created["id"]
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "私人收藏匣").click().run()
+    assert not at.exception
+    assert at.session_state["screen"] == "B"
+    assert _nav(at).value == "收集"
+    assert at.session_state.get("view_inbox") is True
+    assert "我的私人收藏" not in _page(at)

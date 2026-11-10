@@ -1215,6 +1215,9 @@ def _apply_loaded_trip(loaded: dict) -> None:
     st.session_state.travel_start = _stored_date_text(loaded.get("travel_start"))
     st.session_state.travel_end = _stored_date_text(loaded.get("travel_end"))
     st.session_state.owner_display_name = str(loaded.get("owner_display_name") or "")
+    # 行程名稱、日期、日數、風格、偏好的輸入只喺一個畫面。
+    # 載入後要令嗰啲輸入下次顯示新值，唔好留低上一個行程的 widget 值。
+    _bump_bound_widgets()
     if loaded.get("role") in {"owner", "member"}:
         st.session_state.trip_role = loaded["role"]
     if "is_shared" in loaded:
@@ -1383,6 +1386,27 @@ def _render_inbox_cleanup_warning() -> None:
         st.warning(message)
 
 
+def _render_global_trip_alerts() -> None:
+    """衝突、邀請失敗、收藏匣清理。旅行夾收埋之後，每一頁都要繼續見到。"""
+    _render_trip_conflict()
+    message = str(st.session_state.get("invite_error") or "").strip()
+    if message:
+        st.error(message)
+    _render_inbox_cleanup_warning()
+
+
+def _render_current_trip_line() -> None:
+    """其他頁只顯示目前行程名稱，冇掣。"""
+    if (st.session_state.get("screen") or "A") == "F":
+        return
+    if st.session_state.get("view_inbox") or not str(st.session_state.get("trip_id") or ""):
+        return
+    title = str(st.session_state.get("trip_title") or "").strip()
+    if not title:
+        return
+    st.caption(f"目前行程：{title}")
+
+
 def _clear_inbox_cleanup_warning_if_done() -> None:
     if not st.session_state.get("inbox_cleanup_warning"):
         return
@@ -1429,7 +1453,9 @@ def _consume_invite() -> None:
         st.session_state.invite_panel = False
         st.session_state.trip_id = result["id"]
         st.session_state.force_trip_reload = True
-        st.session_state.screen = "A"
+        # 接受邀請之後要見到旅行夾入面嘅共同行程，唔好留喺首頁。
+        st.session_state.screen = "F"
+        st.session_state.nav_sync = "F"
     try:
         if "invite" in list(st.query_params):
             del st.query_params["invite"]
@@ -1523,7 +1549,10 @@ def _load_inbox_document() -> bool:
 
 
 def _load_shared_trip() -> None:
-    # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _skip_next_create。
+    # 每次執行都清「重播建立」旗。旅行夾唔喺呢一頁時都要清，否則旗會卡住，
+    # 或者之後先畫到個掣就再開多一個行程。今次重播與否留喺 _create_replay。
+    st.session_state._create_replay = bool(st.session_state.pop("_skip_next_create", False))
+    # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _create_replay。
     st.session_state._create_done_this_run = False
     st.session_state._inbox_save_inflight = False
     st.session_state._storage_error_set = False
@@ -1710,7 +1739,7 @@ def _activate_trip(trip_id: str) -> None:
     st.session_state.invite_panel = False
     st.session_state.trip_id = trip_id
     st.session_state.force_trip_reload = True
-    st.rerun()
+    _rerun_folder()
 
 
 def _open_collection_inbox() -> None:
@@ -1720,9 +1749,7 @@ def _open_collection_inbox() -> None:
     st.session_state.invite_panel = False
     st.session_state.trip_id = ""
     st.session_state.force_trip_reload = True
-    st.session_state.screen = "B"
-    st.session_state.nav_sync = "B"
-    st.rerun()
+    _go("B")
 
 
 def _create_new_trip() -> None:
@@ -1761,7 +1788,8 @@ def _create_new_trip() -> None:
         st.session_state.last_digest = trip_store.digest(_snapshot())
         st.session_state.force_trip_reload = True
         _clear_storage_error(force=True)
-        st.rerun()
+        _bump_bound_widgets()
+        _rerun_folder()
         return
     try:
         created = trip_store.create_trip()
@@ -1777,7 +1805,8 @@ def _create_new_trip() -> None:
     st.session_state.trip_conflict = False
     st.session_state.force_trip_reload = True
     _clear_storage_error(force=True)
-    st.rerun()
+    _bump_bound_widgets()
+    _rerun_folder()
 
 
 def _trip_button_label(row: dict, *, current: str) -> str:
@@ -1828,7 +1857,7 @@ def _render_invite_panel(trip_id: str) -> None:
     st.markdown("一齊計劃更精彩的旅行！")
     if st.button("返回行程", key="close_invite_panel"):
         st.session_state.invite_panel = False
-        st.rerun()
+        _rerun_folder()
     links = dict(st.session_state.get("invite_tokens") or {})
     saved = links.get(trip_id) or {}
     try:
@@ -1867,7 +1896,7 @@ def _render_invite_panel(trip_id: str) -> None:
             }
             st.session_state.invite_tokens = links
             st.session_state.is_shared_trip = True
-            st.rerun()
+            _rerun_folder()
     if url or status.get("active"):
         if st.button("撤銷邀請連結", key="revoke_invite", use_container_width=True):
             try:
@@ -1877,7 +1906,7 @@ def _render_invite_panel(trip_id: str) -> None:
             else:
                 links.pop(trip_id, None)
                 st.session_state.invite_tokens = links
-                st.rerun()
+                _rerun_folder()
     st.markdown("✓ 朋友要用 Google 登入。登入之後如果連結消失，請再開一次同一條連結。")
     st.markdown(
         "✓ 連結未過期、未撤銷，而且行程未滿人、對方未超過加入上限，就會直接加入，毋須審批。"
@@ -1900,7 +1929,7 @@ def _render_member_actions(trip_id: str, people: list[dict]) -> None:
     if role == "owner":
         if st.button("邀請朋友", key="open_invite", use_container_width=True):
             st.session_state.invite_panel = True
-            st.rerun()
+            _rerun_folder()
         if others:
             st.caption("移除成員")
             for person in others:
@@ -1912,6 +1941,8 @@ def _render_member_actions(trip_id: str, people: list[dict]) -> None:
                 if st.button(f"移除 {name}", key=f"ask_remove_{token}", use_container_width=True):
                     st.session_state.pending_remove = sub
                     st.session_state.pending_remove_name = name
+                    st.session_state.screen = "F"
+                    st.session_state.nav_sync = "F"
         if st.session_state.get("pending_remove"):
             name = st.session_state.get("pending_remove_name") or "這位成員"
             st.warning(f"確定要移除{name}？移除之後對方即刻睇唔到呢個行程同圖片。")
@@ -1925,14 +1956,16 @@ def _render_member_actions(trip_id: str, people: list[dict]) -> None:
                     else:
                         st.session_state.pending_remove = ""
                         st.session_state.pending_remove_name = ""
-                        st.rerun()
+                        _rerun_folder()
             with no:
                 if st.button("取消移除", key="cancel_remove", use_container_width=True):
                     st.session_state.pending_remove = ""
                     st.session_state.pending_remove_name = ""
-                    st.rerun()
+                    _rerun_folder()
         if st.button("刪除行程", key="ask_delete_trip", use_container_width=True):
             st.session_state.pending_delete = True
+            st.session_state.screen = "F"
+            st.session_state.nav_sync = "F"
         if st.session_state.get("pending_delete"):
             st.warning("刪除之後，所有成員都唔可以再睇呢個行程同圖片。")
             yes, no = st.columns(2)
@@ -1947,14 +1980,16 @@ def _render_member_actions(trip_id: str, people: list[dict]) -> None:
                         st.session_state.trip_id = ""
                         st.session_state.invite_panel = False
                         st.session_state.force_trip_reload = True
-                        st.rerun()
+                        _rerun_folder()
             with no:
                 if st.button("取消刪除", key="cancel_delete_trip", use_container_width=True):
                     st.session_state.pending_delete = False
-                    st.rerun()
+                    _rerun_folder()
         return
     if st.button("離開行程", key="ask_leave_trip", use_container_width=True):
         st.session_state.pending_leave = True
+        st.session_state.screen = "F"
+        st.session_state.nav_sync = "F"
     if st.session_state.get("pending_leave"):
         st.warning("離開之後，你會即刻睇唔到呢個行程同圖片。")
         yes, no = st.columns(2)
@@ -1968,11 +2003,106 @@ def _render_member_actions(trip_id: str, people: list[dict]) -> None:
                     st.session_state.pending_leave = False
                     st.session_state.trip_id = ""
                     st.session_state.force_trip_reload = True
-                    st.rerun()
+                    _rerun_folder()
         with no:
             if st.button("取消離開", key="cancel_leave_trip", use_container_width=True):
                 st.session_state.pending_leave = False
-                st.rerun()
+                _rerun_folder()
+
+
+def _bump_bound_widgets() -> None:
+    """載入或轉換行程之後，下一次畫輸入先用新嘅持久值。"""
+    st.session_state._bind_epoch = int(st.session_state.get("_bind_epoch") or 0) + 1
+
+
+def _rerun_folder() -> None:
+    """旅行夾入面嘅動作留喺旅行夾，並且同步上面嗰粒 pill。"""
+    st.session_state.screen = "F"
+    st.session_state.nav_sync = "F"
+    st.rerun()
+
+
+def _coerce_text(value) -> str:
+    if value is None:
+        return ""
+    return str(value)
+
+
+def _coerce_day_count(value) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        number = 3
+    return min(14, max(1, number))
+
+
+def _coerce_trip_style(value) -> str:
+    labels = [name for name, _blurb in TRIP_STYLES]
+    if value in labels:
+        return value
+    return labels[0] if labels else DEFAULT_TRIP_STYLE
+
+
+def _coerce_pref_pills(value) -> list:
+    picked = [item for item in list(value or []) if item in PLAN_PREF_OPTIONS]
+    if picked:
+        return picked
+    return ["美食", "景點"]
+
+
+def _mount_bound(state_key: str, default, coerce):
+    """Widget 用另一條 key。離開畫面時 Streamlit 只會刪 widget key，持久值留低。
+
+    使用者改值會喺 on_change（腳本開始前）寫返持久 key。
+    載入行程會加 _bind_epoch，下次先覆蓋 widget，避免改完一個字就被舊值蓋走。
+    """
+    epoch = int(st.session_state.get("_bind_epoch") or 0)
+    widget_key = f"_w_{state_key}"
+    if state_key not in st.session_state:
+        st.session_state[state_key] = default
+    generation_key = f"_wgen_{state_key}"
+    if widget_key not in st.session_state or st.session_state.get(generation_key) != epoch:
+        seeded = coerce(st.session_state.get(state_key, default))
+        st.session_state[state_key] = seeded
+        st.session_state[widget_key] = seeded
+        st.session_state[generation_key] = epoch
+
+    def _on_change() -> None:
+        st.session_state[state_key] = coerce(st.session_state.get(widget_key, default))
+
+    return widget_key, _on_change
+
+
+def _bound_text_input(label: str, state_key: str, *, default: str = "", **kwargs) -> str:
+    widget_key, on_change = _mount_bound(state_key, default, _coerce_text)
+    value = st.text_input(label, key=widget_key, on_change=on_change, **kwargs)
+    shown = _coerce_text(value)
+    st.session_state[state_key] = shown
+    return shown
+
+
+def _bound_number_input(label: str, state_key: str, *, default: int, **kwargs) -> int:
+    widget_key, on_change = _mount_bound(state_key, default, _coerce_day_count)
+    value = st.number_input(label, key=widget_key, on_change=on_change, **kwargs)
+    shown = _coerce_day_count(value)
+    st.session_state[state_key] = shown
+    return shown
+
+
+def _bound_radio(label: str, state_key: str, options: list, *, default: str, **kwargs) -> str:
+    widget_key, on_change = _mount_bound(state_key, default, _coerce_trip_style)
+    value = st.radio(label, options, key=widget_key, on_change=on_change, **kwargs)
+    shown = _coerce_trip_style(value)
+    st.session_state[state_key] = shown
+    return shown
+
+
+def _bound_pills(label: str, state_key: str, options: list, *, default: list, **kwargs) -> list:
+    widget_key, on_change = _mount_bound(state_key, default, _coerce_pref_pills)
+    value = st.pills(label, options, key=widget_key, on_change=on_change, **kwargs)
+    shown = _coerce_pref_pills(value)
+    st.session_state[state_key] = shown
+    return shown
 
 
 def _render_workspace() -> None:
@@ -1995,6 +2125,8 @@ def _render_workspace() -> None:
     with gear_col:
         if st.button("⚙", key="trip_gear", help="行程設定"):
             st.session_state.gear_open = not st.session_state.get("gear_open")
+            st.session_state.screen = "F"
+            st.session_state.nav_sync = "F"
     if st.session_state.get("gear_open"):
         _render_member_actions(trip_id, people)
     if st.session_state.get("trip_role") == "owner" and st.session_state.get("invite_panel"):
@@ -2017,12 +2149,12 @@ def _render_workspace() -> None:
         if st.button("前往行程", key="workspace_plan", use_container_width=True):
             _go("E" if st.session_state.get("itinerary") else "D")
     st.markdown("**旅行資料**")
-    st.text_input("行程名稱", key="trip_title")
+    _bound_text_input("行程名稱", "trip_title", default="行程")
     start_col, end_col = st.columns(2)
     with start_col:
-        st.text_input("旅行開始", key="travel_start", placeholder="2026-03-15")
+        _bound_text_input("旅行開始", "travel_start", default="", placeholder="2026-03-15")
     with end_col:
-        st.text_input("旅行結束", key="travel_end", placeholder="2026-03-18")
+        _bound_text_input("旅行結束", "travel_end", default="", placeholder="2026-03-18")
     span = _span_label(st.session_state.get("travel_start"), st.session_state.get("travel_end"))
     if st.session_state.get("travel_start") and st.session_state.get("travel_end") and not span:
         st.caption("日期請用 YYYY-MM-DD，結束日期要遲過或等於開始日期。")
@@ -2041,13 +2173,7 @@ def _render_workspace() -> None:
 
 
 def _render_trip_switcher() -> None:
-    replay = bool(st.session_state.get("_skip_next_create"))
-    if replay:
-        st.session_state._skip_next_create = False
-    _render_trip_conflict()
-    if st.session_state.get("invite_error"):
-        st.error(str(st.session_state.get("invite_error")))
-    _render_inbox_cleanup_warning()
+    replay = bool(st.session_state.get("_create_replay"))
     catalog = list(st.session_state.get("trip_catalog") or [])
     current = str(st.session_state.get("trip_id") or "")
     private = [row for row in catalog if row.get("role") == "owner" and not row.get("is_shared")]
@@ -2874,7 +3000,15 @@ def _allow_ai_suggestions(_favs: list[dict]) -> bool:
     return bool(st.session_state.get("allow_ai", True))
 
 
-_NAV = (("A", "首頁"), ("B", "收集"), ("C", "收藏"), ("D", "排程"), ("E", "行程"))
+# 首頁維持開場。旅行夾係獨立一頁，收集之後嘅步驟唔再夾住成個資料夾。
+_NAV = (
+    ("A", "首頁"),
+    ("F", "旅行夾"),
+    ("B", "收集"),
+    ("C", "收藏"),
+    ("D", "排程"),
+    ("E", "行程"),
+)
 
 
 def _go(screen: str) -> None:
@@ -3446,27 +3580,31 @@ def _render_plan() -> None:
     st.markdown("**出發日與日數**")
     day_col, count_col = st.columns([1.35, 0.9], gap="small")
     with day_col:
+        # 出發日只係今次排程用，冇寫入行程 payload。離開頁面會清，唔覆寫已儲存資料。
         st.date_input("出發日", value=None, key="start_date")
     with count_col:
-        st.number_input("日數", min_value=1, max_value=14, step=1, key="day_count")
-    raw_prefs = list(st.session_state.get("pref_pills") or [])
-    clean_prefs = [item for item in raw_prefs if item in PLAN_PREF_OPTIONS]
-    if clean_prefs != raw_prefs:
-        st.session_state.pref_pills = clean_prefs or ["美食", "景點"]
-    st.pills(
+        _bound_number_input(
+            "日數",
+            "day_count",
+            default=3,
+            min_value=1,
+            max_value=14,
+            step=1,
+        )
+    _bound_pills(
         "你想去哪些類型的地方？（可多選）",
+        "pref_pills",
         list(PLAN_PREF_OPTIONS),
+        default=["美食", "景點"],
         selection_mode="multi",
-        key="pref_pills",
     )
     style_labels = [name for name, _blurb in TRIP_STYLES]
-    if st.session_state.get("trip_style") not in style_labels:
-        st.session_state.trip_style = DEFAULT_TRIP_STYLE
-    st.radio(
+    _bound_radio(
         "行程風格（單選）",
+        "trip_style",
         style_labels,
+        default=DEFAULT_TRIP_STYLE,
         captions=[blurb for _name, blurb in TRIP_STYLES],
-        key="trip_style",
     )
     if len(favs) < SPARSE_COLLECTION_MIN:
         st.caption("目前收藏的地方較少，可以讓 AI 建議附近可核實的地點。")
@@ -3848,7 +3986,7 @@ def _render_opening() -> None:
     st.markdown(f'<p class="hero-line">{HERO_LINE}</p>', unsafe_allow_html=True)
     steps = "\n".join(f"{index}. {label}" for index, label in enumerate(OPENING_STEPS, start=1))
     st.markdown(steps)
-    st.text_input("你的顯示名", key="display_name")
+    _bound_text_input("你的顯示名", "display_name", default="旅人")
     if st.button("開始收集想去的地方", type="primary", key="start_collect"):
         _go("B")
 
@@ -3859,7 +3997,8 @@ _load_shared_trip()
 _publish_favourites()
 
 _render_nav()
-_render_trip_switcher()
+_render_global_trip_alerts()
+_render_current_trip_line()
 _MOBILE(key="mobile_fix")
 _render_notice()
 screen = st.session_state.get("screen") or "A"
@@ -3867,6 +4006,8 @@ if not API_KEY:
     st.error("AI 服務未設定好，暫時認不到地方，也排不了行程。（管理員請在 Streamlit Secrets 設定 GEMINI_API_KEY）")
 if screen == "A":
     _render_opening()
+elif screen == "F":
+    _render_trip_switcher()
 elif screen == "B":
     _render_collect()
 elif screen == "C":
