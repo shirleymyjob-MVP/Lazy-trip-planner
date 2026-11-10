@@ -1222,6 +1222,7 @@ def _apply_loaded_trip(loaded: dict) -> None:
     st.session_state.travel_start = _stored_date_text(loaded.get("travel_start"))
     st.session_state.travel_end = _stored_date_text(loaded.get("travel_end"))
     st.session_state.owner_display_name = str(loaded.get("owner_display_name") or "")
+    st.session_state.itinerary_unsaved = False
     # 行程名稱、日期、日數、風格、偏好的輸入只喺一個畫面。
     # 載入後要令嗰啲輸入下次顯示新值，唔好留低上一個行程的 widget 值。
     _bump_bound_widgets()
@@ -1364,6 +1365,10 @@ def _sync_remote_content(loaded: dict, remote_stamp: object, *, same: bool, forc
     _note_seen(loaded, remote_stamp)
 
 
+_ITINERARY_UNSAVED = (
+    "AI 行程已生成，但尚未儲存：呢份行程可能已喺另一個分頁、工作階段或成員度更新。"
+    "重新整理或重新載入會失去呢份未儲存嘅行程。"
+)
 _CONFLICT_BANNER = (
     "呢份行程可能已喺另一個分頁、工作階段或成員度更新。你未儲存嘅更改未寫入。"
 )
@@ -1569,6 +1574,7 @@ def _load_shared_trip() -> None:
     st.session_state._create_replay = bool(st.session_state.pop("_skip_next_create", False))
     # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _create_replay。
     st.session_state._create_done_this_run = False
+    st.session_state._ai_save_attempted = False
     st.session_state._inbox_save_inflight = False
     st.session_state._storage_error_set = False
     st.session_state._conflict_ui_rendered = False
@@ -1731,6 +1737,7 @@ def _persist_shared_trip() -> bool:
         return False
     if current == st.session_state.get("last_digest"):
         _clear_storage_error()
+        st.session_state.itinerary_unsaved = False
         return True
     try:
         stamp = trip_store.save_trip(snapshot)
@@ -1744,6 +1751,7 @@ def _persist_shared_trip() -> bool:
     st.session_state.last_digest = current
     st.session_state.loaded_trip_id = trip_id
     _clear_storage_error(force=True)
+    st.session_state.itinerary_unsaved = False
     return True
 
 
@@ -3646,6 +3654,8 @@ def _render_collection() -> None:
 
 def _render_plan() -> None:
     st.subheader("一鍵排行程")
+    if st.session_state.get("itinerary_unsaved") and st.session_state.get("itinerary"):
+        st.error(_ITINERARY_UNSAVED)
     favs = list(st.session_state.get("favourites") or [])
     st.markdown("**選擇目的地／地區**")
     choice = _bound_selectbox(
@@ -3782,15 +3792,23 @@ def _render_plan() -> None:
             st.session_state.itinerary_places = places
             st.session_state.planned_style = style
             st.session_state.planned_allow_ai = allow_ai
-            st.session_state.screen = "E"
-            st.session_state.nav_sync = "E"
-            st.session_state.notice = None
-            status.update(label="行程排好了", state="complete")
+            # 先用而家的 seen_version 做一次 CAS。成功先當排好並轉去行程頁。
+            st.session_state._ai_save_attempted = True
+            if _persist_shared_trip():
+                st.session_state.screen = "E"
+                st.session_state.nav_sync = "E"
+                st.session_state.notice = None
+                status.update(label="行程排好了", state="complete")
+            else:
+                st.session_state.itinerary_unsaved = True
+                status.update(label="行程已生成，但尚未儲存", state="error")
     if plan_error:
         st.session_state.notice = ("error", plan_error)
         st.error(plan_error)
     elif st.session_state.get("screen") == "E":
         st.rerun()
+    elif st.session_state.get("itinerary_unsaved"):
+        st.error(_ITINERARY_UNSAVED)
 
 
 def _suggested_seeds(itinerary: dict, known_places: list[dict]) -> list[dict]:
@@ -4019,6 +4037,8 @@ def _isolate_cloned_days(days: list[dict]) -> list[dict]:
 
 
 def _render_results() -> None:
+    if st.session_state.get("itinerary_unsaved") and st.session_state.get("itinerary"):
+        st.error(_ITINERARY_UNSAVED)
     itinerary = st.session_state.get("itinerary")
     style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
     if not itinerary:
@@ -4118,5 +4138,6 @@ st.caption(
 )
 # 開始分析喺 fragment 入面先寫完第二張卡。儲存前再收一次，避免行程留低兩個 kchiara。
 _publish_favourites()
-_persist_shared_trip()
+if not st.session_state.get("_ai_save_attempted"):
+    _persist_shared_trip()
 _render_storage_error()
