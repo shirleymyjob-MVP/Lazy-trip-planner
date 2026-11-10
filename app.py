@@ -1984,9 +1984,44 @@ def _span_label(start, end) -> str:
     return f"{start_day.isoformat()} – {end_day.strftime('%m-%d')}（{days}日{nights}夜）"
 
 
+def _render_v2b_styles() -> None:
+    st.markdown(
+        """
+        <style>
+          .v2b-card {
+            background: #FFFFFF;
+            border: 1px solid #F6D5DC;
+            border-radius: 16px;
+            padding: 12px 14px;
+            margin: 0 0 8px;
+          }
+          .v2b-kicker { color: #C45C74; font-weight: 700; font-size: 13px; margin: 0; }
+          .v2b-title { font-size: 18px; font-weight: 700; margin: 2px 0; color: #3A2A2E; }
+          .v2b-meta { color: #7A5C64; font-size: 13px; line-height: 1.5; margin: 0; }
+          div[data-testid="stVerticalBlockBorderWrapper"] {
+            border-color: #F6D5DC !important;
+            border-radius: 16px !important;
+          }
+          div.st-key-revoke_invite button,
+          div.st-key-confirm_delete_trip button {
+            border-color: #B42318 !important;
+            color: #B42318 !important;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_invite_panel(trip_id: str) -> None:
+    _render_v2b_styles()
+    st.markdown('<p class="v2b-kicker">Lazy Trip Planner</p>', unsafe_allow_html=True)
     st.subheader("邀請朋友加入")
-    st.markdown("一齊計劃更精彩的旅行！")
+    st.markdown(
+        '<div class="v2b-card"><p class="v2b-title">一齊計劃更精彩的旅行！</p>'
+        '<p class="v2b-meta">連結要對方用 Google 登入後再開一次。而家未有登入後自動加入。</p></div>',
+        unsafe_allow_html=True,
+    )
     if st.button("返回行程", key="close_invite_panel"):
         st.session_state.invite_panel = False
         _rerun_folder()
@@ -3618,9 +3653,24 @@ def _render_collect_card(item: dict) -> None:
 
 
 def _render_collect() -> None:
+    _render_v2b_styles()
+    st.markdown('<p class="v2b-kicker">上載截圖</p>', unsafe_allow_html=True)
     st.subheader("收集想去的地方")
     st.markdown('<p class="helper">貼上截圖，系統會幫你識別並分類。</p>', unsafe_allow_html=True)
     _ingest_collect_inputs()
+    total = len(st.session_state.inbox)
+    done = sum(1 for item in st.session_state.inbox if _collect_status(item) == COLLECT_STATUS_DONE)
+    failed = sum(1 for item in st.session_state.inbox if _collect_status(item) == COLLECT_STATUS_FAIL)
+    if total:
+        st.markdown(
+            f'<div class="v2b-card"><p class="v2b-title">已完成 {done}／{total}</p>'
+            '<p class="v2b-meta">呢個數字係而家行程匣的狀態，唔係估計進度。已完成的唔會再送去識別。</p></div>',
+            unsafe_allow_html=True,
+        )
+    else:
+        st.caption("尚未有圖片。可以一次選多張。")
+    if failed:
+        st.caption(f"{failed} 張未能辨識。請用該張的「重試」或「手動輸入店名」，唔好靠已完成的圖再分析。")
     _kick_analysis()
     pending = [item for item in st.session_state.inbox if _collect_status(item) != COLLECT_STATUS_DONE]
     done = [item for item in st.session_state.inbox if _collect_status(item) == COLLECT_STATUS_DONE]
@@ -3740,11 +3790,18 @@ def _render_favourite(fav: dict) -> None:
 
 
 def _render_collection() -> None:
+    _render_v2b_styles()
+    shared = bool(st.session_state.get("is_shared_trip")) and not st.session_state.get("view_inbox")
+    st.markdown('<p class="v2b-kicker">收藏</p>', unsafe_allow_html=True)
     st.subheader("我的收藏")
     st.markdown(
         '<p class="helper">這裡只有你（和朋友）收藏的地點，排行程時會用這些。</p>',
         unsafe_allow_html=True,
     )
+    scope = "呢個共同行程的收藏" if shared else "呢個行程的收藏"
+    if st.session_state.get("view_inbox") or not st.session_state.get("trip_id"):
+        scope = "私人收藏匣入面的地點，未有獨立私人收藏庫"
+    st.caption(scope + "。可以按地區或分類篩選，未有文字搜尋，亦未有跨行程複製。")
     favs = list(st.session_state.get("favourites") or [])
     _render_manual_adder("collection")
     if not favs:

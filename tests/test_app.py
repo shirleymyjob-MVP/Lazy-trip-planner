@@ -2895,3 +2895,44 @@ def test_save_failure_log_has_codes_and_no_sensitive_data(caplog):
         "fake",
     ):
         assert secret not in logged
+
+
+def test_collect_progress_counts_real_statuses_without_new_recognition(memory_supabase, monkeypatch):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    at.session_state["inbox"] = [
+        {"id": "done-one", "analysis": "done", "facts": "done", "places": [{"name": "甲"}], "batch": True},
+        {"id": "fail-one", "analysis": "failed", "places": [], "batch": True, "warning": "未能辨識店名"},
+    ]
+    monkeypatch.setattr(
+        gemini_client,
+        "recognize_names",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("不應再識別")),
+    )
+    _open_screen(at, "收集")
+    assert not at.exception
+    page = _page(at)
+    assert "已完成 1／2" in page
+    assert "1 張未能辨識" in page
+    assert "重試" in [button.label for button in at.button]
+    _open_screen(at, "收藏")
+    assert "未有文字搜尋" in _page(at)
+    assert "跨行程複製" in _page(at)
+    assert not any(box.label == "搜尋" for box in at.text_input)
+
+
+def test_invite_panel_keeps_manual_join_wording(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _button(at, "⚙").click().run()
+    _button(at, "邀請朋友").click().run()
+    assert any(block.value == "邀請朋友加入" for block in at.subheader)
+    assert "而家未有登入後自動加入" in _page(at)
+    assert any(button.label == "產生邀請連結" for button in at.button)
+    assert any(button.label == "返回行程" for button in at.button)
