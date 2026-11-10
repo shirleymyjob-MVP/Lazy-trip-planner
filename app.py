@@ -57,6 +57,7 @@ _REQUIRED_LOCAL_ATTRS = {
         "DAY_DEFAULT",
         "DEFAULT_TRIP_STYLE",
         "DESTINATION_DEFAULT",
+        "DESTINATION_OTHER",
         "FAVOURITE_CATEGORIES",
         "HERO_LINE",
         "NEARBY_UNVERIFIED_NOTE",
@@ -84,6 +85,7 @@ _REQUIRED_LOCAL_ATTRS = {
         "compose_trip_request",
         "decode_clipboard_payload",
         "dedupe_places",
+        "destination_labels",
         "fallback_trip_title",
         "favourite_category",
         "format_rating",
@@ -1204,6 +1206,11 @@ def _apply_loaded_trip(loaded: dict) -> None:
     for key in _TRIP_FIELDS:
         if loaded.get(key) is not None:
             st.session_state[key] = loaded[key]
+    # 舊行程冇目的地，或者新行程未揀，都係自動。唔好留低上一個行程的明確選擇。
+    if loaded.get("destination_choice") is None:
+        st.session_state.destination_choice = trip_core.DESTINATION_DEFAULT
+    if loaded.get("destination_other") is None:
+        st.session_state.destination_other = ""
     st.session_state.favourites = list(loaded.get("favourites") or [])
     st.session_state.removed_fav_ids = list(loaded.get("removed_fav_ids") or [])
     if loaded.get("trip_style"):
@@ -1357,14 +1364,22 @@ def _sync_remote_content(loaded: dict, remote_stamp: object, *, same: bool, forc
     _note_seen(loaded, remote_stamp)
 
 
+_CONFLICT_BANNER = (
+    "呢份行程可能已喺另一個分頁、工作階段或成員度更新。你未儲存嘅更改未寫入。"
+)
+_CONFLICT_RELOAD_NOTE = (
+    "撳「重新載入已儲存的行程」會放棄呢度未儲存嘅更改，改為顯示已儲存的版本。"
+)
+
+
 def _render_trip_conflict() -> None:
     if not st.session_state.get("trip_conflict"):
         return
     if st.session_state.get("_conflict_ui_rendered"):
         return
     st.session_state._conflict_ui_rendered = True
-    st.error(trip_store.MSG_CONFLICT)
-    st.caption("未撳「重新載入已儲存的行程」之前，你未儲存嘅更改會留喺呢度。")
+    st.error(_CONFLICT_BANNER)
+    st.caption(_CONFLICT_RELOAD_NOTE)
     if st.button(_CONFLICT_RELOAD, key="reload_conflict_trip"):
         st.session_state.force_trip_reload = True
         st.session_state.trip_conflict = False
@@ -2071,6 +2086,14 @@ def _mount_bound(state_key: str, default, coerce):
         st.session_state[state_key] = coerce(st.session_state.get(widget_key, default))
 
     return widget_key, _on_change
+
+
+def _bound_selectbox(label: str, state_key: str, options: list, *, default, coerce, **kwargs):
+    widget_key, on_change = _mount_bound(state_key, default, coerce)
+    value = st.selectbox(label, options, key=widget_key, on_change=on_change, **kwargs)
+    shown = coerce(value)
+    st.session_state[state_key] = shown
+    return shown
 
 
 def _bound_text_input(label: str, state_key: str, *, default: str = "", **kwargs) -> str:
@@ -2979,6 +3002,53 @@ def _places_from_favourites(favs: list[dict]) -> list[dict]:
     return places
 
 
+def _destination_is_explicit(choice: str) -> bool:
+    """預設「日本（未指定城市）」同舊行程冇呢欄，都當自動判斷。"""
+    return bool(choice) and choice != trip_core.DESTINATION_DEFAULT
+
+
+def _destination_menu_label(label: str) -> str:
+    if label == trip_core.DESTINATION_DEFAULT:
+        return "自動（跟收藏地區）"
+    return label
+
+
+def _coerce_destination_choice(value) -> str:
+    if value in trip_core.destination_labels():
+        return value
+    return trip_core.DESTINATION_DEFAULT
+
+
+_OTHER_DESTINATION_REQUIRED = "請先填寫其他目的地，先可以開始 AI 排程。"
+
+
+def _custom_destination_missing() -> bool:
+    """「其他」未填或只有空白時，唔好靜靜交「日本」去排行程。"""
+    choice = _coerce_destination_choice(st.session_state.get("destination_choice"))
+    if choice != trip_core.DESTINATION_OTHER:
+        return False
+    return not str(st.session_state.get("destination_other") or "").strip()
+
+
+def _planning_destination(favs: list[dict]) -> tuple[str, dict]:
+    """明確目的地交俾排行程。未揀就跟收藏的共同地區，同以前一樣。"""
+    choice = _coerce_destination_choice(st.session_state.get("destination_choice"))
+    request = trip_core.compose_trip_request(
+        choice,
+        destination_other=st.session_state.get("destination_other") or "",
+        days=st.session_state.get("day_count") or 3,
+        preferences=list(st.session_state.get("pref_pills") or []),
+        party=trip_core.PARTY_DEFAULT,
+        start_date=_date_text(st.session_state.get("start_date")),
+    )
+    if _destination_is_explicit(choice):
+        return request["destination"], request
+    detected = _favourite_destination(favs)
+    if detected == "日本":
+        return request["destination"], request
+    return detected, request
+
+
 def _favourite_destination(favs: list[dict]) -> str:
     sets = []
     for fav in favs:
@@ -3577,6 +3647,25 @@ def _render_collection() -> None:
 def _render_plan() -> None:
     st.subheader("一鍵排行程")
     favs = list(st.session_state.get("favourites") or [])
+    st.markdown("**選擇目的地／地區**")
+    choice = _bound_selectbox(
+        "選擇目的地／地區",
+        "destination_choice",
+        trip_core.destination_labels(),
+        default=trip_core.DESTINATION_DEFAULT,
+        coerce=_coerce_destination_choice,
+        format_func=_destination_menu_label,
+    )
+    if choice == trip_core.DESTINATION_OTHER:
+        _bound_text_input("其他目的地", "destination_other", default="", placeholder="例如：韓國首爾")
+        if _custom_destination_missing():
+            st.warning(_OTHER_DESTINATION_REQUIRED)
+    elif not _destination_is_explicit(choice):
+        detected = _favourite_destination(favs)
+        if detected == "日本":
+            st.caption("自動判斷：收藏未有單一地區，會用日本。")
+        else:
+            st.caption(f"自動判斷：{detected}")
     st.markdown("**出發日與日數**")
     day_col, count_col = st.columns([1.35, 0.9], gap="small")
     with day_col:
@@ -3624,7 +3713,14 @@ def _render_plan() -> None:
             st.rerun()
     allow_ai = _allow_ai_suggestions(favs)
     has_date = bool(st.session_state.get("start_date"))
-    can_plan = bool(API_KEY) and remaining_quota() > 0 and has_date and (bool(favs) or allow_ai)
+    missing_other = _custom_destination_missing()
+    can_plan = (
+        bool(API_KEY)
+        and remaining_quota() > 0
+        and has_date
+        and (bool(favs) or allow_ai)
+        and not missing_other
+    )
     if not has_date:
         st.caption("請先選擇出發日與日數。")
     elif not favs and not allow_ai:
@@ -3634,19 +3730,10 @@ def _render_plan() -> None:
     elif remaining_quota() <= 0:
         st.caption("今次可用次數已用完。")
     submitted = st.button("開始排行程", type="primary", disabled=not can_plan, key="plan_go")
-    if not submitted:
+    if not submitted or _custom_destination_missing():
         return
     style = st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
-    request = trip_core.compose_trip_request(
-        trip_core.DESTINATION_DEFAULT,
-        days=st.session_state.get("day_count") or 3,
-        preferences=list(st.session_state.get("pref_pills") or []),
-        party=trip_core.PARTY_DEFAULT,
-        start_date=_date_text(st.session_state.get("start_date")),
-    )
-    destination = _favourite_destination(favs)
-    if destination == "日本":
-        destination = request["destination"]
+    destination, request = _planning_destination(favs)
     notes = "；".join(
         bit for bit in (
             request.get("notes") or "",
