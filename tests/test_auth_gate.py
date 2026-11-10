@@ -156,6 +156,8 @@ def test_logged_out_shows_google_button_and_stops(monkeypatch):
     text = _shown(fake)
     assert "請先用 Google 登入" in text
     assert "使用 Google 登入" in text
+    assert "一站式旅行規劃助手" in text
+    assert "Lazy Trip Planner" in text
     fake.login.assert_not_called()
     assert auth_gate.get_member_id() is None
 
