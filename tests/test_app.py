@@ -2651,10 +2651,10 @@ def test_second_session_edit_shows_the_new_banner_and_is_not_saved(monkeypatch):
     assert caught.value.args[0] == trip_store.MSG_CONFLICT
 
 
-_ITINERARY_UNSAVED = (
-    "AI 行程已生成，但尚未儲存：呢份行程可能已喺另一個分頁、工作階段或成員度更新。"
-    "重新整理或重新載入會失去呢份未儲存嘅行程。"
-)
+def _unsaved_text(at: AppTest) -> str:
+    return _joined(at.error) + "\n" + _page(at)
+
+
 _GENERATED_TITLE = "福岡9日網紅打卡極速快閃遊"
 
 
@@ -2688,9 +2688,19 @@ def _mock_plan(gen):
         mock.patch.object(gemini_client, "suggest_nearby", return_value=gemini_client.AnalysisResult([], []))
 
 
+def _nine_day_itinerary() -> dict:
+    one = _generated_itinerary()
+    stop = one["days"][0]["items"]
+    one["days"] = [
+        {"day": day, "area": "福岡", "theme": "打卡", "items": stop}
+        for day in range(1, 10)
+    ]
+    return one
+
+
 def test_single_session_generation_saves_before_opening_results():
     at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
-    patches = _mock_plan(lambda *args, **kwargs: _generated_itinerary())
+    patches = _mock_plan(lambda *args, **kwargs: _nine_day_itinerary())
     with patches[0], patches[1] as gen, patches[2]:
         _button(at, "開始排行程").click().run()
     assert gen.call_count == 1
@@ -2698,10 +2708,11 @@ def test_single_session_generation_saves_before_opening_results():
     assert at.session_state["screen"] == "E"
     assert not at.session_state.get("trip_conflict")
     assert not at.session_state.get("itinerary_unsaved")
-    assert _ITINERARY_UNSAVED not in _joined(at.error)
+    assert "尚未儲存" not in _unsaved_text(at)
     assert _CONFLICT_BANNER not in _joined(at.error)
     loaded = trip_store.load_trip(at.session_state["trip_id"])
     assert loaded["itinerary"]["title"] == _GENERATED_TITLE
+    assert len(loaded["itinerary"]["days"]) == 9
     assert at.session_state["seen_version"] == loaded["version"]
     assert "再試儲存" not in [button.label for button in at.button]
 
@@ -2728,7 +2739,8 @@ def test_generation_conflict_keeps_itinerary_and_does_not_overwrite(memory_supab
     assert at.session_state.get("trip_conflict")
     assert at.session_state.get("itinerary_unsaved")
     assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
-    assert _ITINERARY_UNSAVED in _joined(at.error)
+    assert "（SAVE-CONFLICT）" in _joined(at.error)
+    assert "另一個分頁、工作階段或成員" in _unsaved_text(at)
     assert _CONFLICT_BANNER in _joined(at.error)
     assert "再試儲存" not in [button.label for button in at.button]
     loaded = trip_store.load_trip(trip_id)
@@ -2736,7 +2748,7 @@ def test_generation_conflict_keeps_itinerary_and_does_not_overwrite(memory_supab
     assert loaded["day_count"] == 2
     _open_screen(at, "行程")
     assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
-    assert _ITINERARY_UNSAVED in _joined(at.error)
+    assert "（SAVE-CONFLICT）" in _joined(at.error)
     assert loaded.get("itinerary") in (None, {})
 
 
@@ -2748,7 +2760,7 @@ def test_generation_save_error_keeps_itinerary_without_pretending_saved(monkeypa
 
     def fail_once(snapshot):
         fail_once.calls += 1
-        raise trip_store.TripStoreError("暫時連不到行程儲存，請稍後再試。今次沒有改動已儲存的行程。")
+        raise trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE, reason="unavailable")
 
     fail_once.calls = 0
     monkeypatch.setattr(trip_store, "save_trip", fail_once)
@@ -2760,9 +2772,126 @@ def test_generation_save_error_keeps_itinerary_without_pretending_saved(monkeypa
     assert at.session_state["screen"] == "D"
     assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
     assert at.session_state.get("itinerary_unsaved")
-    assert _ITINERARY_UNSAVED in _joined(at.error)
+    assert "（SAVE-NET）" in _joined(at.error)
+    assert "連線、逾時或伺服器錯誤" in _unsaved_text(at)
+    assert "另一個分頁" not in _unsaved_text(at)
     assert "再試儲存" not in [button.label for button in at.button]
     monkeypatch.setattr(trip_store, "save_trip", real)
     loaded = trip_store.load_trip(trip_id)
     assert loaded.get("itinerary") == before.get("itinerary")
     assert loaded["version"] == before["version"]
+
+
+def _assert_save_code(at: AppTest, code: str, *, conflict_words: bool) -> None:
+    text = _unsaved_text(at)
+    assert f"（{code}）" in _joined(at.error)
+    assert "AI 行程已生成，但尚未儲存" in _joined(at.error)
+    if conflict_words:
+        assert "另一個分頁、工作階段或成員" in text
+    else:
+        assert "另一個分頁" not in text
+    assert "再試儲存" not in [button.label for button in at.button]
+    assert at.session_state["screen"] == "D"
+    assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
+
+
+def test_each_save_failure_code_is_shown_without_guessing_conflict(monkeypatch):
+    monkeypatch.setenv("MAX_TRIPS_PER_USER", "20")
+    cases = [
+        (trip_store.TripStoreError(trip_store.MSG_CONTENT), "SAVE-CONTENT", False),
+        (trip_store.TripStoreError(trip_store.MSG_DENIED), "SAVE-DENIED", False),
+        (
+            trip_store.TripStoreError(
+                trip_store.MSG_UNAVAILABLE,
+                reason="update0",
+                expected_version=4,
+                remote_version=4,
+            ),
+            "SAVE-UPDATE0",
+            False,
+        ),
+        (
+            trip_store.TripStoreError(trip_store.MSG_UNAVAILABLE, reason="unavailable"),
+            "SAVE-NET",
+            False,
+        ),
+        (trip_store.TripStoreError("未能歸類的儲存問題"), "SAVE-UNKNOWN", False),
+    ]
+    real_save = trip_store.save_trip
+    for exc, code, conflict_words in cases:
+        at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+
+        def fail(_snapshot, exc=exc):
+            raise exc
+
+        monkeypatch.setattr(trip_store, "save_trip", fail)
+        patches = _mock_plan(lambda *_args, **_kwargs: _generated_itinerary())
+        with patches[0], patches[1], patches[2]:
+            _button(at, "開始排行程").click().run()
+        assert not at.exception
+        _assert_save_code(at, code, conflict_words=conflict_words)
+        monkeypatch.setattr(trip_store, "save_trip", real_save)
+
+
+def test_already_conflict_and_missing_trip_use_their_own_codes():
+    already = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+
+    def mark_conflict(*_args, **_kwargs):
+        import streamlit as st
+        st.session_state.trip_conflict = True
+        return _generated_itinerary()
+
+    patches = _mock_plan(mark_conflict)
+    with patches[0], patches[1], patches[2]:
+        _button(already, "開始排行程").click().run()
+    _assert_save_code(already, "SAVE-ALREADY", conflict_words=True)
+    assert "已經有未解決的版本衝突" in _unsaved_text(already)
+    assert already.session_state.get("trip_conflict")
+
+    missing = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+
+    def drop_trip(*_args, **_kwargs):
+        import streamlit as st
+        st.session_state.trip_id = ""
+        st.session_state._inbox_save_inflight = True
+        return _generated_itinerary()
+
+    patches = _mock_plan(drop_trip)
+    with patches[0], patches[1], patches[2]:
+        _button(missing, "開始排行程").click().run()
+    _assert_save_code(missing, "SAVE-STATE", conflict_words=False)
+
+
+def test_save_failure_log_has_codes_and_no_sensitive_data(caplog):
+    at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+    trip_id = at.session_state["trip_id"]
+    at.session_state["favourites"] = [_fav(name="NameMarker顯示名", added_by="mail-marker@example.com")]
+    at.session_state["display_name"] = "NameMarker顯示名"
+
+    def fail(snapshot):
+        assert snapshot.get("trip_id") == trip_id
+        raise trip_store.TripStoreError(trip_store.MSG_CONTENT)
+
+    caplog.set_level("WARNING", logger="lazy_trip_planner")
+    with mock.patch.object(trip_store, "save_trip", side_effect=fail):
+        patches = _mock_plan(lambda *_args, **_kwargs: {
+            **_generated_itinerary(),
+            "title": "TitleMarker行程標題",
+        })
+        with patches[0], patches[1], patches[2]:
+            _button(at, "開始排行程").click().run()
+    logged = "\n".join(record.getMessage() for record in caplog.records)
+    assert "save_failed code=SAVE-CONTENT" in logged
+    assert "exc=TripStoreError" in logged
+    assert "payload_bytes=" in logged
+    assert "trip_hash=" in logged
+    for secret in (
+        trip_id,
+        "NameMarker顯示名",
+        "mail-marker@example.com",
+        "TitleMarker行程標題",
+        "太宰府天滿宮",
+        "test-member-sub",
+        "fake",
+    ):
+        assert secret not in logged
