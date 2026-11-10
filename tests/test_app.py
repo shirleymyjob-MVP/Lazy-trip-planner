@@ -2649,3 +2649,120 @@ def test_second_session_edit_shows_the_new_banner_and_is_not_saved(monkeypatch):
             "itinerary": None,
         })
     assert caught.value.args[0] == trip_store.MSG_CONFLICT
+
+
+_ITINERARY_UNSAVED = (
+    "AI 行程已生成，但尚未儲存：呢份行程可能已喺另一個分頁、工作階段或成員度更新。"
+    "重新整理或重新載入會失去呢份未儲存嘅行程。"
+)
+_GENERATED_TITLE = "福岡9日網紅打卡極速快閃遊"
+
+
+def _generated_itinerary() -> dict:
+    return {
+        "title": _GENERATED_TITLE,
+        "days": [{"day": 1, "area": "福岡", "theme": "", "items": [
+            {"time": "09:00", "place_name": "太宰府天滿宮", "activity": "參拜",
+             "is_meal": False, "maps_query": "太宰府天滿宮", "transit": ""},
+        ]}],
+        "tips": [],
+    }
+
+
+def _plan_with_trip(at: AppTest) -> AppTest:
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _open_screen(at, "排程")
+    at.session_state["favourites"] = [_fav()]
+    at.session_state["start_date"] = date(2026, 11, 14)
+    at.run()
+    assert not _button(at, "開始排行程").disabled
+    return at
+
+
+def _mock_plan(gen):
+    return mock.patch.object(gemini_client, "make_client", return_value=object()), \
+        mock.patch.object(gemini_client, "generate_itinerary", side_effect=gen), \
+        mock.patch.object(gemini_client, "suggest_nearby", return_value=gemini_client.AnalysisResult([], []))
+
+
+def test_single_session_generation_saves_before_opening_results():
+    at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+    patches = _mock_plan(lambda *args, **kwargs: _generated_itinerary())
+    with patches[0], patches[1] as gen, patches[2]:
+        _button(at, "開始排行程").click().run()
+    assert gen.call_count == 1
+    assert not at.exception
+    assert at.session_state["screen"] == "E"
+    assert not at.session_state.get("trip_conflict")
+    assert not at.session_state.get("itinerary_unsaved")
+    assert _ITINERARY_UNSAVED not in _joined(at.error)
+    assert _CONFLICT_BANNER not in _joined(at.error)
+    loaded = trip_store.load_trip(at.session_state["trip_id"])
+    assert loaded["itinerary"]["title"] == _GENERATED_TITLE
+    assert at.session_state["seen_version"] == loaded["version"]
+    assert "再試儲存" not in [button.label for button in at.button]
+
+
+def test_generation_conflict_keeps_itinerary_and_does_not_overwrite(memory_supabase):
+    at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+    trip_id = at.session_state["trip_id"]
+
+    def other_writer(*_args, **_kwargs):
+        row = next(item for item in memory_supabase.rows if item["id"] == trip_id)
+        row["version"] = int(row["version"]) + 1
+        payload = dict(row["payload"])
+        payload["day_count"] = 2
+        payload["itinerary"] = None
+        row["payload"] = payload
+        row["updated_at"] = str(row.get("updated_at") or "") + "X"
+        return _generated_itinerary()
+
+    patches = _mock_plan(other_writer)
+    with patches[0], patches[1], patches[2]:
+        _button(at, "開始排行程").click().run()
+    assert not at.exception
+    assert at.session_state["screen"] == "D"
+    assert at.session_state.get("trip_conflict")
+    assert at.session_state.get("itinerary_unsaved")
+    assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
+    assert _ITINERARY_UNSAVED in _joined(at.error)
+    assert _CONFLICT_BANNER in _joined(at.error)
+    assert "再試儲存" not in [button.label for button in at.button]
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded.get("itinerary") in (None, {})
+    assert loaded["day_count"] == 2
+    _open_screen(at, "行程")
+    assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
+    assert _ITINERARY_UNSAVED in _joined(at.error)
+    assert loaded.get("itinerary") in (None, {})
+
+
+def test_generation_save_error_keeps_itinerary_without_pretending_saved(monkeypatch):
+    at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+    trip_id = at.session_state["trip_id"]
+    before = trip_store.load_trip(trip_id)
+    real = trip_store.save_trip
+
+    def fail_once(snapshot):
+        fail_once.calls += 1
+        raise trip_store.TripStoreError("暫時連不到行程儲存，請稍後再試。今次沒有改動已儲存的行程。")
+
+    fail_once.calls = 0
+    monkeypatch.setattr(trip_store, "save_trip", fail_once)
+    patches = _mock_plan(lambda *_args, **_kwargs: _generated_itinerary())
+    with patches[0], patches[1], patches[2]:
+        _button(at, "開始排行程").click().run()
+    assert not at.exception
+    assert fail_once.calls == 1
+    assert at.session_state["screen"] == "D"
+    assert at.session_state["itinerary"]["title"] == _GENERATED_TITLE
+    assert at.session_state.get("itinerary_unsaved")
+    assert _ITINERARY_UNSAVED in _joined(at.error)
+    assert "再試儲存" not in [button.label for button in at.button]
+    monkeypatch.setattr(trip_store, "save_trip", real)
+    loaded = trip_store.load_trip(trip_id)
+    assert loaded.get("itinerary") == before.get("itinerary")
+    assert loaded["version"] == before["version"]
