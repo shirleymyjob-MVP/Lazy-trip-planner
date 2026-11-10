@@ -45,7 +45,7 @@ begin
     and c.table_name = 'trips';
   raise notice 'preflight public.trips columns: %', cols;
 
-  select string_agg(con.conname || ' ' || con.contype, ', ' order by con.conname)
+  select string_agg(con.conname::text || ' ' || con.contype::text, ', ' order by con.conname)
     into constraint_names
   from pg_constraint con
   where con.conrelid = 'public.trips'::regclass;
