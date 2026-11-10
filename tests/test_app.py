@@ -135,6 +135,8 @@ def test_opening_shows_the_four_steps_and_build_without_a_paywall():
     assert not at.exception
     page = _page(at)
     assert "懶人出行" in page
+    assert "歡迎回來，旅人！" in page
+    assert "進行中" not in page
     assert trip_core.HERO_LINE in page
     for step in trip_core.OPENING_STEPS:
         assert step in page
@@ -147,6 +149,7 @@ def test_opening_shows_the_four_steps_and_build_without_a_paywall():
     assert not start.disabled
     assert not any(button.label == "開始排行程" for button in at.button)
     assert not at.download_button
+    assert any(block.value == "你仲未有行程" for block in at.info)
 
 
 def test_logout_css_stays_tappable_without_covering_the_desktop_column():
@@ -2895,3 +2898,59 @@ def test_save_failure_log_has_codes_and_no_sensitive_data(caplog):
         "fake",
     ):
         assert secret not in logged
+
+
+def test_home_prefers_google_display_name(monkeypatch):
+    monkeypatch.setattr(auth_gate, "get_display_name", lambda: "阿花")
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    assert "歡迎回來，阿花！" in _page(at)
+    assert "進行中" not in _page(at)
+
+
+def test_home_sorts_visible_trips_and_in_progress_uses_saved_dates(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _button(at, "建立新旅行夾").click().run()
+    for row in memory_supabase.rows:
+        title = (row.get("payload") or {}).get("title")
+        if title == "行程 1":
+            row["updated_at"] = "2026-12-01T00:00:00+00:00"
+        elif title == "行程 2":
+            row["updated_at"] = "2020-01-01T00:00:00+00:00"
+    _open_screen(at, "首頁")
+    labels = [button.label for button in at.button]
+    assert labels.index("行程 1") < labels.index("行程 2（目前）")
+    assert "進行中" not in _page(at)
+    _open_screen(at, "旅行夾")
+    today = date.today().isoformat()
+    [box for box in at.text_input if box.label == "旅行開始"][0].input(today).run()
+    [box for box in at.text_input if box.label == "旅行結束"][0].input(today).run()
+    _open_screen(at, "首頁")
+    assert "進行中" in _page(at)
+    assert "行程 2" in _page(at)
+    _button(at, "前往收集").click().run()
+    assert at.session_state["screen"] == "B"
+    _open_screen(at, "旅行夾")
+    [box for box in at.text_input if box.label == "旅行開始"][0].input("2020-01-01").run()
+    [box for box in at.text_input if box.label == "旅行結束"][0].input("2020-01-02").run()
+    _open_screen(at, "首頁")
+    assert "進行中" not in _page(at)
+    assert "前往排程" not in [button.label for button in at.button]
+
+
+def test_workspace_schedule_card_opens_plan_without_removing_results(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    _button(at, "前往排程").click().run()
+    assert at.session_state["screen"] == "D"
+    _open_screen(at, "旅行夾")
+    _button(at, "前往行程").click().run()
+    assert at.session_state["screen"] == "D"

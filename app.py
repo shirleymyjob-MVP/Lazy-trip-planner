@@ -309,8 +309,30 @@ st.markdown(
     """
     <style>
       .stApp {
-        background: linear-gradient(180deg, #FFF8F5 0%, #FFF5F2 220px, #FFFFFF 480px);
-        color: #2C2C2C;
+        background: linear-gradient(180deg, #FFF0F5 0%, #FFF7F8 240px, #FFFFFF 520px);
+        color: #3A2A2E;
+      }
+      .v2a-kicker { color: #C45C74; font-weight: 700; font-size: 13px; margin: 0; }
+      .v2a-card, .v2a-status {
+        background: #FFFFFF;
+        border: 1px solid #F6D5DC;
+        border-radius: 16px;
+        padding: 12px 14px;
+        margin: 8px 0 4px;
+      }
+      .v2a-status { background: #FFE4EC; }
+      .v2a-title { font-size: 18px; font-weight: 700; margin: 2px 0; color: #3A2A2E; }
+      .v2a-meta { color: #7A5C64; font-size: 13px; margin: 0; line-height: 1.5; }
+      button[kind="primary"] {
+        background-color: #E85D75 !important;
+        border-color: #E85D75 !important;
+      }
+      div.st-key-ask_delete_trip button,
+      div.st-key-confirm_delete_trip button,
+      div.st-key-ask_remove button,
+      div[class*="st-key-ask_remove_"] button {
+        border-color: #B42318 !important;
+        color: #B42318 !important;
       }
       h1, h2, h3 { color: #2C2C2C; }
       .trip-kicker {
@@ -1960,6 +1982,15 @@ def _render_folder_rows(rows: list[dict], current: str) -> None:
         label = _trip_button_label(row, current=current)
         if not row.get("title"):
             label = _trip_button_label({**row, "title": f"行程 {index}"}, current=current)
+        updated = str(row.get("updated_at") or "").strip()
+        meta = f"最近更新 {updated[:10]}" if len(updated) >= 10 else "未有更新時間"
+        kind = "共同旅行" if row.get("is_shared") else "私人行程"
+        st.markdown(
+            f'<div class="v2a-card"><p class="v2a-meta">{html.escape(kind)}</p>'
+            f'<p class="v2a-title">{html.escape(str(row.get("title") or "行程"))}</p>'
+            f'<p class="v2a-meta">{html.escape(meta)}</p></div>',
+            unsafe_allow_html=True,
+        )
         if st.button(label, key=f"switch_trip_{row['id']}", use_container_width=True):
             if row.get("id") != current or st.session_state.get("view_inbox"):
                 _activate_trip(row["id"])
@@ -2272,22 +2303,26 @@ def _render_workspace() -> None:
     if st.session_state.get("trip_role") == "owner" and st.session_state.get("invite_panel"):
         _render_invite_panel(trip_id)
     fav_label = "共同收藏" if shared else "我的收藏"
-    c1, c2, c3 = st.columns(3)
-    with c1:
-        st.markdown("**收集靈感**")
-        st.caption("上傳截圖，AI 識別")
-        if st.button("前往收集", key="workspace_collect", use_container_width=True):
-            _go("B")
-    with c2:
-        st.markdown(f"**{fav_label}**")
-        st.caption("查看與編輯所有景點")
-        if st.button("前往收藏", key="workspace_favs", use_container_width=True):
-            _go("C")
-    with c3:
-        st.markdown("**行程管理**")
-        st.caption("查看／編輯旅行行程")
-        if st.button("前往行程", key="workspace_plan", use_container_width=True):
-            _go("E" if st.session_state.get("itinerary") else "D")
+    entries = (
+        ("收集靈感", "上傳截圖，AI 識別", "前往收集", "workspace_collect", "B"),
+        (fav_label, "查看與編輯所有景點", "前往收藏", "workspace_favs", "C"),
+        ("排程", "設定目的地、日期並開始排行程", "前往排程", "workspace_schedule", "D"),
+        (
+            "查看結果",
+            "已生成的行程；未有行程時會去排程",
+            "前往行程",
+            "workspace_plan",
+            "E" if st.session_state.get("itinerary") else "D",
+        ),
+    )
+    for heading, blurb, label, key, screen in entries:
+        st.markdown(
+            f'<div class="v2a-card"><p class="v2a-title">{html.escape(heading)}</p>'
+            f'<p class="v2a-meta">{html.escape(blurb)}</p></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(label, key=key, use_container_width=True):
+            _go(screen)
     st.markdown("**旅行資料**")
     _bound_text_input("行程名稱", "trip_title", default="行程")
     start_col, end_col = st.columns(2)
@@ -4195,14 +4230,87 @@ def _render_results() -> None:
         st.link_button("喺 Google 睇行程", maps_url, type="primary", use_container_width=True)
 
 
+def _welcome_name() -> str:
+    google = auth_gate.get_display_name()
+    if google:
+        return google
+    name = (st.session_state.get("display_name") or "").strip()
+    return name or "旅人"
+
+
+def _dates_in_progress(start, end, today: date | None = None) -> bool:
+    """只有開始同結束都係有效日期，而且今日落在區間內，先算進行中。"""
+    start_day = _parse_iso_date(start)
+    end_day = _parse_iso_date(end)
+    if start_day is None or end_day is None or end_day < start_day:
+        return False
+    today = today or date.today()
+    return start_day <= today <= end_day
+
+
+def _recent_catalog(catalog: list[dict]) -> tuple[list[dict], bool]:
+    """用資料列的 updated_at 由新到舊。完全冇呢個欄就保持原順序，而且唔叫「最近」。"""
+    stamped = [row for row in catalog if str(row.get("updated_at") or "").strip()]
+    if not stamped:
+        return list(catalog), False
+    ordered = sorted(catalog, key=lambda row: str(row.get("updated_at") or ""), reverse=True)
+    return ordered, True
+
+
 def _render_opening() -> None:
-    st.title("懶人出行 ✈️")
-    st.markdown(f'<p class="hero-line">{HERO_LINE}</p>', unsafe_allow_html=True)
-    steps = "\n".join(f"{index}. {label}" for index, label in enumerate(OPENING_STEPS, start=1))
-    st.markdown(steps)
+    st.markdown('<p class="v2a-kicker">Lazy Trip Planner</p>', unsafe_allow_html=True)
+    st.title("懶人出行")
+    st.markdown(f"### 歡迎回來，{html.escape(_welcome_name())}！")
+    st.caption(HERO_LINE)
+    st.caption(" · ".join(OPENING_STEPS))
     _bound_text_input("你的顯示名", "display_name", default="旅人")
-    if st.button("開始收集想去的地方", type="primary", key="start_collect"):
+    catalog = list(st.session_state.get("trip_catalog") or [])
+    current = str(st.session_state.get("trip_id") or "")
+    loaded = next((row for row in catalog if row.get("id") == current), None)
+    if (
+        loaded
+        and not st.session_state.get("view_inbox")
+        and _dates_in_progress(
+            st.session_state.get("travel_start"),
+            st.session_state.get("travel_end"),
+        )
+    ):
+        title = str(loaded.get("title") or st.session_state.get("trip_title") or "行程")
+        st.markdown(
+            f'<div class="v2a-status"><p class="v2a-meta">進行中</p>'
+            f'<p class="v2a-title">{html.escape(title)}</p>'
+            f'<p class="v2a-meta">依已儲存的旅行日期推導，唔係估計。</p></div>',
+            unsafe_allow_html=True,
+        )
+        if st.session_state.get("itinerary"):
+            if st.button("前往行程", key="home_open_itinerary", use_container_width=True):
+                _go("E")
+        elif st.button("前往收集", key="home_open_collect", use_container_width=True):
+            _go("B")
+    if st.button("開始收集想去的地方", type="primary", key="start_collect", use_container_width=True):
         _go("B")
+    if st.button("前往旅行夾", key="home_open_folder", use_container_width=True):
+        _go("F")
+    if not catalog:
+        st.info(_EMPTY_TRIPS_NOTE)
+        return
+    ordered, by_time = _recent_catalog(catalog)
+    heading = "最近的行程" if by_time else "你的行程"
+    st.markdown(f"**{heading}（{len(ordered)}）**")
+    if not by_time:
+        st.caption("未有可靠的更新時間，以下唔當最近排序。")
+    for row in ordered:
+        kind = "共同旅行" if row.get("is_shared") else "私人行程"
+        updated = str(row.get("updated_at") or "").strip()
+        when = updated[:10] if len(updated) >= 10 else "未有更新時間"
+        st.markdown(
+            f'<div class="v2a-card"><p class="v2a-meta">{html.escape(kind)} · {html.escape(when)}</p>'
+            f'<p class="v2a-title">{html.escape(str(row.get("title") or "行程"))}</p></div>',
+            unsafe_allow_html=True,
+        )
+        label = _trip_button_label(row, current=current)
+        if st.button(label, key=f"home_trip_{row['id']}", use_container_width=True):
+            _activate_trip(row["id"])
 
 
 init_state()

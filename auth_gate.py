@@ -116,9 +116,32 @@ def _do_logout() -> None:
 
 
 def _render_login() -> None:
+    st.markdown(
+        """
+        <style>
+          .stApp {
+            background: linear-gradient(180deg, #FFF0F5 0%, #FFF7F8 280px, #FFFFFF 560px);
+          }
+          .v2a-kicker { color: #C45C74; font-weight: 700; font-size: 13px; margin: 0 0 4px; }
+          .v2a-intro {
+            background: #FFFFFF;
+            border: 1px solid #F6D5DC;
+            border-radius: 16px;
+            padding: 12px 14px;
+            color: #5C4A4E;
+            line-height: 1.6;
+          }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown('<p class="v2a-kicker">Lazy Trip Planner</p>', unsafe_allow_html=True)
     st.title("懶人出行")
-    st.subheader("請先用 Google 登入")
-    st.markdown("登入之後先可以收集地方同編輯行程。")
+    st.subheader("一站式旅行規劃助手")
+    st.markdown(
+        '<div class="v2a-intro">請先用 Google 登入。登入之後先可以收集地方同編輯行程。</div>',
+        unsafe_allow_html=True,
+    )
     if _query_text("invite"):
         st.info("你打開咗邀請連結。請先用 Google 登入，登入後再開一次同一條連結先可以加入。")
     st.caption("如果係朋友嘅邀請連結，登入之後會回到首頁，連結會消失。請登入後再開一次同一條連結。")
