@@ -8,10 +8,12 @@ from __future__ import annotations
 import base64
 import hashlib
 import html
+import importlib
 import logging
 import os
 import re
 import subprocess
+import sys
 import time
 import unicodedata
 import uuid
@@ -28,10 +30,185 @@ import gemini_client
 import trip_core
 import trip_store
 
+# Streamlit Cloud 熱重載會再執行 app.py，但 sys.modules 入面嘅本地模組可能仲係舊物件。
+# 例如 PR #21 先加的 list_visible_trips：舊 trip_store 仍有 release_adopted_collection_inbox，
+# 登入後 _load_shared_trip 就 AttributeError。依賴要先重載（trip_store import auth_gate，
+# gemini_client import trip_core）。屬性齊就唔好重載，避免清走行程鎖同其他模組狀態。
+# 重載後仍然缺就停，唔好靜默退回本機儲存或分享模式。
+_LOCAL_MODULE_ORDER = (
+    "auth_gate",
+    "trip_core",
+    "gemini_client",
+    "trip_store",
+)
+_REQUIRED_LOCAL_ATTRS = {
+    "auth_gate": (
+        "get_display_name",
+        "get_member_id",
+        "render_logout",
+        "require_login",
+    ),
+    "trip_core": (
+        "COLLECT_STATUS_DONE",
+        "COLLECT_STATUS_FAIL",
+        "COLLECT_STATUS_IDLE",
+        "COLLECT_STATUS_RUNNING",
+        "COLLECT_STATUS_VERIFYING",
+        "DAY_DEFAULT",
+        "DEFAULT_TRIP_STYLE",
+        "DESTINATION_DEFAULT",
+        "FAVOURITE_CATEGORIES",
+        "HERO_LINE",
+        "NEARBY_UNVERIFIED_NOTE",
+        "OPENING_STEPS",
+        "PARTY_DEFAULT",
+        "PAYWALL_NOTE",
+        "PLAN_PREF_OPTIONS",
+        "PREFERENCE_DEFAULT",
+        "QUICK_REGION_FIXES",
+        "REGION_LOW",
+        "REGION_MANUAL",
+        "SPARSE_COLLECTION_MIN",
+        "TRIP_STYLES",
+        "UNSORTED_REGION",
+        "UNVERIFIED",
+        "_norm_key",
+        "address_specificity",
+        "addresses_near",
+        "append_verifiable_nearby",
+        "apply_visible_address",
+        "attach_place_facts",
+        "attribution_html",
+        "classify_regions",
+        "collect_status",
+        "compose_trip_request",
+        "decode_clipboard_payload",
+        "dedupe_places",
+        "fallback_trip_title",
+        "favourite_category",
+        "format_rating",
+        "garbled_place_name",
+        "generic_suggestion_name",
+        "inbox_region_names",
+        "looks_like_salon",
+        "match_favourite",
+        "match_place",
+        "merge_known_places",
+        "model_category",
+        "model_category_for_label",
+        "place_is_complete",
+        "place_regions",
+        "places_needing_facts",
+        "prefer_printed_facts",
+        "prepare_image",
+        "present_itinerary",
+        "public_fact",
+        "replace_generic_suggestions",
+        "same_favourite",
+        "seed_place",
+        "shared_inbox_region",
+        "strip_ai_label",
+        "style_planning_note",
+        "suggestion_is_verifiable",
+    ),
+    "gemini_client": (
+        "AnalysisResult",
+        "CROWD_RATE_LIMIT_MESSAGE",
+        "DEFAULT_ENRICH_MODEL",
+        "DEFAULT_ITINERARY_MODEL",
+        "DEFAULT_NAMES_MODEL",
+        "DEFAULT_RETRY_ATTEMPTS",
+        "DEFAULT_TIMEOUT_MS",
+        "ENRICH_INCOMPLETE_WARNING",
+        "GeminiError",
+        "MAPS_UNAVAILABLE_WARNING",
+        "enrich_places",
+        "generate_itinerary",
+        "make_client",
+        "recognize_names",
+        "suggest_nearby",
+    ),
+    "trip_store": (
+        "INVITE_DAYS",
+        "MSG_CONFLICT",
+        "TripConflictError",
+        "TripStoreError",
+        "accept_invite",
+        "adopt_collection_inbox",
+        "collection_inbox_id",
+        "collection_inbox_status",
+        "count_images",
+        "count_images_for_trip",
+        "create_invite",
+        "create_trip",
+        "delete_trip",
+        "digest",
+        "has_pending_collection_inbox",
+        "images_cap_message",
+        "invite_status",
+        "leave_trip",
+        "list_collaborators",
+        "list_visible_trips",
+        "load_collection_inbox",
+        "load_trip",
+        "max_images",
+        "max_joined_trips",
+        "max_members_per_trip",
+        "max_trips",
+        "refresh_actor_name",
+        "release_adopted_collection_inbox",
+        "remove_member",
+        "revoke_invites",
+        "save_collection_inbox",
+        "save_trip",
+    ),
+}
+
+
+def _missing_local_attrs(module: object, names: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(name for name in names if not hasattr(module, name))
+
+
+def _ensure_local_modules() -> None:
+    """本地模組缺少 app.py 需要的屬性時重載一次。重載後仍缺就停。"""
+    for name in _LOCAL_MODULE_ORDER:
+        module = sys.modules.get(name)
+        if module is None:
+            raise RuntimeError(
+                f"本地模組 {name} 不在 sys.modules，無法核對 app.py 需要的屬性。"
+                "不會改用本機儲存或分享模式。"
+            )
+        required = _REQUIRED_LOCAL_ATTRS[name]
+        missing = _missing_local_attrs(module, required)
+        if not missing:
+            continue
+        logging.getLogger("lazy_trip_planner").warning(
+            "本地模組 %s 缺少 %s，會重新載入檔案上的版本。",
+            name,
+            ", ".join(missing),
+        )
+        try:
+            reloaded = importlib.reload(module)
+        except Exception as exc:
+            raise RuntimeError(
+                f"{name} 缺少屬性 {', '.join(missing)}，重新載入失敗（{exc.__class__.__name__}）。"
+                "不會改用本機儲存或分享模式。"
+            ) from exc
+        globals()[name] = reloaded
+        still = _missing_local_attrs(reloaded, required)
+        if still:
+            raise RuntimeError(
+                f"{name} 重新載入後仍缺少 app.py 需要的屬性：{', '.join(still)}。"
+                "不會改用本機儲存或分享模式。"
+            )
+
+
+_ensure_local_modules()
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("lazy_trip_planner")
 
-# Cloud 有時新 app.py 對住舊 trip_core。新流程先有嘅常數缺咗就用畫面預設，唔好整頁爆。
+# 舊 trip_core 的常數。_ensure_local_modules 已經先重載；重載後仍缺會停，唔好靠呢度頂住。
 DEFAULT_TRIP_STYLE = getattr(trip_core, "DEFAULT_TRIP_STYLE", "平衡型")
 HERO_LINE = getattr(
     trip_core,
