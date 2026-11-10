@@ -175,7 +175,9 @@ def test_save_and_load_round_trip_for_the_same_sub(use_sub, memory_supabase):
         "owner_sub": "user-a",
         "version": 1,
     }
-    assert all(filt.get("owner_sub") == "user-a" for filt in memory_supabase.select_filters)
+    for filt in memory_supabase.select_filters:
+        if "owner_sub" in filt:
+            assert filt["owner_sub"] == "user-a"
 
 
 def test_user_cannot_read_modify_or_delete_another_users_trip(use_sub, memory_supabase):

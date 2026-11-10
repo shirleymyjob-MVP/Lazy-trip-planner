@@ -298,6 +298,13 @@ def _block_store(monkeypatch, tmp_path):
         "release_adopted_collection_inbox",
         "collection_inbox_id",
         "has_pending_collection_inbox",
+        "list_visible_trips",
+        "list_joined_trips",
+        "collection_inbox_status",
+        "create_invite",
+        "accept_invite",
+        "revoke_invites",
+        "count_images_for_trip",
     ):
         monkeypatch.setattr(trip_store, name, fail)
 

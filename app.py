@@ -15,6 +15,7 @@ import subprocess
 import time
 import unicodedata
 import uuid
+from datetime import date, datetime
 from pathlib import Path
 from urllib.parse import quote, urlencode
 
@@ -35,7 +36,7 @@ DEFAULT_TRIP_STYLE = getattr(trip_core, "DEFAULT_TRIP_STYLE", "平衡型")
 HERO_LINE = getattr(
     trip_core,
     "HERO_LINE",
-    "貼上你想去的地方，系統會幫你整理清單並安排每日行程，完成後可分享給朋友一起修改。",
+    "貼上你想去的地方，系統會幫你整理清單並安排每日行程。行程擁有者可以邀請已登入的朋友，一齊編輯同一份行程。",
 )
 OPENING_STEPS = getattr(
     trip_core,
@@ -44,7 +45,7 @@ OPENING_STEPS = getattr(
         "收集想去的地方",
         "查看／整理我的收藏",
         "一鍵排行程",
-        "收集後可邀請朋友一起修改",
+        "擁有者可邀請朋友一齊編輯",
     ),
 )
 PAYWALL_NOTE = getattr(trip_core, "PAYWALL_NOTE", "收費：待定")
@@ -126,6 +127,13 @@ st.markdown(
         color: #2C2C2C;
       }
       h1, h2, h3 { color: #2C2C2C; }
+      .trip-kicker {
+        margin: 0 0 2px;
+        color: #E85D52;
+        font-size: 13px;
+        font-weight: 700;
+        letter-spacing: 0.02em;
+      }
       .hero-line, .style-banner, .invite-label {
         background: #FFF5F2;
         border-radius: 16px;
@@ -626,6 +634,10 @@ _MOBILE = components.declare_component(
     "mobile_fix",
     path=str(Path(__file__).parent / "components" / "mobile_fix"),
 )
+_COPY = components.declare_component(
+    "copy_link",
+    path=str(Path(__file__).parent / "components" / "copy_link"),
+)
 
 
 # ---------------------------------------------------------------- config
@@ -708,6 +720,12 @@ def init_state():
     st.session_state.setdefault("display_name", "旅人")
     st.session_state.setdefault("members", [])
     st.session_state.setdefault("screen", "A")
+    st.session_state.setdefault("travel_start", "")
+    st.session_state.setdefault("travel_end", "")
+    st.session_state.setdefault("owner_display_name", "")
+    st.session_state.setdefault("trip_role", "")
+    st.session_state.setdefault("is_shared_trip", False)
+    st.session_state.setdefault("view_inbox", False)
     st.session_state.setdefault("favourites", [])
     st.session_state.setdefault("removed_fav_ids", [])
     st.session_state.setdefault("trip_style", DEFAULT_TRIP_STYLE)
@@ -741,6 +759,49 @@ def _upload_key(uploaded_file) -> str:
 
 def _viewer_name() -> str:
     return (st.session_state.get("display_name") or "旅人").strip() or "旅人"
+
+
+def _public_name() -> str:
+    """成員名單用。Google 顯示名優先，否則用畫面顯示名。永遠唔用 sub。"""
+    google = auth_gate.get_display_name()
+    if google:
+        return google
+    name = (st.session_state.get("display_name") or "").strip()
+    sub = auth_gate.get_member_id() or ""
+    if not name or name == sub:
+        return "旅人"
+    return name
+
+
+def _owner_name_for_snapshot() -> str:
+    if st.session_state.get("trip_role") == "owner":
+        return auth_gate.get_display_name() or str(st.session_state.get("owner_display_name") or "")
+    return str(st.session_state.get("owner_display_name") or "")
+
+
+def _parse_iso_date(value):
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str) and value.strip():
+        try:
+            return date.fromisoformat(value.strip()[:10])
+        except ValueError:
+            return None
+    return None
+
+
+def _query_text(name: str) -> str:
+    try:
+        value = st.query_params.get(name)
+    except Exception:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], str):
+        return value[0].strip()
+    return ""
 
 
 def _new_item(image: bytes, remark: str, *, batch: bool = False) -> dict:
@@ -974,6 +1035,13 @@ def _apply_loaded_trip(loaded: dict) -> None:
         st.session_state.allow_ai = bool(loaded.get("allow_ai"))
     if loaded.get("day_count"):
         st.session_state.day_count = int(loaded["day_count"])
+    st.session_state.travel_start = _stored_date_text(loaded.get("travel_start"))
+    st.session_state.travel_end = _stored_date_text(loaded.get("travel_end"))
+    st.session_state.owner_display_name = str(loaded.get("owner_display_name") or "")
+    if loaded.get("role") in {"owner", "member"}:
+        st.session_state.trip_role = loaded["role"]
+    if "is_shared" in loaded:
+        st.session_state.is_shared_trip = bool(loaded.get("is_shared"))
     picks = loaded.get("picks") or {}
     for item in st.session_state.inbox:
         st.session_state[f"pick_{item['id']}"] = bool(picks.get(item["id"], True))
@@ -1165,6 +1233,118 @@ def _stop_for_pending_inbox() -> bool:
     return True
 
 
+def _consume_invite() -> None:
+    """?invite= 只可以喺已登入之後用。登入會掉 query，登入頁會叫人再開一次。"""
+    token = _query_text("invite")
+    if not token:
+        return
+    marker = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    if st.session_state.get("_invite_handled") == marker:
+        return
+    st.session_state._invite_handled = marker
+    try:
+        result = trip_store.accept_invite(token, _public_name())
+    except trip_store.TripStoreError as err:
+        st.session_state.invite_error = str(err)
+    else:
+        st.session_state.invite_error = ""
+        st.session_state.view_inbox = False
+        st.session_state.invite_panel = False
+        st.session_state.trip_id = result["id"]
+        st.session_state.force_trip_reload = True
+        st.session_state.screen = "A"
+    try:
+        if "invite" in list(st.query_params):
+            del st.query_params["invite"]
+    except Exception:
+        pass
+    st.rerun()
+
+
+def _maybe_refresh_profile(trip_id: str) -> None:
+    name = auth_gate.get_display_name()
+    if not name or st.session_state.get("trip_conflict"):
+        return
+    if st.session_state.get("trip_role") != "member" and _unsaved_local_changes():
+        return
+    try:
+        refreshed = trip_store.refresh_actor_name(trip_id, name)
+    except trip_store.TripStoreError:
+        return
+    if not refreshed:
+        return
+    if _version_ready(refreshed.get("version")):
+        st.session_state.seen_version = refreshed["version"]
+    if refreshed.get("owner_display_name"):
+        st.session_state.owner_display_name = refreshed["owner_display_name"]
+    try:
+        st.session_state.last_digest = trip_store.digest(_snapshot())
+    except trip_store.TripStoreError:
+        pass
+
+
+def _catalog_row(row: dict) -> dict:
+    return {
+        "id": row["id"],
+        "title": row.get("title") or "行程",
+        "is_shared": bool(row.get("is_shared")),
+        "role": row.get("role") or "owner",
+        "member_count": int(row.get("member_count") or 1),
+        "version": row.get("version"),
+        "updated_at": row.get("updated_at") or "",
+    }
+
+
+def _load_inbox_document() -> bool:
+    """讀收藏匣。沒有匣而且已經有行程時回傳 False，叫呼叫方改開行程。"""
+    force = bool(st.session_state.pop("force_trip_reload", False))
+    try:
+        loaded = trip_store.load_collection_inbox()
+    except trip_store.TripStoreError as err:
+        _storage_stop(str(err))
+    if loaded is None:
+        if st.session_state.get("trip_catalog"):
+            st.session_state.view_inbox = False
+            if force:
+                st.session_state.force_trip_reload = True
+            return False
+        st.session_state.trip_id = ""
+        st.session_state.loaded_trip_id = ""
+        st.session_state.collection_inbox_id = ""
+        st.session_state.loaded_inbox_id = ""
+        st.session_state.seen_stamp = ""
+        st.session_state.seen_version = None
+        st.session_state.last_digest = ""
+        st.session_state.trip_conflict = False
+        st.session_state.view_inbox = False
+        st.session_state.trip_role = ""
+        st.session_state.is_shared_trip = False
+        return True
+    inbox_id = str(loaded.get("trip_id") or "")
+    st.session_state.view_inbox = True
+    st.session_state.trip_id = ""
+    st.session_state.loaded_trip_id = ""
+    st.session_state.collection_inbox_id = inbox_id
+    st.session_state.trip_role = "owner"
+    st.session_state.is_shared_trip = False
+    remote_stamp = loaded.get("updated_at") or ""
+    same = st.session_state.get("loaded_inbox_id") == inbox_id
+    if (
+        not force
+        and same
+        and str(st.session_state.get("seen_stamp") or "") == str(remote_stamp)
+        and not _remote_moved(remote_stamp, loaded.get("version"))
+    ):
+        if not _version_ready(st.session_state.get("seen_version")):
+            _note_seen(loaded, remote_stamp)
+        st.session_state.loaded_inbox_id = inbox_id
+        st.session_state.trip_conflict = False
+        return True
+    _sync_remote_content(loaded, remote_stamp, same=same, force=force, title=False)
+    st.session_state.loaded_inbox_id = inbox_id
+    return True
+
+
 def _load_shared_trip() -> None:
     # 每次執行先放開「今次已撳過新增」嘅鎖。重播同一次撳掣靠 _skip_next_create。
     st.session_state._create_done_this_run = False
@@ -1176,51 +1356,17 @@ def _load_shared_trip() -> None:
     except trip_store.TripStoreError as err:
         _remember_storage_error(str(err))
     _clear_inbox_cleanup_warning_if_done()
+    _consume_invite()
     try:
-        trips = trip_store.list_trips()
+        trips = trip_store.list_visible_trips()
     except trip_store.TripStoreError as err:
         _storage_stop(str(err))
-    if not trips:
-        # 唔好自動開行程。有收藏匣先讀，沒有就唔好新增。
-        st.session_state.trip_catalog = []
-        st.session_state.trip_id = ""
-        st.session_state.loaded_trip_id = ""
-        force = bool(st.session_state.pop("force_trip_reload", False))
-        try:
-            loaded = trip_store.load_collection_inbox()
-        except trip_store.TripStoreError as err:
-            _storage_stop(str(err))
-        if loaded is None:
-            st.session_state.collection_inbox_id = ""
-            st.session_state.loaded_inbox_id = ""
-            st.session_state.seen_stamp = ""
-            st.session_state.seen_version = None
-            st.session_state.last_digest = ""
-            st.session_state.trip_conflict = False
+    st.session_state.trip_catalog = [_catalog_row(row) for row in trips]
+    if st.session_state.get("view_inbox") or not trips:
+        if _load_inbox_document():
             return
-        inbox_id = str(loaded.get("trip_id") or "")
-        st.session_state.collection_inbox_id = inbox_id
-        remote_stamp = loaded.get("updated_at") or ""
-        same = st.session_state.get("loaded_inbox_id") == inbox_id
-        if (
-            not force
-            and same
-            and str(st.session_state.get("seen_stamp") or "") == str(remote_stamp)
-            and not _remote_moved(remote_stamp, loaded.get("version"))
-        ):
-            if not _version_ready(st.session_state.get("seen_version")):
-                _note_seen(loaded, remote_stamp)
-            st.session_state.loaded_inbox_id = inbox_id
-            st.session_state.trip_conflict = False
-            return
-        _sync_remote_content(loaded, remote_stamp, same=same, force=force, title=False)
-        st.session_state.loaded_inbox_id = inbox_id
-        return
     st.session_state.collection_inbox_id = ""
     st.session_state.loaded_inbox_id = ""
-    st.session_state.trip_catalog = [
-        {"id": row["id"], "title": row.get("title") or "行程"} for row in trips
-    ]
     ids = [row["id"] for row in trips]
     requested = str(st.session_state.get("trip_id") or "")
     force = bool(st.session_state.pop("force_trip_reload", False))
@@ -1231,7 +1377,10 @@ def _load_shared_trip() -> None:
     else:
         current = requested
     st.session_state.trip_id = current
+    st.session_state.view_inbox = False
     remote = next(row for row in trips if row["id"] == current)
+    st.session_state.trip_role = remote.get("role") or "owner"
+    st.session_state.is_shared_trip = bool(remote.get("is_shared"))
     remote_stamp = remote.get("updated_at") or ""
     same = st.session_state.get("loaded_trip_id") == current
     if (
@@ -1244,6 +1393,7 @@ def _load_shared_trip() -> None:
             if _version_ready(remote.get("version")):
                 st.session_state.seen_version = remote["version"]
         st.session_state.trip_conflict = False
+        _maybe_refresh_profile(current)
         return
     if (
         not force
@@ -1260,6 +1410,8 @@ def _load_shared_trip() -> None:
         _storage_stop(str(err))
     _sync_remote_content(loaded, remote_stamp, same=same, force=force, title=True)
     st.session_state.loaded_trip_id = current
+    if not st.session_state.get("trip_conflict"):
+        _maybe_refresh_profile(current)
 
 
 def _snapshot() -> dict:
@@ -1288,6 +1440,9 @@ def _snapshot() -> dict:
         "trip_style": st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE,
         "allow_ai": bool(st.session_state.get("allow_ai")),
         "day_count": int(st.session_state.get("day_count") or 3),
+        "travel_start": _date_text(st.session_state.get("travel_start")),
+        "travel_end": _date_text(st.session_state.get("travel_end")),
+        "owner_display_name": _owner_name_for_snapshot(),
         **{key: st.session_state.get(key) for key in _TRIP_FIELDS},
     }
     if _version_ready(st.session_state.get("seen_version")):
@@ -1374,8 +1529,22 @@ def _persist_shared_trip() -> bool:
 def _activate_trip(trip_id: str) -> None:
     if not _persist_shared_trip():
         return
+    st.session_state.view_inbox = False
+    st.session_state.invite_panel = False
     st.session_state.trip_id = trip_id
     st.session_state.force_trip_reload = True
+    st.rerun()
+
+
+def _open_collection_inbox() -> None:
+    if not _persist_shared_trip():
+        return
+    st.session_state.view_inbox = True
+    st.session_state.invite_panel = False
+    st.session_state.trip_id = ""
+    st.session_state.force_trip_reload = True
+    st.session_state.screen = "B"
+    st.session_state.nav_sync = "B"
     st.rerun()
 
 
@@ -1402,6 +1571,7 @@ def _create_new_trip() -> None:
             st.session_state.inbox_cleanup_warning = _INBOX_CLEANUP_WARNING
         else:
             st.session_state.inbox_cleanup_warning = ""
+        st.session_state.view_inbox = False
         st.session_state.trip_id = adopted["id"]
         st.session_state.trip_title = adopted.get("title") or "行程"
         st.session_state.collection_inbox_id = ""
@@ -1422,6 +1592,7 @@ def _create_new_trip() -> None:
         _remember_storage_error(str(err))
         return
     st.session_state._skip_next_create = True
+    st.session_state.view_inbox = False
     st.session_state.trip_id = created["id"]
     st.session_state.trip_title = created.get("title") or "行程"
     if _version_ready(created.get("version")):
@@ -1432,38 +1603,322 @@ def _create_new_trip() -> None:
     st.rerun()
 
 
+def _trip_button_label(row: dict, *, current: str) -> str:
+    title = row.get("title") or "行程"
+    if row.get("is_shared"):
+        count = int(row.get("member_count") or 1)
+        title = f"{title} · {count} 位成員"
+    if row.get("id") == current and not st.session_state.get("view_inbox"):
+        title = f"{title}（目前）"
+    return title
+
+
+def _owned_trip_count(catalog: list[dict]) -> int:
+    return sum(1 for row in catalog if row.get("role", "owner") == "owner")
+
+
+def _render_folder_rows(rows: list[dict], current: str) -> None:
+    for index, row in enumerate(rows, start=1):
+        label = _trip_button_label(row, current=current)
+        if not row.get("title"):
+            label = _trip_button_label({**row, "title": f"行程 {index}"}, current=current)
+        if st.button(label, key=f"switch_trip_{row['id']}", use_container_width=True):
+            if row.get("id") != current or st.session_state.get("view_inbox"):
+                _activate_trip(row["id"])
+
+
+def _stored_date_text(value) -> str:
+    parsed = _parse_iso_date(value)
+    if parsed is None:
+        return ""
+    return parsed.isoformat()
+
+
+def _span_label(start, end) -> str:
+    start_day = _parse_iso_date(start)
+    end_day = _parse_iso_date(end)
+    if start_day is None or end_day is None:
+        return ""
+    nights = (end_day - start_day).days
+    if nights < 0:
+        return ""
+    days = nights + 1
+    return f"{start_day.isoformat()} – {end_day.strftime('%m-%d')}（{days}日{nights}夜）"
+
+
+def _render_invite_panel(trip_id: str) -> None:
+    st.subheader("邀請朋友加入")
+    st.markdown("一齊計劃更精彩的旅行！")
+    if st.button("返回行程", key="close_invite_panel"):
+        st.session_state.invite_panel = False
+        st.rerun()
+    links = dict(st.session_state.get("invite_tokens") or {})
+    saved = links.get(trip_id) or {}
+    try:
+        status = trip_store.invite_status(trip_id)
+    except trip_store.TripStoreError as err:
+        st.error(str(err))
+        status = {"active": False, "expires_at": ""}
+    url = str(saved.get("url") or "")
+    if url:
+        st.caption("邀請連結")
+        st.code(url, language=None)
+        _COPY(url=url, label="邀請連結", key=f"copy_invite_{trip_id}")
+        expires = str(saved.get("expires_at") or status.get("expires_at") or "")
+        if expires:
+            st.caption(f"有效至 {expires[:10]}（{trip_store.INVITE_DAYS} 日）。重新產生會即時撤銷舊連結。")
+    elif status.get("active"):
+        st.caption(
+            "已有有效邀請連結，但呢度睇唔到原文。"
+            "要再分享請重新產生，舊連結會即時失效。"
+        )
+        if status.get("expires_at"):
+            st.caption(f"有效至 {str(status.get('expires_at'))[:10]}。")
+    else:
+        st.caption("未有有效邀請連結。產生之後先可以複製。")
+    produce = "重新產生邀請連結" if url or status.get("active") else "產生邀請連結"
+    if st.button(produce, key="create_invite", type="primary", use_container_width=True):
+        try:
+            created = trip_store.create_invite(trip_id)
+        except trip_store.TripStoreError as err:
+            st.error(str(err))
+        else:
+            links[trip_id] = {
+                "token": created["token"],
+                "url": created["url"],
+                "expires_at": created["expires_at"],
+            }
+            st.session_state.invite_tokens = links
+            st.session_state.is_shared_trip = True
+            st.rerun()
+    if url or status.get("active"):
+        if st.button("撤銷邀請連結", key="revoke_invite", use_container_width=True):
+            try:
+                trip_store.revoke_invites(trip_id)
+            except trip_store.TripStoreError as err:
+                st.error(str(err))
+            else:
+                links.pop(trip_id, None)
+                st.session_state.invite_tokens = links
+                st.rerun()
+    st.markdown("✓ 朋友要用 Google 登入。登入之後如果連結消失，請再開一次同一條連結。")
+    st.markdown(
+        "✓ 連結未過期、未撤銷，而且行程未滿人、對方未超過加入上限，就會直接加入，毋須審批。"
+    )
+    st.markdown("✓ 只有擁有者同成員可以查看同編輯。")
+    st.caption(members_cap_hint())
+
+
+def members_cap_hint() -> str:
+    return (
+        f"每個共同行程最多 {trip_store.max_members_per_trip()} 位成員（唔計擁有者），"
+        f"每人最多加入 {trip_store.max_joined_trips()} 個別人的行程。"
+        "連結用 https://lazy-trip-planner.streamlit.app/?invite= 。"
+    )
+
+
+def _render_member_actions(trip_id: str, people: list[dict]) -> None:
+    role = st.session_state.get("trip_role") or "owner"
+    others = [person for person in people if person.get("role") == "member"]
+    if role == "owner":
+        if st.button("邀請朋友", key="open_invite", use_container_width=True):
+            st.session_state.invite_panel = True
+            st.rerun()
+        if others:
+            st.caption("移除成員")
+            for person in others:
+                sub = str(person.get("member_sub") or "")
+                if not sub:
+                    continue
+                name = person.get("display_name") or "旅人"
+                token = hashlib.sha256(sub.encode("utf-8")).hexdigest()[:12]
+                if st.button(f"移除 {name}", key=f"ask_remove_{token}", use_container_width=True):
+                    st.session_state.pending_remove = sub
+                    st.session_state.pending_remove_name = name
+        if st.session_state.get("pending_remove"):
+            name = st.session_state.get("pending_remove_name") or "這位成員"
+            st.warning(f"確定要移除{name}？移除之後對方即刻睇唔到呢個行程同圖片。")
+            yes, no = st.columns(2)
+            with yes:
+                if st.button("確認移除", key="confirm_remove", use_container_width=True):
+                    try:
+                        trip_store.remove_member(trip_id, str(st.session_state.get("pending_remove") or ""))
+                    except trip_store.TripStoreError as err:
+                        st.error(str(err))
+                    else:
+                        st.session_state.pending_remove = ""
+                        st.session_state.pending_remove_name = ""
+                        st.rerun()
+            with no:
+                if st.button("取消移除", key="cancel_remove", use_container_width=True):
+                    st.session_state.pending_remove = ""
+                    st.session_state.pending_remove_name = ""
+                    st.rerun()
+        if st.button("刪除行程", key="ask_delete_trip", use_container_width=True):
+            st.session_state.pending_delete = True
+        if st.session_state.get("pending_delete"):
+            st.warning("刪除之後，所有成員都唔可以再睇呢個行程同圖片。")
+            yes, no = st.columns(2)
+            with yes:
+                if st.button("確認刪除", key="confirm_delete_trip", use_container_width=True):
+                    try:
+                        trip_store.delete_trip(trip_id)
+                    except trip_store.TripStoreError as err:
+                        st.error(str(err))
+                    else:
+                        st.session_state.pending_delete = False
+                        st.session_state.trip_id = ""
+                        st.session_state.invite_panel = False
+                        st.session_state.force_trip_reload = True
+                        st.rerun()
+            with no:
+                if st.button("取消刪除", key="cancel_delete_trip", use_container_width=True):
+                    st.session_state.pending_delete = False
+                    st.rerun()
+        return
+    if st.button("離開行程", key="ask_leave_trip", use_container_width=True):
+        st.session_state.pending_leave = True
+    if st.session_state.get("pending_leave"):
+        st.warning("離開之後，你會即刻睇唔到呢個行程同圖片。")
+        yes, no = st.columns(2)
+        with yes:
+            if st.button("確認離開", key="confirm_leave_trip", use_container_width=True):
+                try:
+                    trip_store.leave_trip(trip_id)
+                except trip_store.TripStoreError as err:
+                    st.error(str(err))
+                else:
+                    st.session_state.pending_leave = False
+                    st.session_state.trip_id = ""
+                    st.session_state.force_trip_reload = True
+                    st.rerun()
+        with no:
+            if st.button("取消離開", key="cancel_leave_trip", use_container_width=True):
+                st.session_state.pending_leave = False
+                st.rerun()
+
+
+def _render_workspace() -> None:
+    trip_id = str(st.session_state.get("trip_id") or "")
+    if not trip_id or st.session_state.get("view_inbox"):
+        return
+    title = st.session_state.get("trip_title") or "行程"
+    shared = bool(st.session_state.get("is_shared_trip"))
+    try:
+        people = trip_store.list_collaborators(trip_id)
+    except trip_store.TripStoreError as err:
+        st.error(str(err))
+        people = []
+    count = len(people) or 1
+    kind = f"共同旅行 · {count} 位成員" if shared else "私人行程"
+    st.markdown(f'<p class="trip-kicker">Lazy Trip Planner</p>', unsafe_allow_html=True)
+    st.markdown(f"### {title}")
+    st.caption(kind)
+    gear_col, _spacer = st.columns([1, 3])
+    with gear_col:
+        if st.button("⚙", key="trip_gear", help="行程設定"):
+            st.session_state.gear_open = not st.session_state.get("gear_open")
+    if st.session_state.get("gear_open"):
+        _render_member_actions(trip_id, people)
+    if st.session_state.get("trip_role") == "owner" and st.session_state.get("invite_panel"):
+        _render_invite_panel(trip_id)
+    fav_label = "共同收藏" if shared else "我的收藏"
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**收集靈感**")
+        st.caption("上傳截圖，AI 識別")
+        if st.button("前往收集", key="workspace_collect", use_container_width=True):
+            _go("B")
+    with c2:
+        st.markdown(f"**{fav_label}**")
+        st.caption("查看與編輯所有景點")
+        if st.button("前往收藏", key="workspace_favs", use_container_width=True):
+            _go("C")
+    with c3:
+        st.markdown("**行程管理**")
+        st.caption("查看／編輯旅行行程")
+        if st.button("前往行程", key="workspace_plan", use_container_width=True):
+            _go("E" if st.session_state.get("itinerary") else "D")
+    st.markdown("**旅行資料**")
+    st.text_input("行程名稱", key="trip_title")
+    start_col, end_col = st.columns(2)
+    with start_col:
+        st.text_input("旅行開始", key="travel_start", placeholder="2026-03-15")
+    with end_col:
+        st.text_input("旅行結束", key="travel_end", placeholder="2026-03-18")
+    span = _span_label(st.session_state.get("travel_start"), st.session_state.get("travel_end"))
+    if st.session_state.get("travel_start") and st.session_state.get("travel_end") and not span:
+        st.caption("日期請用 YYYY-MM-DD，結束日期要遲過或等於開始日期。")
+    elif span:
+        st.caption(f"旅行日期：{span}")
+    labels = []
+    for person in people:
+        label = person.get("display_name") or "旅人"
+        if person.get("is_self"):
+            label = f"{label}（你）"
+        labels.append(label)
+    if labels:
+        st.markdown("成員：" + " · ".join(labels))
+    places = len(st.session_state.get("favourites") or [])
+    st.markdown(f"地點：已收藏 {places} 個景點")
+
+
 def _render_trip_switcher() -> None:
     replay = bool(st.session_state.get("_skip_next_create"))
     if replay:
         st.session_state._skip_next_create = False
     _render_trip_conflict()
-    catalog = list(st.session_state.get("trip_catalog") or [])
-    st.caption("我的行程")
+    if st.session_state.get("invite_error"):
+        st.error(str(st.session_state.get("invite_error")))
     _render_inbox_cleanup_warning()
+    catalog = list(st.session_state.get("trip_catalog") or [])
+    current = str(st.session_state.get("trip_id") or "")
+    private = [row for row in catalog if row.get("role") == "owner" and not row.get("is_shared")]
+    shared = [row for row in catalog if row.get("is_shared")]
+    st.markdown('<p class="trip-kicker">Lazy Trip Planner</p>', unsafe_allow_html=True)
+    st.subheader("旅行夾")
+    st.markdown("**我的私人收藏**")
+    st.caption("只屬於你的旅行靈感（不會與他人分享）")
+    try:
+        inbox_status = trip_store.collection_inbox_status()
+    except trip_store.TripStoreError as err:
+        inbox_status = None
+        _remember_storage_error(str(err))
+    if inbox_status:
+        inbox_label = "私人收藏匣（目前）" if st.session_state.get("view_inbox") else "私人收藏匣"
+        if st.button(inbox_label, key="open_collection_inbox", use_container_width=True):
+            if not st.session_state.get("view_inbox"):
+                _open_collection_inbox()
     if not catalog:
         st.caption(_EMPTY_TRIPS_NOTE)
+    elif private:
+        _render_folder_rows(private, current)
     else:
-        current = st.session_state.get("trip_id")
-        for index, row in enumerate(catalog, start=1):
-            title = row.get("title") or f"行程 {index}"
-            label = f"{title}（目前）" if row.get("id") == current else title
-            if st.button(label, key=f"switch_trip_{row['id']}"):
-                if row.get("id") != current:
-                    _activate_trip(row["id"])
+        st.caption("未有私人行程。")
+    st.markdown(f"**共同旅行（{len(shared)}）**")
+    st.caption("與朋友一起收集、整理及安排行程")
+    if shared:
+        _render_folder_rows(shared, current)
+    else:
+        st.caption("未有共同旅行。")
     cap = trip_store.max_trips()
-    if len(catalog) >= cap:
+    owned = _owned_trip_count(catalog)
+    if owned >= cap:
         st.caption(f"每位會員最多可儲存 {cap} 個行程。")
-        return
-    if st.button("新增行程", key="create_trip") and not replay:
+    elif st.button("建立新旅行夾", key="create_trip", use_container_width=True) and not replay:
         _create_new_trip()
+    _render_workspace()
 
 
 def _image_room() -> int:
-    trip_id = str(st.session_state.get("trip_id") or "")
+    viewing_inbox = bool(st.session_state.get("view_inbox")) or not st.session_state.get("trip_id")
+    trip_id = "" if viewing_inbox else str(st.session_state.get("trip_id") or "")
     inbox_id = str(st.session_state.get("collection_inbox_id") or "")
-    exclude = trip_id or inbox_id
     try:
-        used = trip_store.count_images(excluding_trip_id=exclude or None)
+        if trip_id:
+            used = trip_store.count_images_for_trip(trip_id)
+        else:
+            used = trip_store.count_images(excluding_trip_id=inbox_id or None)
     except trip_store.TripStoreError as err:
         st.error(str(err))
         return 0
@@ -2242,7 +2697,7 @@ def _allow_ai_suggestions(_favs: list[dict]) -> bool:
     return bool(st.session_state.get("allow_ai", True))
 
 
-_NAV = (("A", "開場"), ("B", "收集"), ("C", "收藏"), ("D", "排程"), ("E", "結果"))
+_NAV = (("A", "首頁"), ("B", "收集"), ("C", "收藏"), ("D", "排程"), ("E", "行程"))
 
 
 def _go(screen: str) -> None:
