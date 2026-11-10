@@ -3019,6 +3019,17 @@ def _coerce_destination_choice(value) -> str:
     return trip_core.DESTINATION_DEFAULT
 
 
+_OTHER_DESTINATION_REQUIRED = "請先填寫其他目的地，先可以開始 AI 排程。"
+
+
+def _custom_destination_missing() -> bool:
+    """「其他」未填或只有空白時，唔好靜靜交「日本」去排行程。"""
+    choice = _coerce_destination_choice(st.session_state.get("destination_choice"))
+    if choice != trip_core.DESTINATION_OTHER:
+        return False
+    return not str(st.session_state.get("destination_other") or "").strip()
+
+
 def _planning_destination(favs: list[dict]) -> tuple[str, dict]:
     """明確目的地交俾排行程。未揀就跟收藏的共同地區，同以前一樣。"""
     choice = _coerce_destination_choice(st.session_state.get("destination_choice"))
@@ -3647,6 +3658,8 @@ def _render_plan() -> None:
     )
     if choice == trip_core.DESTINATION_OTHER:
         _bound_text_input("其他目的地", "destination_other", default="", placeholder="例如：韓國首爾")
+        if _custom_destination_missing():
+            st.warning(_OTHER_DESTINATION_REQUIRED)
     elif not _destination_is_explicit(choice):
         detected = _favourite_destination(favs)
         if detected == "日本":
@@ -3700,7 +3713,14 @@ def _render_plan() -> None:
             st.rerun()
     allow_ai = _allow_ai_suggestions(favs)
     has_date = bool(st.session_state.get("start_date"))
-    can_plan = bool(API_KEY) and remaining_quota() > 0 and has_date and (bool(favs) or allow_ai)
+    missing_other = _custom_destination_missing()
+    can_plan = (
+        bool(API_KEY)
+        and remaining_quota() > 0
+        and has_date
+        and (bool(favs) or allow_ai)
+        and not missing_other
+    )
     if not has_date:
         st.caption("請先選擇出發日與日數。")
     elif not favs and not allow_ai:
@@ -3710,7 +3730,7 @@ def _render_plan() -> None:
     elif remaining_quota() <= 0:
         st.caption("今次可用次數已用完。")
     submitted = st.button("開始排行程", type="primary", disabled=not can_plan, key="plan_go")
-    if not submitted:
+    if not submitted or _custom_destination_missing():
         return
     style = st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
     destination, request = _planning_destination(favs)

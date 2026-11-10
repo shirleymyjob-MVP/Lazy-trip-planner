@@ -2480,6 +2480,53 @@ def test_plan_destination_choice_is_what_the_itinerary_receives():
     assert gen.call_args.args[4] == "首爾"
 
 
+_OTHER_DESTINATION_REQUIRED = "請先填寫其他目的地，先可以開始 AI 排程。"
+
+
+def test_blank_custom_destination_blocks_planning_until_text_is_entered(monkeypatch):
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: "test-member-sub")
+    for blank in ("", "   "):
+        at = AppTest.from_file(APP, default_timeout=30)
+        at.secrets["GEMINI_API_KEY"] = "fake"
+        at.run()
+        _open_screen(at, "旅行夾")
+        _button(at, "建立新旅行夾").click().run()
+        _open_screen(at, "排程")
+        at.session_state["favourites"] = [_fav()]
+        at.session_state["start_date"] = date(2026, 11, 14)
+        at.run()
+        _destination_box(at).set_value(trip_core.DESTINATION_OTHER).run()
+        typed = [box for box in at.text_input if box.label == "其他目的地"][0]
+        if blank != (typed.value or ""):
+            typed.input(blank).run()
+        assert _OTHER_DESTINATION_REQUIRED in _joined(at.warning)
+        submit = _button(at, "開始排行程")
+        assert submit.disabled
+        before = trip_store.load_trip(at.session_state["trip_id"])
+        with mock.patch.object(
+            gemini_client, "generate_itinerary", side_effect=AssertionError("should not plan"),
+        ) as gen:
+            at.run()
+        assert not at.exception
+        assert gen.call_count == 0
+        assert at.session_state.get("itinerary") is None
+        assert at.session_state["usage"] == 0
+        after = trip_store.load_trip(at.session_state["trip_id"])
+        assert after["version"] == before["version"]
+        assert after.get("itinerary") == before.get("itinerary")
+        assert after.get("updated_at") == before.get("updated_at")
+
+    ready = _ready_plan(AppTest.from_file(APP, default_timeout=30))
+    _destination_box(ready).set_value(trip_core.DESTINATION_OTHER).run()
+    [box for box in ready.text_input if box.label == "其他目的地"][0].input("  韓國首爾  ").run()
+    assert _OTHER_DESTINATION_REQUIRED not in _joined(ready.warning)
+    assert not _button(ready, "開始排行程").disabled
+    with mock.patch.object(gemini_client, "make_client", return_value=object()), \
+         mock.patch.object(gemini_client, "generate_itinerary", return_value=_fake_itinerary()) as gen:
+        _button(ready, "開始排行程").click().run()
+    assert gen.call_args.args[4] == "韓國首爾"
+
+
 def test_explicit_destination_survives_every_screen_and_is_saved():
     at = AppTest.from_file(APP, default_timeout=30)
     at.secrets["GEMINI_API_KEY"] = "fake"
