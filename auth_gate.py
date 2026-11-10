@@ -40,6 +40,21 @@ _LOGIN_ERROR_KEY = "_auth_login_error"
 _LOGOUT_ERROR_KEY = "_auth_logout_error"
 
 
+def get_display_name() -> str:
+    """Google 顯示名。唔會回傳 sub，未登入或沒有名字就係空字串。"""
+    if not _is_logged_in():
+        return ""
+    sub = get_member_id() or ""
+    for key in ("name", "given_name"):
+        value = _claim(key)
+        if not isinstance(value, str):
+            continue
+        cleaned = " ".join(value.split())
+        if cleaned and cleaned != sub and len(cleaned) <= 80:
+            return cleaned
+    return ""
+
+
 def get_member_id() -> str | None:
     """回傳已登入會員的 OIDC ``sub``。未登入、或者 ``sub`` 缺失／空白就係 None。
 
@@ -104,6 +119,9 @@ def _render_login() -> None:
     st.title("懶人出行")
     st.subheader("請先用 Google 登入")
     st.markdown("登入之後先可以收集地方同編輯行程。")
+    if _query_text("invite"):
+        st.info("你打開咗邀請連結。請先用 Google 登入，登入後再開一次同一條連結先可以加入。")
+    st.caption("如果係朋友嘅邀請連結，登入之後會回到首頁，連結會消失。請登入後再開一次同一條連結。")
     if st.session_state.get(_LOGIN_ERROR_KEY):
         st.error("登入未能開始。請再試一次。如果一直失敗，請管理員檢查登入設定。")
     st.button(
@@ -230,6 +248,26 @@ def _halt() -> NoReturn:
     """
     st.stop()
     raise StopException()
+
+
+def _query_text(name: str) -> str:
+    """讀 query string。讀唔到、或者唔係文字，都當沒有，避免登入頁爆。"""
+    try:
+        params = st.query_params
+    except Exception:
+        return ""
+    getter = getattr(params, "get", None)
+    if not callable(getter):
+        return ""
+    try:
+        value = getter(name)
+    except Exception:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, (list, tuple)) and value and isinstance(value[0], str):
+        return value[0].strip()
+    return ""
 
 
 def _claim(name: str) -> object:

@@ -1,6 +1,8 @@
 """測試用 Supabase 替身。只存在測試，應用程式唔會因為環境變數改用佢。
 
 ``eq`` 條件一齊先算命中，所以 ``version`` 比較交換會喺 0 行時拒絕更新。
+``trips``、``trip_members``、``trip_invites`` 分開存放。``rows`` 仍然係行程列，
+方便既有測試直接讀寫。
 """
 from __future__ import annotations
 
@@ -10,7 +12,13 @@ from types import SimpleNamespace
 
 class MemorySupabase:
     def __init__(self) -> None:
-        self.rows: list[dict] = []
+        self.tables: dict[str, list[dict]] = {
+            "trips": [],
+            "trip_members": [],
+            "trip_invites": [],
+        }
+        # 既有測試把行程列當成 rows。呢個係同一個 list，唔好換成副本。
+        self.rows = self.tables["trips"]
         self.objects: dict[str, bytes] = {}
         self.uploads: list[tuple[str, bytes, dict]] = []
         self.removes: list[list[str]] = []
@@ -23,27 +31,28 @@ class MemorySupabase:
         self.storage = _Storage(self)
 
     def table(self, name: str) -> "_Query":
-        if name != "trips":
+        if name not in self.tables:
             raise AssertionError(name)
-        return _Query(self)
+        return _Query(self, name)
 
     def _execute(self, query: "_Query") -> SimpleNamespace:
         filters = dict(query.filters)
+        bucket = self.tables[query.table]
         if query.op == "select":
             self.select_filters.append(filters)
-            matched = self._match(filters)
+            matched = self._match(bucket, filters)
             if query.row_limit is not None:
                 matched = matched[: query.row_limit]
             return SimpleNamespace(data=deepcopy(matched))
         if query.op == "insert":
             record = deepcopy(query.payload)
             self.inserts.append(deepcopy(record))
-            self.rows.append(record)
+            bucket.append(record)
             return SimpleNamespace(data=[deepcopy(record)])
         if query.op == "update":
             self.update_filters.append(filters)
             updated = []
-            for row in self.rows:
+            for row in bucket:
                 if self._is_match(row, filters):
                     row.update(deepcopy(query.payload))
                     updated.append(deepcopy(row))
@@ -52,17 +61,17 @@ class MemorySupabase:
             self.delete_filters.append(filters)
             kept = []
             deleted = []
-            for row in self.rows:
+            for row in bucket:
                 if self._is_match(row, filters):
                     deleted.append(deepcopy(row))
                 else:
                     kept.append(row)
-            self.rows = kept
+            bucket[:] = kept
             return SimpleNamespace(data=deleted)
         raise AssertionError(query.op)
 
-    def _match(self, filters: dict) -> list[dict]:
-        return [row for row in self.rows if self._is_match(row, filters)]
+    def _match(self, rows: list[dict], filters: dict) -> list[dict]:
+        return [row for row in rows if self._is_match(row, filters)]
 
     @staticmethod
     def _is_match(row: dict, filters: dict) -> bool:
@@ -109,8 +118,9 @@ class _Bucket:
 
 
 class _Query:
-    def __init__(self, store: MemorySupabase) -> None:
+    def __init__(self, store: MemorySupabase, table: str) -> None:
         self.store = store
+        self.table = table
         self.op = ""
         self.payload = None
         self.filters: dict = {}

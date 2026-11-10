@@ -1,8 +1,9 @@
 """行程儲存：Supabase PostgreSQL `public.trips` 加私人 bucket `trip-images`。
 
 授權只信伺服器上 `auth_gate.get_member_id()` 讀到的 Google OIDC `sub`。
-呼叫方傳入的 owner_sub、trip_id、storage path 都唔可以當權限。
-RLS 已開啟，但呢度用 service_role（繞過 RLS），所以每次讀寫都要再核對擁有者。
+呼叫方傳入的 owner_sub、trip_id、成員名單、storage path 都唔可以當權限。
+RLS 已開啟，但呢度用 service_role（繞過 RLS），所以每次讀寫都要再核對
+擁有者或者共同行程的現有成員。私人行程即使留有成員列，都唔可以進入。
 
 密鑰只可以喺執行時從 Streamlit secrets 或環境變數讀取，唔好寫入程式、日誌或回傳文字。
 設定缺失、未登入、id 無效、或者連線失敗，都要拒絕，唔好退回本機 `data/trips` 或 `?share=`。
@@ -15,10 +16,11 @@ import json
 import logging
 import os
 import re
+import secrets
 import threading
 import uuid
 from collections.abc import Mapping
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from urllib.parse import urlparse
 
@@ -31,10 +33,17 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TRIPS_TABLE = "trips"
+MEMBERS_TABLE = "trip_members"
+INVITES_TABLE = "trip_invites"
 IMAGES_BUCKET = "trip-images"
+# 邀請連結用正式 Streamlit 網址。唔好用假域名，亦唔好加 Streamlit 伺服唔到的 /join/。
+PUBLIC_APP_URL = "https://lazy-trip-planner.streamlit.app"
+INVITE_DAYS = 7
 _MAX_IMAGE_BYTES = 10 * 1024 * 1024
 _DEFAULT_MAX_TRIPS = 3
 _DEFAULT_MAX_IMAGES = 50
+_DEFAULT_MAX_JOINED = 3
+_DEFAULT_MAX_MEMBERS = 5
 
 MSG_LOGIN = "請先用 Google 登入。"
 MSG_CONFIG = "行程儲存未設定好，暫時未能讀取或儲存行程。"
@@ -46,6 +55,7 @@ MSG_TOO_BIG = "圖片太大，單張上限是 10MB。"
 MSG_CONTENT = "行程內容未能儲存，請稍後再試。"
 MSG_INBOX_KEEP = "收藏未能完成整理，原有收藏仍然保留。請再試一次。"
 MSG_CONFLICT = "其他裝置或成員已修改呢份行程，你嘅更改未儲存。"
+MSG_INVITE = "邀請連結無效、已過期或已撤銷。"
 
 # 收藏匣用現有 trips 列。沒有 kind、或者 kind 不是 inbox，都當普通行程。
 KIND_INBOX = "inbox"
@@ -55,6 +65,7 @@ _owner_locks: dict[str, threading.Lock] = {}
 
 _SUB_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,254}\Z")
 _ITEM_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}\Z")
+_TOKEN_RE = re.compile(r"[A-Za-z0-9_-]{20,200}\Z")
 _ITEM_FIELDS = (
     "id", "label", "remark", "status", "analysis", "places", "city", "regions",
     "region_confidence", "warning", "added_by", "facts", "batch", "added_at",
@@ -85,6 +96,24 @@ def max_images() -> int:
     )
 
 
+def max_joined_trips() -> int:
+    """可以加入別人幾多個共同行程。同自己擁有的行程上限分開計。"""
+    return _limit(
+        ("limits", "max_joined_trips_per_user"),
+        "MAX_JOINED_TRIPS_PER_USER",
+        _DEFAULT_MAX_JOINED,
+    )
+
+
+def max_members_per_trip() -> int:
+    """一個共同行程除擁有者之外最多幾多位成員。"""
+    return _limit(
+        ("limits", "max_members_per_trip"),
+        "MAX_MEMBERS_PER_TRIP",
+        _DEFAULT_MAX_MEMBERS,
+    )
+
+
 def trips_cap_message() -> str:
     return f"每位會員最多可儲存 {max_trips()} 個行程。"
 
@@ -93,22 +122,48 @@ def images_cap_message() -> str:
     return f"每位會員最多可儲存 {max_images()} 張圖片。"
 
 
+def joined_cap_message() -> str:
+    return f"你最多可以加入 {max_joined_trips()} 個別人的共同行程。"
+
+
+def members_cap_message() -> str:
+    return f"每個共同行程最多 {max_members_per_trip()} 位成員（唔計擁有者）。"
+
+
 def list_trips() -> list[dict]:
-    """回傳目前會員自己的行程摘要（不含圖片，亦不含收藏匣）。"""
+    """回傳目前會員自己擁有的行程摘要（不含圖片，亦不含收藏匣）。"""
     owner = _require_owner()
     rows = _trip_rows(_select_owned(owner))
+    return [
+        _summary_from_row(row, index=index, role="owner")
+        for index, row in enumerate(rows, start=1)
+    ]
+
+
+def list_joined_trips() -> list[dict]:
+    """其他人分享出嚟、而且 is_shared 仍係 true 的行程。私人行程上的舊成員列唔計。"""
+    actor = _require_owner()
     summaries = []
-    for index, row in enumerate(rows, start=1):
-        payload = _payload_dict(row)
-        title = str(payload.get("title") or "").strip() or f"行程 {index}"
-        summaries.append({
-            "id": str(row.get("id")),
-            "title": title,
-            "created_at": _stamp(row.get("created_at")),
-            "updated_at": _stamp(row.get("updated_at")),
-            "version": _require_version(row),
-        })
+    for membership in _memberships_of(actor):
+        trip_id = str(membership.get("trip_id") or "")
+        try:
+            trip_id = _validate_trip_id(trip_id)
+            row = _trip_row_by_id(trip_id)
+        except TripStoreError:
+            continue
+        if _is_collection_inbox(row) or not _is_shared(row):
+            continue
+        if row.get("owner_sub") == actor:
+            continue
+        summaries.append(_summary_from_row(row, index=len(summaries) + 1, role="member"))
     return summaries
+
+
+def list_visible_trips() -> list[dict]:
+    """自己擁有的行程在前，跟住係已加入的共同行程。收藏匣唔喺呢度。"""
+    owned = list_trips()
+    seen = {row["id"] for row in owned}
+    return owned + [row for row in list_joined_trips() if row["id"] not in seen]
 
 
 def create_trip() -> dict:
@@ -127,6 +182,7 @@ def create_trip() -> dict:
         "created_at": now,
         "updated_at": now,
         "version": 1,
+        "is_shared": False,
     }
     inserted = _insert_owned(owner, record)
     payload = _payload_dict(inserted)
@@ -232,39 +288,46 @@ def release_adopted_collection_inbox() -> None:
 
 
 def load_trip(trip_id: str) -> dict:
-    owner = _require_owner()
-    trip_id = _validate_trip_id(trip_id)
-    row = _owned_row(owner, trip_id)
-    if _is_collection_inbox(row):
+    access = _access_trip(trip_id)
+    if access["inbox"]:
         raise TripStoreError(MSG_DENIED)
-    return _load_owned_row(owner, row)
+    loaded = _load_owned_row(access["owner"], access["row"])
+    loaded["role"] = access["role"]
+    loaded["is_shared"] = bool(access["shared"])
+    loaded.pop("owner_sub", None)
+    return loaded
 
 
 def save_trip(snapshot: dict) -> str:
-    """寫入目前會員自己的行程。回傳資料庫的 updated_at。
+    """寫入目前會員有權編輯的行程。回傳資料庫的 updated_at。
 
+    擁有者同共同行程的現有成員都可以改內容。圖片仍然放喺擁有者的路徑。
     ``snapshot["version"]`` 必須係上次成功讀到嘅版本。寫入用
     ``id + owner_sub + version`` 比較交換，對唔上就拋 ``TripConflictError``，
     唔會覆蓋。成功之後會把新版本寫回 ``snapshot["version"]``。
+    成員唔可以改擁有者顯示名，亦唔可以靠 payload 關掉分享。
     """
-    owner = _require_owner()
     if not isinstance(snapshot, dict):
         raise TripStoreError(MSG_DENIED)
     trip_id = _validate_trip_id(str(snapshot.get("trip_id") or ""))
+    access = _access_trip(trip_id)
+    if access["inbox"]:
+        raise TripStoreError(MSG_DENIED)
     raw_version = snapshot.get("version") if "version" in snapshot else None
     stamp, version = _write_snapshot(
-        owner,
+        access["owner"],
         trip_id,
         snapshot,
         kind=None,
         expected_version=raw_version,
+        preserve_owner_name=access["role"] != "owner",
     )
     snapshot["version"] = version
     return stamp
 
 
 def delete_trip(trip_id: str) -> None:
-    """刪除目前會員自己的行程同圖片。介面未提供刪除，但接口都要核對擁有者。"""
+    """刪除目前會員自己擁有的行程同圖片。成員唔可以刪。"""
     owner = _require_owner()
     trip_id = _validate_trip_id(trip_id)
     row = _owned_row(owner, trip_id)
@@ -274,13 +337,18 @@ def delete_trip(trip_id: str) -> None:
     ]
     if paths:
         _remove_owned(owner, paths)
+    _delete_members_of(trip_id)
+    _delete_invites_of(trip_id)
     _delete_owned(owner, trip_id)
 
 
 def delete_image(trip_id: str, item_id: str) -> None:
-    owner = _require_owner()
     trip_id = _validate_trip_id(trip_id)
     item_id = _validate_item_id(item_id)
+    access = _access_trip(trip_id)
+    if access["inbox"]:
+        raise TripStoreError(MSG_DENIED)
+    owner = access["owner"]
     row = _owned_row(owner, trip_id)
     path = _object_path(owner, trip_id, item_id)
     payload = _payload_dict(row)
@@ -318,6 +386,32 @@ def count_images(*, excluding_trip_id: str | None = None) -> int:
         except TripStoreError:
             pass
     return _count_images(owner, excluded)
+
+
+def count_images_for_trip(trip_id: str) -> int:
+    """呢個行程以外、計入擁有者圖片上限的張數。成員上載都計落擁有者。"""
+    access = _access_trip(trip_id)
+    if access["inbox"]:
+        raise TripStoreError(MSG_DENIED)
+    return _count_images(access["owner"], {access["trip_id"]})
+
+
+def collection_inbox_status() -> dict | None:
+    """收藏匣有內容先回傳摘要。唔會新增列，亦唔會當成普通行程。"""
+    owner = _require_owner()
+    row = _collection_inbox_row(owner)
+    if row is None:
+        return None
+    payload = _payload_dict(row)
+    items = [item for item in (payload.get("inbox") or []) if isinstance(item, dict)]
+    favourites = payload.get("favourites") or []
+    if not items and not favourites and not payload.get("itinerary"):
+        return None
+    return {
+        "id": str(row.get("id") or ""),
+        "title": "私人收藏匣",
+        "items": len(items),
+    }
 
 
 def _owner_lock(owner: str) -> threading.Lock:
@@ -360,6 +454,7 @@ def _ensure_collection_inbox_locked(owner: str) -> str:
         "created_at": now,
         "updated_at": now,
         "version": 1,
+        "is_shared": False,
     }
     inserted = _insert_owned(owner, record)
     return str(inserted.get("id") or inbox_id)
@@ -407,6 +502,7 @@ def _write_snapshot(
     kind: str | None,
     expected_version: object,
     exclude_ids: set[str] | None = None,
+    preserve_owner_name: bool = False,
 ) -> tuple[str, int]:
     row = _owned_row(owner, trip_id)
     if kind == KIND_INBOX and not _is_collection_inbox(row):
@@ -462,6 +558,8 @@ def _write_snapshot(
     if others + len(final_ids) > max_images():
         raise TripStoreError(images_cap_message())
     payload = _snapshot_payload(snapshot, inbox_out)
+    if preserve_owner_name:
+        payload["owner_display_name"] = str(previous.get("owner_display_name") or "")
     if kind == KIND_INBOX:
         payload["kind"] = KIND_INBOX
         promoted = str(previous.get("promoted_trip_id") or "")
@@ -739,6 +837,7 @@ def _insert_trip_for_adopt(owner: str) -> dict:
         "created_at": now,
         "updated_at": now,
         "version": 1,
+        "is_shared": False,
     }
     inserted = _insert_owned(owner, record)
     payload = _payload_dict(inserted)
@@ -771,6 +870,9 @@ def digest(snapshot: dict) -> str:
         "trip_style": snapshot.get("trip_style") or "",
         "allow_ai": bool(snapshot.get("allow_ai")),
         "day_count": snapshot.get("day_count") or 3,
+        "travel_start": _date_field(snapshot.get("travel_start")),
+        "travel_end": _date_field(snapshot.get("travel_end")),
+        "owner_display_name": _clean_display_name(snapshot.get("owner_display_name"), "") if snapshot.get("owner_display_name") else "",
     }
     raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode()).hexdigest()
@@ -801,6 +903,9 @@ def _snapshot_payload(snapshot: dict, inbox_out: list[dict]) -> dict:
         "trip_style": snapshot.get("trip_style") or "",
         "allow_ai": bool(snapshot.get("allow_ai")),
         "day_count": snapshot.get("day_count") or 3,
+        "travel_start": _date_field(snapshot.get("travel_start")),
+        "travel_end": _date_field(snapshot.get("travel_end")),
+        "owner_display_name": _clean_display_name(snapshot.get("owner_display_name"), "") if snapshot.get("owner_display_name") else "",
     }
     try:
         encoded = json.dumps(payload, ensure_ascii=False)
@@ -833,6 +938,9 @@ def _empty_payload(title: str) -> dict:
         "trip_style": "",
         "allow_ai": True,
         "day_count": 3,
+        "travel_start": "",
+        "travel_end": "",
+        "owner_display_name": "",
     }
 
 
@@ -954,6 +1062,598 @@ def _delete_unreferenced(owner: str, paths: list[str]) -> None:
     if not doomed:
         return
     _remove_owned(owner, doomed)
+
+
+def _summary_from_row(row: Mapping[str, Any], *, index: int, role: str) -> dict:
+    payload = _payload_dict(row)
+    title = str(payload.get("title") or "").strip() or f"行程 {index}"
+    trip_id = str(row.get("id") or "")
+    shared = _is_shared(row) and not _is_collection_inbox(row)
+    return {
+        "id": trip_id,
+        "title": title,
+        "created_at": _stamp(row.get("created_at")),
+        "updated_at": _stamp(row.get("updated_at")),
+        "version": _require_version(row),
+        "is_shared": shared,
+        "role": role,
+        "member_count": _member_total(trip_id) if shared else 1,
+    }
+
+
+def _is_shared(row: Mapping[str, Any]) -> bool:
+    """只有布林 true 先算共同行程。缺欄、null、字串都不當已分享。"""
+    return row.get("is_shared") is True
+
+
+def invite_link(token: str) -> str:
+    token = _validate_token(token)
+    return f"{PUBLIC_APP_URL}/?invite={token}"
+
+
+def create_invite(trip_id: str) -> dict:
+    """擁有者產生邀請。私人行程會就地設 is_shared，唔搬圖片。
+
+    重新產生會撤銷舊連結。原文 token 只喺呢次回傳，資料庫只存 hash。
+    """
+    owner = _require_owner()
+    trip_id = _validate_trip_id(trip_id)
+    row = _owned_row(owner, trip_id)
+    if _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    _revoke_active_invites(owner, trip_id)
+    if not _is_shared(row):
+        _mark_shared(owner, trip_id)
+    token = secrets.token_urlsafe(32)
+    _validate_token(token)
+    digest_value = _token_hash(token)
+    if _invite_by_hash(digest_value) is not None:
+        raise TripStoreError(MSG_UNAVAILABLE)
+    now = _utcnow()
+    expires = now + timedelta(days=INVITE_DAYS)
+    record = {
+        "token_hash": digest_value,
+        "trip_id": trip_id,
+        "created_by_sub": owner,
+        "created_at": now.isoformat(),
+        "expires_at": expires.isoformat(),
+        "revoked_at": None,
+    }
+    _insert_invite(record)
+    return {
+        "trip_id": trip_id,
+        "token": token,
+        "expires_at": record["expires_at"],
+        "url": invite_link(token),
+    }
+
+
+def revoke_invites(trip_id: str) -> None:
+    owner = _require_owner()
+    trip_id = _validate_trip_id(trip_id)
+    row = _owned_row(owner, trip_id)
+    if _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    _revoke_active_invites(owner, trip_id)
+
+
+def invite_status(trip_id: str) -> dict:
+    """擁有者先可以睇。唔會回傳 token 或 hash。"""
+    owner = _require_owner()
+    trip_id = _validate_trip_id(trip_id)
+    row = _owned_row(owner, trip_id)
+    if _is_collection_inbox(row):
+        raise TripStoreError(MSG_DENIED)
+    active = []
+    for invite in _invites_for_trip(trip_id):
+        if invite.get("created_by_sub") != owner or _invite_blocked(invite):
+            continue
+        active.append(invite)
+    if not active:
+        return {"active": False, "expires_at": ""}
+    active.sort(key=lambda item: str(item.get("expires_at") or ""))
+    return {"active": True, "expires_at": str(active[-1].get("expires_at") or "")}
+
+
+def accept_invite(token: str, display_name: str) -> dict:
+    """未登入、過期、已撤銷、滿人、或私人行程都拒絕。成功就進入該行程。"""
+    actor = _require_owner()
+    try:
+        token = _validate_token(token)
+    except TripStoreError:
+        raise TripStoreError(MSG_INVITE) from None
+    invite = _invite_by_hash(_token_hash(token))
+    if invite is None or _invite_blocked(invite):
+        raise TripStoreError(MSG_INVITE)
+    try:
+        trip_id = _validate_trip_id(str(invite.get("trip_id") or ""))
+        row = _trip_row_by_id(trip_id)
+    except TripStoreError:
+        raise TripStoreError(MSG_INVITE) from None
+    owner = row.get("owner_sub")
+    if (
+        _is_collection_inbox(row)
+        or not _is_shared(row)
+        or not isinstance(owner, str)
+        or invite.get("created_by_sub") != owner
+    ):
+        raise TripStoreError(MSG_INVITE)
+    try:
+        owner = _validate_sub(owner)
+    except TripStoreError:
+        raise TripStoreError(MSG_INVITE) from None
+    if owner == actor:
+        return {"id": trip_id, "role": "owner", "already": True}
+    name = _clean_display_name(display_name, actor)
+    if _member_row(trip_id, actor) is not None:
+        current = _member_row(trip_id, actor) or {}
+        if str(current.get("display_name") or "") != name:
+            _update_member_name(trip_id, actor, name)
+        return {"id": trip_id, "role": "member", "already": True}
+    if _joined_count(actor) >= max_joined_trips():
+        raise TripStoreError(joined_cap_message())
+    if len(_member_rows(trip_id)) >= max_members_per_trip():
+        raise TripStoreError(members_cap_message())
+    _insert_member({
+        "trip_id": trip_id,
+        "member_sub": actor,
+        "display_name": name,
+        "joined_at": _utcnow().isoformat(),
+    })
+    over_members = len(_member_rows(trip_id)) > max_members_per_trip()
+    over_joined = _joined_count(actor) > max_joined_trips()
+    if over_members or over_joined:
+        _delete_member(trip_id, actor)
+        if over_joined and not over_members:
+            raise TripStoreError(joined_cap_message())
+        raise TripStoreError(members_cap_message())
+    return {"id": trip_id, "role": "member", "already": False}
+
+
+def remove_member(trip_id: str, member_sub: str) -> None:
+    owner = _require_owner()
+    trip_id = _validate_trip_id(trip_id)
+    try:
+        member_sub = _validate_sub(member_sub)
+    except TripStoreError:
+        raise TripStoreError(MSG_DENIED) from None
+    if member_sub == owner:
+        raise TripStoreError(MSG_DENIED)
+    row = _owned_row(owner, trip_id)
+    if _is_collection_inbox(row) or not _is_shared(row):
+        raise TripStoreError(MSG_DENIED)
+    if _member_row(trip_id, member_sub) is None:
+        raise TripStoreError(MSG_DENIED)
+    _delete_member(trip_id, member_sub)
+
+
+def leave_trip(trip_id: str) -> None:
+    actor = _require_owner()
+    access = _access_trip(trip_id)
+    if access["role"] != "member" or access["inbox"] or not access["shared"]:
+        raise TripStoreError(MSG_DENIED)
+    _delete_member(access["trip_id"], actor)
+
+
+def list_collaborators(trip_id: str) -> list[dict]:
+    """顯示名。member_sub 只俾伺服器端移除成員用，畫面唔好渲染。"""
+    access = _access_trip(trip_id)
+    if access["inbox"]:
+        raise TripStoreError(MSG_DENIED)
+    owner_name = _clean_display_name(
+        _payload_dict(access["row"]).get("owner_display_name"),
+        access["owner"],
+    )
+    people = [{
+        "role": "owner",
+        "display_name": owner_name,
+        "is_self": access["role"] == "owner",
+        "member_sub": "",
+    }]
+    for member in _member_rows(access["trip_id"]):
+        sub = member.get("member_sub")
+        if not isinstance(sub, str):
+            continue
+        try:
+            sub = _validate_sub(sub)
+        except TripStoreError:
+            continue
+        people.append({
+            "role": "member",
+            "display_name": _clean_display_name(member.get("display_name"), sub),
+            "is_self": sub == access["actor"],
+            "member_sub": sub,
+        })
+    return people
+
+
+def refresh_actor_name(trip_id: str, display_name: str) -> dict | None:
+    """成員改 trip_members，唔郁行程 version。擁有者先至寫入 payload。
+
+    空白或者同 sub 一樣的名字唔寫，避免打開頁面就改到舊行程。
+    """
+    access = _access_trip(trip_id)
+    if access["inbox"]:
+        return None
+    supplied = display_name if isinstance(display_name, str) else ""
+    if not supplied.strip() or supplied.strip() == access["actor"]:
+        return None
+    name = _clean_display_name(supplied, access["actor"])
+    if access["role"] == "member":
+        current = str((access.get("member") or {}).get("display_name") or "")
+        if current != name:
+            _update_member_name(access["trip_id"], access["actor"], name)
+        return None
+    payload = dict(_payload_dict(access["row"]))
+    if str(payload.get("owner_display_name") or "") == name:
+        return None
+    payload["owner_display_name"] = name
+    updated = _update_owned(
+        access["owner"],
+        access["trip_id"],
+        payload,
+        _require_version(access["row"]),
+    )
+    return {"version": _require_version(updated), "owner_display_name": name}
+
+
+def _access_trip(trip_id: str) -> dict:
+    actor = _require_owner()
+    trip_id = _validate_trip_id(trip_id)
+    row = _trip_row_by_id(trip_id)
+    owner = row.get("owner_sub")
+    if not isinstance(owner, str):
+        raise TripStoreError(MSG_DENIED)
+    try:
+        owner = _validate_sub(owner)
+    except TripStoreError:
+        raise TripStoreError(MSG_DENIED) from None
+    inbox = _is_collection_inbox(row)
+    if owner == actor:
+        return {
+            "actor": actor,
+            "owner": owner,
+            "row": row,
+            "trip_id": trip_id,
+            "role": "owner",
+            "inbox": inbox,
+            "shared": False if inbox else _is_shared(row),
+            "member": None,
+        }
+    if inbox or not _is_shared(row):
+        raise TripStoreError(MSG_DENIED)
+    member = _member_row(trip_id, actor)
+    if member is None:
+        raise TripStoreError(MSG_DENIED)
+    return {
+        "actor": actor,
+        "owner": owner,
+        "row": row,
+        "trip_id": trip_id,
+        "role": "member",
+        "inbox": False,
+        "shared": True,
+        "member": member,
+    }
+
+
+def _trip_row_by_id(trip_id: str) -> dict:
+    def run(client: Any) -> dict:
+        response = (
+            client.table(TRIPS_TABLE)
+            .select("*")
+            .eq("id", trip_id)
+            .limit(1)
+            .execute()
+        )
+        matched = [row for row in _rows(response) if str(row.get("id")) == trip_id]
+        if len(matched) != 1:
+            raise TripStoreError(MSG_DENIED)
+        return matched[0]
+
+    return _call("select", run)
+
+
+def _mark_shared(owner: str, trip_id: str) -> None:
+    """只改 is_shared 欄，唔改 payload、唔搬圖片、唔推進 version。"""
+    current = _owned_row(owner, trip_id)
+    if _is_shared(current):
+        return
+
+    def run(client: Any) -> None:
+        response = (
+            client.table(TRIPS_TABLE)
+            .update({"is_shared": True})
+            .eq("id", trip_id)
+            .eq("owner_sub", owner)
+            .execute()
+        )
+        matched = [
+            row for row in _rows(response)
+            if str(row.get("id")) == trip_id
+            and row.get("owner_sub") == owner
+            and row.get("is_shared") is True
+        ]
+        if len(matched) != 1:
+            raise TripStoreError(MSG_UNAVAILABLE)
+
+    _call("update", run)
+
+
+def _member_total(trip_id: str) -> int:
+    return 1 + len(_member_rows(trip_id))
+
+
+def _joined_count(actor: str) -> int:
+    total = 0
+    for membership in _memberships_of(actor):
+        raw_id = str(membership.get("trip_id") or "")
+        try:
+            trip_id = _validate_trip_id(raw_id)
+            row = _trip_row_by_id(trip_id)
+        except TripStoreError:
+            continue
+        if _is_collection_inbox(row) or not _is_shared(row):
+            continue
+        if row.get("owner_sub") == actor:
+            continue
+        total += 1
+    return total
+
+
+def _member_rows(trip_id: str) -> list[dict]:
+    def run(client: Any) -> list[dict]:
+        response = (
+            client.table(MEMBERS_TABLE)
+            .select("*")
+            .eq("trip_id", trip_id)
+            .execute()
+        )
+        return [
+            row for row in _rows(response)
+            if str(row.get("trip_id")) == trip_id and isinstance(row.get("member_sub"), str)
+        ]
+
+    return _call("select", run)
+
+
+def _member_row(trip_id: str, member_sub: str) -> dict | None:
+    def run(client: Any) -> dict | None:
+        response = (
+            client.table(MEMBERS_TABLE)
+            .select("*")
+            .eq("trip_id", trip_id)
+            .eq("member_sub", member_sub)
+            .limit(1)
+            .execute()
+        )
+        matched = [
+            row for row in _rows(response)
+            if str(row.get("trip_id")) == trip_id and row.get("member_sub") == member_sub
+        ]
+        return matched[0] if matched else None
+
+    return _call("select", run)
+
+
+def _memberships_of(member_sub: str) -> list[dict]:
+    def run(client: Any) -> list[dict]:
+        response = (
+            client.table(MEMBERS_TABLE)
+            .select("*")
+            .eq("member_sub", member_sub)
+            .execute()
+        )
+        return [row for row in _rows(response) if row.get("member_sub") == member_sub]
+
+    return _call("select", run)
+
+
+def _insert_member(record: dict) -> None:
+    def run(client: Any) -> None:
+        response = client.table(MEMBERS_TABLE).insert(record).execute()
+        matched = [
+            row for row in _rows(response)
+            if str(row.get("trip_id")) == str(record.get("trip_id"))
+            and row.get("member_sub") == record.get("member_sub")
+        ]
+        if len(matched) != 1:
+            raise TripStoreError(MSG_UNAVAILABLE)
+
+    _call("insert", run)
+
+
+def _update_member_name(trip_id: str, member_sub: str, name: str) -> None:
+    def run(client: Any) -> None:
+        response = (
+            client.table(MEMBERS_TABLE)
+            .update({"display_name": name})
+            .eq("trip_id", trip_id)
+            .eq("member_sub", member_sub)
+            .execute()
+        )
+        matched = [
+            row for row in _rows(response)
+            if str(row.get("trip_id")) == trip_id and row.get("member_sub") == member_sub
+        ]
+        if len(matched) != 1:
+            raise TripStoreError(MSG_UNAVAILABLE)
+
+    _call("update", run)
+
+
+def _delete_member(trip_id: str, member_sub: str) -> None:
+    def run(client: Any) -> None:
+        response = (
+            client.table(MEMBERS_TABLE)
+            .delete()
+            .eq("trip_id", trip_id)
+            .eq("member_sub", member_sub)
+            .execute()
+        )
+        matched = [
+            row for row in _rows(response)
+            if str(row.get("trip_id")) == trip_id and row.get("member_sub") == member_sub
+        ]
+        if len(matched) != 1:
+            raise TripStoreError(MSG_DENIED)
+
+    _call("delete", run)
+
+
+def _delete_members_of(trip_id: str) -> None:
+    def run(client: Any) -> None:
+        client.table(MEMBERS_TABLE).delete().eq("trip_id", trip_id).execute()
+
+    _call("delete", run)
+
+
+def _token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _validate_token(token: str) -> str:
+    if not isinstance(token, str) or not _TOKEN_RE.fullmatch(token):
+        raise TripStoreError(MSG_INVITE)
+    return token
+
+
+def _invite_blocked(invite: Mapping[str, Any]) -> bool:
+    if invite.get("revoked_at"):
+        return True
+    expires = _parse_time(invite.get("expires_at"))
+    if expires is None:
+        return True
+    return expires <= _utcnow()
+
+
+def _invite_by_hash(digest_value: str) -> dict | None:
+    def run(client: Any) -> dict | None:
+        response = (
+            client.table(INVITES_TABLE)
+            .select("*")
+            .eq("token_hash", digest_value)
+            .limit(1)
+            .execute()
+        )
+        matched = [row for row in _rows(response) if row.get("token_hash") == digest_value]
+        if any("token" in row for row in matched):
+            raise TripStoreError(MSG_UNAVAILABLE)
+        return matched[0] if matched else None
+
+    return _call("select", run)
+
+
+def _invites_for_trip(trip_id: str) -> list[dict]:
+    def run(client: Any) -> list[dict]:
+        response = (
+            client.table(INVITES_TABLE)
+            .select("*")
+            .eq("trip_id", trip_id)
+            .execute()
+        )
+        rows = [row for row in _rows(response) if str(row.get("trip_id")) == trip_id]
+        if any("token" in row for row in rows):
+            raise TripStoreError(MSG_UNAVAILABLE)
+        return rows
+
+    return _call("select", run)
+
+
+def _insert_invite(record: dict) -> None:
+    if "token" in record:
+        raise TripStoreError(MSG_UNAVAILABLE)
+
+    def run(client: Any) -> None:
+        response = client.table(INVITES_TABLE).insert(record).execute()
+        matched = [
+            row for row in _rows(response)
+            if row.get("token_hash") == record.get("token_hash")
+        ]
+        if len(matched) != 1 or "token" in matched[0]:
+            raise TripStoreError(MSG_UNAVAILABLE)
+
+    _call("insert", run)
+
+
+def _revoke_active_invites(owner: str, trip_id: str) -> None:
+    for invite in _invites_for_trip(trip_id):
+        if invite.get("created_by_sub") != owner or invite.get("revoked_at"):
+            continue
+        digest_value = str(invite.get("token_hash") or "")
+        if not digest_value:
+            continue
+        _revoke_invite_hash(owner, trip_id, digest_value)
+
+
+def _revoke_invite_hash(owner: str, trip_id: str, digest_value: str) -> None:
+    stamp = _utcnow().isoformat()
+
+    def run(client: Any) -> None:
+        response = (
+            client.table(INVITES_TABLE)
+            .update({"revoked_at": stamp})
+            .eq("token_hash", digest_value)
+            .eq("trip_id", trip_id)
+            .eq("created_by_sub", owner)
+            .execute()
+        )
+        matched = [
+            row for row in _rows(response)
+            if row.get("token_hash") == digest_value and row.get("revoked_at")
+        ]
+        if len(matched) != 1:
+            raise TripStoreError(MSG_UNAVAILABLE)
+
+    _call("update", run)
+
+
+def _delete_invites_of(trip_id: str) -> None:
+    def run(client: Any) -> None:
+        client.table(INVITES_TABLE).delete().eq("trip_id", trip_id).execute()
+
+    _call("delete", run)
+
+
+def _clean_display_name(name: object, sub: str) -> str:
+    if not isinstance(name, str):
+        return "旅人"
+    cleaned = " ".join(name.split())[:80]
+    if not cleaned or cleaned == sub:
+        return "旅人"
+    if "/" in cleaned or "\\" in cleaned or cleaned.startswith("."):
+        return "旅人"
+    return cleaned
+
+
+def _date_field(value: object) -> str:
+    if hasattr(value, "isoformat") and not isinstance(value, str):
+        try:
+            return str(value.isoformat())[:32]
+        except Exception:
+            return ""
+    if isinstance(value, str):
+        return value.strip()[:32]
+    return ""
+
+
+def _parse_time(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _require_owner() -> str:

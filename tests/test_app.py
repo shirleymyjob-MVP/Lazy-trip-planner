@@ -396,7 +396,7 @@ def test_same_member_reloads_screenshot_and_share_query_is_ignored():
     at.run()
     assert at.query_params.get("share") == "abc123def456"
     assert "share_token" not in at.session_state
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     with mock.patch.object(gemini_client, "recognize_names", side_effect=AssertionError("no analyze")):
         at.file_uploader[0].upload("shared.png", _png("red"), "image/png").run()
     assert at.session_state["inbox"][0]["added_by"] == "Ada"
@@ -1041,7 +1041,7 @@ def test_nav_is_small_step_chips_not_a_full_width_button():
     assert not at.exception
     nav = [pill for pill in at.pills if pill.label == "步驟"]
     assert nav, "step chips should be st.pills"
-    assert nav[0].options == ["開場", "收集", "收藏", "排程", "結果"]
+    assert nav[0].options == ["首頁", "收集", "收藏", "排程", "行程"]
     assert not any(button.label == "開場" for button in at.button)
     nav[0].set_value("收集").run()
     assert at.session_state["screen"] == "B"
@@ -1151,7 +1151,7 @@ def test_unrelated_buttons_do_not_open_the_zoom_dialog():
     assert not any(button.label == "關閉" for button in at.button)
 
     nav = [pill for pill in at.pills if pill.label == "步驟"][0]
-    for label, screen in (("收藏", "C"), ("排程", "D"), ("結果", "E"), ("開場", "A")):
+    for label, screen in (("收藏", "C"), ("排程", "D"), ("行程", "E"), ("首頁", "A")):
         nav.set_value(label).run()
         assert at.session_state["screen"] == screen
         assert not at.exception
@@ -1442,18 +1442,18 @@ def test_trip_switcher_stops_at_the_configured_cap(monkeypatch, memory_supabase)
     assert not at.exception
     assert memory_supabase.inserts == []
     assert "你仲未有行程" in _page(at)
-    assert any(button.label == "新增行程" for button in at.button)
-    _button(at, "新增行程").click().run()
+    assert any(button.label == "建立新旅行夾" for button in at.button)
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     assert len(memory_supabase.inserts) == 1
     assert any("行程 1" in button.label for button in at.button)
-    assert any(button.label == "新增行程" for button in at.button)
-    _button(at, "新增行程").click().run()
+    assert any(button.label == "建立新旅行夾" for button in at.button)
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     labels = [button.label for button in at.button]
     assert any(label == "行程 1" or label.startswith("行程 1") for label in labels)
     assert any("行程 2" in label for label in labels)
-    assert "新增行程" not in labels
+    assert "建立新旅行夾" not in labels
     assert "每位會員最多可儲存 2 個行程" in _page(at)
     assert len(memory_supabase.inserts) == 2
 
@@ -1515,15 +1515,15 @@ def test_supabase_secrets_are_enough_and_stay_off_the_page(monkeypatch):
     at.run()
     assert not at.exception
     assert "行程儲存未設定好" not in _joined(at.error)
-    assert any(button.label == "新增行程" for button in at.button)
+    assert any(button.label == "建立新旅行夾" for button in at.button)
     assert not any("行程 1" in button.label for button in at.button)
     blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption))
     assert "secret-value-from-secrets" not in blob
     assert "test-service-role-key" not in blob
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     assert any("行程 1" in button.label for button in at.button)
-    assert not any(button.label == "新增行程" for button in at.button)
+    assert not any(button.label == "建立新旅行夾" for button in at.button)
     blob = _page(at) + "\n" + _joined(list(at.error) + list(at.warning) + list(at.caption) + list(at.info) + list(at.success))
     assert "secret-value-from-secrets" not in blob
     assert "test-service-role-key" not in blob
@@ -1549,7 +1549,7 @@ def test_connection_failure_refuses_without_leaking_or_local_files(monkeypatch, 
     assert not (tmp_path / "data").exists()
 
 
-_UNSAVED_NOTICE = "尚未儲存。按「新增行程」之後先會保留。"
+_UNSAVED_NOTICE = "尚未儲存。按「建立新旅行夾」之後先會保留。"
 
 
 def _feedback(at: AppTest) -> str:
@@ -1573,7 +1573,7 @@ def test_new_account_load_does_not_create_a_trip(memory_supabase):
     assert at.session_state.get("trip_id") in ("", None)
     assert list(at.session_state.get("trip_catalog") or []) == []
     assert "你仲未有行程" in _page(at)
-    assert any(button.label == "新增行程" for button in at.button)
+    assert any(button.label == "建立新旅行夾" for button in at.button)
     assert not any("行程 1" in button.label for button in at.button)
     assert "開始收集想去的地方" in [button.label for button in at.button]
     assert not list(at.success)
@@ -1585,7 +1585,7 @@ def test_create_trip_once_stays_one_across_reruns(memory_supabase):
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.run()
     assert memory_supabase.inserts == []
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     assert len(memory_supabase.rows) == 1
     assert len(memory_supabase.inserts) == 1
@@ -1605,7 +1605,7 @@ def test_create_trip_replay_and_reentry_insert_once(monkeypatch, memory_supabase
     at.secrets["GEMINI_API_KEY"] = "fake"
     at.run()
     at.session_state["_skip_next_create"] = True
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     assert memory_supabase.inserts == []
     assert at.session_state.get("_skip_next_create") in (False, None, "")
@@ -1630,7 +1630,7 @@ def test_create_trip_replay_and_reentry_insert_once(monkeypatch, memory_supabase
         return created
 
     monkeypatch.setattr(trip_store, "create_trip", wrapped)
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     assert state["n"] == 1
     assert len(memory_supabase.rows) == 1
@@ -1751,7 +1751,7 @@ def test_collection_inbox_saves_without_a_trip_and_adopt_clears_it(monkeypatch, 
     assert _UNSAVED_NOTICE not in _feedback(fresh)
     _button(fresh, "查看我的收藏 →").click().run()
     assert fresh.session_state["screen"] == "C"
-    _button(fresh, "新增行程").click().run()
+    _button(fresh, "建立新旅行夾").click().run()
     assert not fresh.exception
     assert _inbox_rows(memory_supabase) == []
     assert len(trip_store.list_trips()) == 1
@@ -1845,7 +1845,7 @@ def test_cross_user_load_does_not_create_or_leak(monkeypatch, memory_supabase):
     assert at.session_state.get("trip_id") in ("", None)
     assert "秘密拉麵" not in _page(at)
     assert "你仲未有行程" in _page(at)
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     own = [row for row in memory_supabase.rows if row.get("owner_sub") == "user-b"]
     assert len(own) == 1
@@ -1898,7 +1898,7 @@ def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypat
     at.run()
     assert not at.exception
     assert at.session_state.get("trip_id") in ("", None)
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert not at.exception
     trip_id = at.session_state["trip_id"]
     assert trip_id and trip_id != inbox_id
@@ -1930,7 +1930,7 @@ def test_cleanup_failure_switches_to_the_new_trip_without_asking_again(monkeypat
     at.run()
     assert trip_store.load_trip(trip_id)["inbox"][0]["remark"] == "改過備註"
     edited_stamp = trip_store.load_trip(trip_id)["updated_at"]
-    _button(at, "新增行程").click().run()
+    _button(at, "建立新旅行夾").click().run()
     assert len(trip_store.list_trips()) == 1
     assert at.session_state["trip_id"] == trip_id
     kept = trip_store.load_trip(trip_id)
@@ -2026,3 +2026,70 @@ def test_remote_edit_keeps_unsaved_local_until_reload(monkeypatch, memory_supaba
     assert not at.session_state.get("trip_conflict")
     assert trip_store.load_trip(created["id"])["title"] == "遠端已改"
     assert memory_supabase.objects[f"user-a/{created['id']}/{item_id}.jpg"] == image
+
+
+def test_invite_opens_shared_workspace_and_dates_persist(monkeypatch, memory_supabase):
+    holder = {"sub": "owner-sub"}
+    monkeypatch.setattr(auth_gate, "get_member_id", lambda: holder["sub"])
+    created = trip_store.create_trip()
+    trip_store.save_trip({
+        "trip_id": created["id"],
+        "version": created["version"],
+        "title": "福岡旅行",
+        "inbox": [],
+        "favourites": [_fav(name="太宰府天滿宮")],
+        "itinerary": None,
+    })
+    invite = trip_store.create_invite(created["id"])
+    holder["sub"] = "member-sub"
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.query_params["invite"] = invite["token"]
+    at.session_state["display_name"] = "朋友 A"
+    at.run()
+    assert not at.exception
+    assert at.session_state["trip_id"] == created["id"]
+    page = _page(at)
+    assert "福岡旅行" in page
+    assert "共同旅行" in page
+    assert "member-sub" not in page
+    assert "owner-sub" not in page
+    assert "lazy-trip-planner.app" not in page
+    labels = [button.label for button in at.button]
+    assert "前往收集" in labels
+    assert "前往收藏" in labels
+    assert "前往行程" in labels
+    assert "撤銷邀請連結" not in labels
+    assert "刪除行程" not in labels
+    _button(at, "⚙").click().run()
+    labels = [button.label for button in at.button]
+    assert "離開行程" in labels
+    assert "邀請朋友" not in labels
+    _button(at, "前往收藏").click().run()
+    assert at.session_state["screen"] == "C"
+    assert "太宰府天滿宮" in _page(at)
+
+    holder["sub"] = "owner-sub"
+    owner = AppTest.from_file(APP, default_timeout=30)
+    owner.secrets["GEMINI_API_KEY"] = "fake"
+    owner.session_state["trip_id"] = created["id"]
+    owner.session_state["display_name"] = "行程主人"
+    owner.run()
+    assert not owner.exception
+    _button(owner, "⚙").click().run()
+    _button(owner, "邀請朋友").click().run()
+    owner_labels = [button.label for button in owner.button]
+    assert "撤銷邀請連結" in owner_labels or "重新產生邀請連結" in owner_labels
+    assert "https://lazy-trip-planner.streamlit.app/?invite=" in _page(owner) or any(
+        "重新產生邀請連結" == button.label for button in owner.button
+    )
+    start = [box for box in owner.text_input if box.label == "旅行開始"][0]
+    start.input("2026-03-15").run()
+    end = [box for box in owner.text_input if box.label == "旅行結束"][0]
+    end.input("2026-03-18").run()
+    assert not owner.exception
+    loaded = trip_store.load_trip(created["id"])
+    assert loaded["travel_start"] == "2026-03-15"
+    assert loaded["travel_end"] == "2026-03-18"
+    assert "4日3夜" in _page(owner)
+    assert "owner-sub" not in _page(owner)
