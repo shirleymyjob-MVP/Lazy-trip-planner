@@ -2995,3 +2995,48 @@ def test_invite_panel_keeps_manual_join_wording(memory_supabase):
     assert "而家未有登入後自動加入" in _page(at)
     assert any(button.label == "產生邀請連結" for button in at.button)
     assert any(button.label == "返回行程" for button in at.button)
+
+
+def test_plan_lists_all_favourites_and_travel_detail_keeps_the_day(monkeypatch):
+    at = _plan_with_trip(AppTest.from_file(APP, default_timeout=30))
+    page = _page(at)
+    assert "太宰府天滿宮" in page
+    assert "全部收藏都會交俾排程" in page
+    assert "尚未修正" in page
+    assert not list(at.checkbox)
+    calls = {"n": 0}
+
+    def gen(*_args, **_kwargs):
+        calls["n"] += 1
+        return _generated_itinerary()
+
+    monkeypatch.setattr(gemini_client, "make_client", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(gemini_client, "generate_itinerary", gen)
+    monkeypatch.setattr(
+        gemini_client,
+        "suggest_nearby",
+        lambda *_args, **_kwargs: gemini_client.AnalysisResult([], []),
+    )
+    _button(at, "開始排行程").click().run()
+    assert calls["n"] == 1
+    assert at.session_state["screen"] == "E"
+    assert "手動調整時間" in _page(at)
+    assert "上移" not in [button.label for button in at.button]
+    assert "（SAVE-" not in _joined(at.error)
+    _button(at, "旅行中查看").click().run()
+    assert calls["n"] == 1
+    travel_page = _page(at)
+    assert "太宰府天滿宮" in travel_page
+    assert "°C" not in travel_page
+    assert "加入行程" not in [button.label for button in at.button]
+    kept = at.session_state.get("day_tab")
+    _button(at, "查看詳情：太宰府天滿宮").click().run()
+    assert at.session_state.get("day_tab") == kept
+    assert "營業時間" in _page(at)
+    _button(at, "返回時間線").click().run()
+    assert at.session_state.get("day_tab") == kept
+    assert not at.session_state.get("travel_detail")
+    _button(at, "返回行程結果").click().run()
+    assert not at.session_state.get("travel_view")
+    assert at.session_state.get("day_tab") == kept
+    assert calls["n"] == 1

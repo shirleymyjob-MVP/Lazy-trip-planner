@@ -3853,10 +3853,39 @@ def _render_collection() -> None:
     st.caption(PAYWALL_NOTE)
 
 
+def _render_v2c_styles() -> None:
+    st.markdown(
+        """
+        <style>
+          .v2c-kicker { color: #C45C74; font-weight: 700; font-size: 13px; margin: 0; }
+          .v2c-card {
+            background: #FFFFFF;
+            border: 1px solid #F6D5DC;
+            border-radius: 16px;
+            padding: 12px 14px;
+            margin: 8px 0 4px;
+          }
+          .v2c-title { font-size: 17px; font-weight: 700; margin: 0; color: #3A2A2E; }
+          .v2c-meta { color: #7A5C64; font-size: 13px; line-height: 1.5; margin: 4px 0 0; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 def _render_plan() -> None:
+    _render_v2c_styles()
+    st.markdown('<p class="v2c-kicker">排程</p>', unsafe_allow_html=True)
     st.subheader("一鍵排行程")
     _render_itinerary_unsaved()
     favs = list(st.session_state.get("favourites") or [])
+    st.markdown("**今次排程會用的收藏**")
+    if not favs:
+        st.caption("未有收藏。逐個勾選尚未提供，而家仍然係全部收藏做輸入。")
+    else:
+        for fav in favs:
+            st.markdown(f"- {html.escape(str(fav.get('name') or '未命名'))}")
+        st.caption("逐個勾選尚未提供。上面全部收藏都會交俾排程，畫面唔會顯示「已選 N 個」。")
     st.markdown("**選擇目的地／地區**")
     choice = _bound_selectbox(
         "選擇目的地／地區",
@@ -3881,6 +3910,7 @@ def _render_plan() -> None:
     with day_col:
         # 出發日只係今次排程用，冇寫入行程 payload。離開頁面會清，唔覆寫已儲存資料。
         st.date_input("出發日", value=None, key="start_date")
+        st.caption("出發日離開呢頁之後要再選。呢個限制尚未修正。每日出發同結束時間都未提供。")
     with count_col:
         _bound_number_input(
             "日數",
@@ -4236,7 +4266,64 @@ def _isolate_cloned_days(days: list[dict]) -> list[dict]:
     return isolated
 
 
+def _render_stop_detail(stop: dict) -> None:
+    name = str(stop.get("place_name") or "未命名")
+    address = str(stop.get("address") or "").strip()
+    hours = str(stop.get("opening_hours") or "").strip() or UNVERIFIED
+    rating = str(stop.get("rating") or "").strip() or UNVERIFIED
+    st.markdown('<p class="v2c-kicker">地點詳情</p>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div class="v2c-card"><p class="v2c-title">{html.escape(name)}</p>'
+        f'<p class="v2c-meta">地址：{html.escape(address or "未有地址")}</p>'
+        f'<p class="v2c-meta">營業時間：{html.escape(hours)}</p>'
+        f'<p class="v2c-meta">評分：{html.escape(rating)}</p></div>',
+        unsafe_allow_html=True,
+    )
+    maps_url = _stop_maps_url(stop)
+    if maps_url:
+        st.link_button("Google 地圖", maps_url, use_container_width=True)
+    else:
+        st.caption("未有足夠資料開地圖。")
+    if st.button("返回時間線", key="close_stop_detail", use_container_width=True):
+        st.session_state.travel_detail = None
+        st.rerun()
+
+
+def _render_travel_day(picked: str, visible: list[dict]) -> None:
+    st.markdown('<p class="v2c-kicker">旅行中</p>', unsafe_allow_html=True)
+    st.caption("顯示已儲存行程。未有按今日自動跳日，未有天氣，未有即時交通時間。")
+    detail = str(st.session_state.get("travel_detail") or "")
+    if detail.startswith(f"{picked}:"):
+        try:
+            index = int(detail.split(":", 1)[1])
+        except ValueError:
+            index = -1
+        if 0 <= index < len(visible):
+            _render_stop_detail(visible[index])
+            return
+        st.session_state.travel_detail = None
+    if not visible:
+        st.caption("這一天未有安排。")
+    for index, stop in enumerate(visible):
+        name = str(stop.get("place_name") or "未命名")
+        when = str(stop.get("time") or "")
+        source = "AI 建議" if stop.get("ai") else "來自收藏"
+        st.markdown(
+            f'<div class="v2c-card"><p class="v2c-title">{html.escape(when)} {html.escape(name)}</p>'
+            f'<p class="v2c-meta">{html.escape(source)}</p></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button(f"查看詳情：{name}", key=f"travel_detail_{picked}_{index}", use_container_width=True):
+            st.session_state.travel_detail = f"{picked}:{index}"
+            st.rerun()
+    if st.button("返回行程結果", key="close_travel_view", use_container_width=True):
+        st.session_state.travel_view = False
+        st.session_state.travel_detail = None
+        st.rerun()
+
+
 def _render_results() -> None:
+    _render_v2c_styles()
     _render_itinerary_unsaved()
     itinerary = st.session_state.get("itinerary")
     style = st.session_state.get("planned_style") or st.session_state.get("trip_style") or DEFAULT_TRIP_STYLE
@@ -4254,7 +4341,9 @@ def _render_results() -> None:
         ),
         list(st.session_state.get("favourites") or []),
     )
+    st.markdown('<p class="v2c-kicker">行程結果</p>', unsafe_allow_html=True)
     st.subheader(shown.get("title") or "行程結果")
+    st.caption("手動調整時間、上下移、刪除或移去另一日尚未提供。")
     st.markdown(f'<div class="style-banner">已按「{style}」安排</div>', unsafe_allow_html=True)
     if shown.get("suggestion_note"):
         st.caption(str(shown["suggestion_note"]))
@@ -4278,10 +4367,16 @@ def _render_results() -> None:
                 st.session_state.allow_ai = True
                 st.session_state.planned_allow_ai = True
                 st.rerun()
-        if not visible:
+        if st.session_state.get("travel_view"):
+            _render_travel_day(picked, visible)
+        elif not visible:
             st.caption("這一天未有安排。")
         else:
             _render_timeline(visible)
+            if st.button("旅行中查看", key="open_travel_view", use_container_width=True):
+                st.session_state.travel_view = True
+                st.session_state.travel_detail = None
+                st.rerun()
     maps_url = _google_trip_url(visible)
     if maps_url:
         st.link_button("喺 Google 睇行程", maps_url, type="primary", use_container_width=True)
