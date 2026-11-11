@@ -3109,3 +3109,80 @@ def test_five_tab_nav_keeps_trip_data_across_switch_relogin_and_home(memory_supa
     assert loaded["title"] == "大阪行"
     assert loaded["travel_start"] == "2026-04-01"
     assert calls["n"] == 0
+
+
+def _two_day_itinerary(place: str) -> dict:
+    return {
+        "title": place,
+        "days": [
+            {"day": 1, "items": [{
+                "time": "09:00", "place_name": place, "activity": "第一日",
+                "maps_query": place, "transit": "", "address": f"{place}地址",
+                "opening_hours": "09:00-18:00", "rating": "4/5",
+            }]},
+            {"day": 2, "items": [{
+                "time": "10:00", "place_name": f"{place}翌日", "activity": "第二日",
+                "maps_query": place, "transit": "", "address": "",
+                "opening_hours": "", "rating": "",
+            }]},
+        ],
+    }
+
+
+def _click_label_prefix(at: AppTest, prefix: str):
+    found = [button for button in at.button if button.label.startswith(prefix)]
+    assert found, [button.label for button in at.button]
+    found[0].click().run()
+
+
+def test_travel_detail_does_not_follow_another_trip_day_or_reload(memory_supabase):
+    at = AppTest.from_file(APP, default_timeout=30)
+    at.secrets["GEMINI_API_KEY"] = "fake"
+    at.run()
+    _open_screen(at, "旅行夾")
+    _button(at, "建立新旅行夾").click().run()
+    [box for box in at.text_input if box.label == "行程名稱"][0].input("行程甲").run()
+    at.session_state["itinerary"] = _two_day_itinerary("景點甲")
+    at.run()
+    _button(at, "建立新旅行夾").click().run()
+    [box for box in at.text_input if box.label == "行程名稱"][0].input("行程乙").run()
+    at.session_state["itinerary"] = _two_day_itinerary("景點乙")
+    at.run()
+    _open_screen(at, "首頁")
+    _click_label_prefix(at, "行程甲")
+    _open_screen(at, "行程")
+    _button(at, "旅行中查看").click().run()
+    _button(at, "查看詳情：景點甲").click().run()
+    assert "地點詳情" in _page(at)
+    assert "景點甲地址" in _page(at)
+
+    _open_screen(at, "首頁")
+    _click_label_prefix(at, "行程乙")
+    _open_screen(at, "行程")
+    page = _page(at)
+    assert "地點詳情" not in page
+    assert "景點甲" not in page
+    assert "景點乙" in page
+    assert not at.session_state.get("travel_view")
+    assert not at.session_state.get("travel_detail")
+
+    _button(at, "旅行中查看").click().run()
+    _button(at, "查看詳情：景點乙").click().run()
+    assert "地點詳情" in _page(at)
+    day = [pill for pill in at.pills if pill.label == "行程日"][0]
+    day.set_value("Day 2").run()
+    assert "地點詳情" not in _page(at)
+    assert "景點乙翌日" in _page(at)
+    assert not at.session_state.get("travel_detail")
+    day = [pill for pill in at.pills if pill.label == "行程日"][0]
+    day.set_value("Day 1").run()
+    assert "地點詳情" not in _page(at)
+    assert any(button.label == "查看詳情：景點乙" for button in at.button)
+
+    _button(at, "查看詳情：景點乙").click().run()
+    at.session_state["force_trip_reload"] = True
+    at.run()
+    _open_screen(at, "行程")
+    assert "地點詳情" not in _page(at)
+    assert not at.session_state.get("travel_view")
+    assert not at.session_state.get("travel_detail")

@@ -1273,7 +1273,14 @@ def _sync_recognize() -> bool:
     return os.environ.get("LAZY_TRIP_SYNC_RECOGNIZE") == "1"
 
 
+def _clear_travel_focus() -> None:
+    """旅行中同景點詳情只屬於目前呢份行程。換行程或重新載入就唔好留住。"""
+    st.session_state.travel_view = False
+    st.session_state.travel_detail = None
+
+
 def _apply_loaded_trip(loaded: dict) -> None:
+    _clear_travel_focus()
     st.session_state.inbox = list(loaded.get("inbox") or [])
     st.session_state.itinerary = loaded.get("itinerary")
     st.session_state.itinerary_places = list(loaded.get("itinerary_places") or [])
@@ -1936,6 +1943,7 @@ def _persist_shared_trip() -> bool:
 def _activate_trip(trip_id: str) -> None:
     if not _persist_shared_trip():
         return
+    _clear_travel_focus()
     st.session_state.view_inbox = False
     st.session_state.invite_panel = False
     st.session_state.trip_id = trip_id
@@ -4342,6 +4350,9 @@ def _render_travel_day(picked: str, visible: list[dict]) -> None:
     st.markdown('<p class="v2c-kicker">旅行中</p>', unsafe_allow_html=True)
     st.caption("顯示已儲存行程。未有按今日自動跳日，未有天氣，未有即時交通時間。")
     detail = str(st.session_state.get("travel_detail") or "")
+    if detail and not detail.startswith(f"{picked}:"):
+        st.session_state.travel_detail = None
+        detail = ""
     if detail.startswith(f"{picked}:"):
         try:
             index = int(detail.split(":", 1)[1])
