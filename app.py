@@ -4462,9 +4462,6 @@ def _render_opening() -> None:
     st.markdown('<p class="v2a-kicker">Lazy Trip Planner</p>', unsafe_allow_html=True)
     st.title("懶人出行")
     st.markdown(f"### 歡迎回來，{html.escape(_welcome_name())}！")
-    st.caption(HERO_LINE)
-    st.caption(" · ".join(OPENING_STEPS))
-    _bound_text_input("你的顯示名", "display_name", default="旅人")
     catalog = list(st.session_state.get("trip_catalog") or [])
     current = str(st.session_state.get("trip_id") or "")
     loaded = next((row for row in catalog if row.get("id") == current), None)
@@ -4488,8 +4485,6 @@ def _render_opening() -> None:
                 _go("E")
         elif st.button("前往收集", key="home_open_collect", use_container_width=True):
             _go("B")
-    if st.button("開始收集想去的地方", type="primary", key="start_collect", use_container_width=True):
-        _go("B")
     owned = _owned_trip_count(catalog)
     cap = trip_store.max_trips()
     if owned >= cap:
@@ -4498,6 +4493,11 @@ def _render_opening() -> None:
         _create_new_trip()
     if st.button("查看全部行程", key="home_open_folder", use_container_width=True):
         _go("F")
+    if st.button("開始收集想去的地方", type="primary", key="start_collect", use_container_width=True):
+        _go("B")
+    _bound_text_input("你的顯示名", "display_name", default="旅人")
+    st.caption(HERO_LINE)
+    st.caption(" · ".join(OPENING_STEPS))
     if not catalog:
         st.info(_EMPTY_TRIPS_NOTE)
         return
