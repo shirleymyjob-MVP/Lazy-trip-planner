@@ -471,6 +471,7 @@ st.markdown(
         padding-top: 0.6rem !important;
         padding-left: 0.7rem !important;
         padding-right: 0.7rem !important;
+        padding-bottom: 96px !important;
         overflow-x: hidden;
       }
       /* 登出掣。頁頂 padding 只有 0.6rem，但 Streamlit header 高 3.75rem、
@@ -665,6 +666,52 @@ st.markdown(
         padding: 2px 10px !important;
         font-size: 12px !important;
         border-radius: 999px !important;
+      }
+      /* 底部五格。標籤仍然係純文字，圖示用次序加，方便測試鎖定名稱。 */
+      div.st-key-nav_chip {
+        position: fixed !important;
+        left: 0 !important;
+        right: 0 !important;
+        bottom: 0 !important;
+        z-index: 40 !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        margin: 0 !important;
+        background: #FFFFFF !important;
+        border-top: 1px solid #F6D5DC !important;
+        padding: 4px 2px 6px !important;
+        box-shadow: 0 -4px 16px rgba(196, 92, 116, 0.12);
+      }
+      div.st-key-nav_chip [data-testid="stButtonGroup"],
+      div.st-key-nav_chip [data-testid="stHorizontalBlock"] {
+        flex-wrap: nowrap !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        gap: 2px !important;
+        justify-content: space-between !important;
+      }
+      div.st-key-nav_chip button {
+        flex: 1 1 0 !important;
+        width: 20% !important;
+        min-width: 0 !important;
+        max-width: 20% !important;
+        min-height: 52px !important;
+        height: auto !important;
+        padding: 4px 0 2px !important;
+        font-size: 11px !important;
+        line-height: 1.15 !important;
+        white-space: pre-line !important;
+        border-radius: 10px !important;
+      }
+      div.st-key-nav_chip button:nth-child(1)::before { content: "🏠"; }
+      div.st-key-nav_chip button:nth-child(2)::before { content: "🖼️"; }
+      div.st-key-nav_chip button:nth-child(3)::before { content: "⭐"; }
+      div.st-key-nav_chip button:nth-child(4)::before { content: "📅"; }
+      div.st-key-nav_chip button:nth-child(5)::before { content: "🧳"; }
+      div.st-key-nav_chip button::before {
+        display: block;
+        font-size: 16px;
+        line-height: 1.1;
       }
       [data-testid="stImage"] button,
       [data-testid="StyledFullScreenButton"] {
@@ -3260,7 +3307,6 @@ def _allow_ai_suggestions(_favs: list[dict]) -> bool:
 # 首頁維持開場。旅行夾係獨立一頁，收集之後嘅步驟唔再夾住成個資料夾。
 _NAV = (
     ("A", "首頁"),
-    ("F", "旅行夾"),
     ("B", "收集"),
     ("C", "收藏"),
     ("D", "排程"),
@@ -3282,7 +3328,10 @@ def _render_nav() -> None:
     pending = st.session_state.pop("nav_sync", None)
     if pending in label_by:
         st.session_state["nav_chip"] = label_by[pending]
-    elif st.session_state.get("nav_chip") not in labels:
+    elif pending == "F":
+        # 旅行夾係首頁的次級頁。底欄唔預選，再撳五格先離開。
+        st.session_state["nav_chip"] = None
+    elif screen != "F" and st.session_state.get("nav_chip") not in labels:
         st.session_state["nav_chip"] = label_by.get(screen, labels[0])
     choice = st.pills("步驟", labels, key="nav_chip", label_visibility="collapsed")
     if choice in labels and code_by[choice] != screen:
@@ -4441,7 +4490,13 @@ def _render_opening() -> None:
             _go("B")
     if st.button("開始收集想去的地方", type="primary", key="start_collect", use_container_width=True):
         _go("B")
-    if st.button("前往旅行夾", key="home_open_folder", use_container_width=True):
+    owned = _owned_trip_count(catalog)
+    cap = trip_store.max_trips()
+    if owned >= cap:
+        st.caption(f"每位會員最多可儲存 {cap} 個行程。")
+    elif st.button("建立新旅行夾", key="home_create_trip", use_container_width=True):
+        _create_new_trip()
+    if st.button("查看全部行程", key="home_open_folder", use_container_width=True):
         _go("F")
     if not catalog:
         st.info(_EMPTY_TRIPS_NOTE)
